@@ -384,7 +384,7 @@ def render_activity():
     t = Table.grid(padding=(0,1))
     t.add_column(style="dim white", width=8,  no_wrap=True)
     t.add_column(style="white",     width=3,  no_wrap=True)
-    t.add_column(min_width=34)
+    t.add_column(min_width=34, overflow="fold")
 
     if rows:
         for ts, icon, msg in rows:
@@ -394,10 +394,10 @@ def render_activity():
                   else "yellow" if icon in ("📋",)
                   else "white")
             t.add_row(str(ts), str(icon),
-                      Text.from_markup(f"[{mc}]{str(msg)[:45]}[/]"))
+                      Text.from_markup(f"[{mc}]{str(msg)}[/]"))
     else:
         for ts, msg in reversed(state["activity"][-15:]):
-            t.add_row(str(ts), "", str(msg)[:45])
+            t.add_row(str(ts), "", str(msg))
         if not state["activity"]:
             t.add_row("", "", Text.from_markup(dim("Waiting for activity...")))
 
