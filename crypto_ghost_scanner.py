@@ -1420,7 +1420,7 @@ class CryptoGhostScanner:
                 tier_names = {1:"STRIKE",2:"HOURLY",3:"4HR",4:"DAILY"}
                 print(f"[{ts}] {mode_tag} T{tier} {tier_names.get(tier,'')} | "
                       f"{coin} @ ${ask:.3f} | Size:${size} -> +${payout:.2f} | '{question[:40]}'")
-                log_event("📋", f"T{tier} {coin} BUY @ ${ask:.3f} | +${payout:.2f} | {question[:38]}")
+                log_event("📋", f"T{tier} {coin} BUY @ ${ask:.3f} | +${payout:.2f} | {question}")
                 write_stats_json()
                 return True
             else:
