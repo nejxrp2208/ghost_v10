@@ -1,7 +1,7 @@
 """
 Crypto Ghost Dashboard — Clean rewrite
 """
-import sqlite3, asyncio, aiohttp, os, sys, time
+import sqlite3, asyncio, aiohttp, os, sys, time, re, json
 from datetime import datetime, timezone
 
 if sys.platform == "win32":
@@ -72,6 +72,11 @@ def db_connect():
         skip_certainty INTEGER DEFAULT 0, skip_window INTEGER DEFAULT 0,
         scan_ms INTEGER DEFAULT 0)""")
     conn.commit()
+    try:
+        conn.execute("ALTER TABLE trades ADD COLUMN pm_result TEXT DEFAULT 'pending'")
+        conn.commit()
+    except Exception:
+        pass
     return conn
 
 def safe_query(sql, params=()):
@@ -88,6 +93,80 @@ def safe_query(sql, params=()):
 def safe_one(sql, params=()):
     rows = safe_query(sql, params)
     return rows[0][0] if rows else 0
+
+# ── Window parser ─────────────────────────────────────────────────────────────
+def parse_window(question):
+    m = re.search(r'(\d{1,2}:\d{2}(?:AM|PM)?)\s[-–]\s(\d{1,2}:\d{2}(?:AM|PM)?)', str(question))
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    return "—"
+
+# ── PM Oracle ─────────────────────────────────────────────────────────────────
+async def _query_pm_oracle(session, market_id, our_outcome):
+    if not market_id or not str(market_id).isdigit():
+        return None
+    try:
+        url = f"https://gamma-api.polymarket.com/markets/{market_id}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with session.get(url, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+        outcome_prices = json.loads(data.get("outcomePrices", "[]"))
+        outcomes       = json.loads(data.get("outcomes", "[]"))
+        if not outcome_prices or not outcomes:
+            return None
+        prices = [float(p) for p in outcome_prices]
+        if max(prices) < 0.99:
+            return None  # not settled yet
+        winner_idx = prices.index(max(prices))
+        winner     = str(outcomes[winner_idx]).upper()
+        our        = (our_outcome or "").upper()
+        return "won" if winner == our else "lost"
+    except Exception:
+        return None
+
+async def pm_oracle_checker():
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        while True:
+            await asyncio.sleep(30)
+            try:
+                rows = safe_query("""
+                    SELECT id, market_id, outcome, status, size_usdc, entry_price
+                    FROM trades
+                    WHERE status IN ('won','lost')
+                      AND COALESCE(pm_result,'pending') = 'pending'
+                      AND closed_at > datetime('now','-3 hours')
+                """)
+                for tid, market_id, outcome, status, size_usdc, entry_price in rows:
+                    pm = await _query_pm_oracle(session, market_id, outcome)
+                    if pm is None:
+                        continue
+                    if pm != status:
+                        pnl = (round(size_usdc / entry_price - size_usdc, 2)
+                               if pm == "won" and entry_price else -size_usdc)
+                        try:
+                            conn = db_connect()
+                            conn.execute(
+                                "UPDATE trades SET status=?, pnl=?, pm_result=? WHERE id=?",
+                                (pm, pnl, pm, tid))
+                            conn.commit()
+                            conn.close()
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            conn = db_connect()
+                            conn.execute(
+                                "UPDATE trades SET pm_result=? WHERE id=?", (pm, tid))
+                            conn.commit()
+                            conn.close()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
 def get_stats():
@@ -326,23 +405,28 @@ def render_scanner_stats():
 # ── Render: Last Trades ───────────────────────────────────────────────────────
 def render_last_trades():
     rows = safe_query("""
-        SELECT id, ts, tier, coin, question, size_usdc, pnl, status, outcome
+        SELECT id, ts, tier, coin, question, size_usdc, pnl, status,
+               COALESCE(outcome,'?') as outcome,
+               COALESCE(pm_result,'pending') as pm_result,
+               market_id, entry_price
         FROM trades ORDER BY id DESC LIMIT 10
     """)
     t = Table(box=rbox.SIMPLE_HEAD, border_style="white",
               show_header=True, header_style="bold white",
               expand=True, padding=(0,1))
-    t.add_column("ID",    width=4,  style="dim white")
-    t.add_column("Time",  width=8,  style="dim white")
-    t.add_column("Market",min_width=36)
-    t.add_column("Dir",   width=4)
-    t.add_column("Out",   width=5)
-    t.add_column("$",     width=6,  justify="right")
-    t.add_column("P&L",   width=8,  justify="right")
-    t.add_column("Status",width=6)
+    t.add_column("ID",     width=4,  style="dim white")
+    t.add_column("Time",   width=8,  style="dim white")
+    t.add_column("Market", min_width=24)
+    t.add_column("Dir",    width=4)
+    t.add_column("Window", width=13, style="dim white")
+    t.add_column("Oracle", width=8)
+    t.add_column("Out",    width=5)
+    t.add_column("$",      width=6,  justify="right")
+    t.add_column("P&L",    width=8,  justify="right")
+    t.add_column("Status", width=6)
 
     colors = {1:"yellow", 2:"green", 3:"cyan", 4:"magenta"}
-    for rid, ts, tier, coin, q, size, pnl, status, outcome in rows:
+    for rid, ts, tier, coin, q, size, pnl, status, outcome, pm_result, market_id, entry_price in rows:
         tstr = ts[11:19] if ts else "?"
         pstr = f"+${pnl:.2f}" if (pnl and pnl>0) else (f"-${abs(pnl):.2f}" if pnl else "—")
         pc   = "green" if (pnl and pnl>0) else ("red" if (pnl and pnl<0) else "dim white")
@@ -354,9 +438,17 @@ def render_last_trades():
         dtxt = (Text.from_markup("[bold green]UP[/]")   if direction == "UP"   else
                 Text.from_markup("[bold red]DOWN[/]")   if direction == "DOWN" else
                 Text("—", style="dim white"))
+        if pm_result == "won":
+            otxt = Text.from_markup("[bold green]WON ✓[/]")
+        elif pm_result == "lost":
+            otxt = Text.from_markup("[bold red]LOST ✗[/]")
+        else:
+            otxt = Text("pending", style="dim white")
         t.add_row(str(rid), tstr,
                   Text(str(q), overflow="fold"),
                   dtxt,
+                  parse_window(q),
+                  otxt,
                   Text.from_markup(f"[{col}]T{tier}[/]"),
                   f"${size:.2f}",
                   Text.from_markup(f"[{pc}]{pstr}[/]"),
@@ -407,6 +499,7 @@ async def main():
     log_activity("Tracking BTC/ETH/XRP/SOL markets")
 
     asyncio.create_task(data_loop())
+    asyncio.create_task(pm_oracle_checker())
 
     layout = Layout()
     layout.split_column(
