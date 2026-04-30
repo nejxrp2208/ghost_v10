@@ -280,25 +280,20 @@ def render_scanner_stats():
                   f"[{chg_c}]{sign}{chg_p:.2f}%[/]")
         return [header] + rows
 
-    t = Table.grid(padding=(0, 1))
-    t.add_column(min_width=30)
-    t.add_column(min_width=30)
+    t = Table.grid(padding=(0, 0))
+    t.add_column(min_width=28)
 
     btc_lines = make_chart(state["btc_history"], "BTC", "yellow")
     eth_lines = make_chart(state["eth_history"], "ETH", "cyan")
 
-    max_lines = max(len(btc_lines), len(eth_lines))
-    btc_lines += [""] * (max_lines - len(btc_lines))
-    eth_lines += [""] * (max_lines - len(eth_lines))
-
-    for b, e in zip(btc_lines, eth_lines):
-        t.add_row(
-            Text.from_markup(b) if b else Text(""),
-            Text.from_markup(e) if e else Text("")
-        )
+    for line in btc_lines:
+        t.add_row(Text.from_markup(line) if line else Text(""))
+    t.add_row(Text(""))
+    for line in eth_lines:
+        t.add_row(Text.from_markup(line) if line else Text(""))
 
     # Scanner stats below chart
-    t.add_row(Text(""), Text(""))
+    t.add_row(Text(""))
     rows_db = safe_query("""
         SELECT markets_found, signals_passed, skip_ask, scan_ms
         FROM scan_stats ORDER BY id DESC LIMIT 100
@@ -313,24 +308,17 @@ def render_scanner_stats():
         speed_c = "green" if avg_ms < 3000 else "yellow"
         sig_c   = "green" if sig_rate > 1  else "dim white"
 
-        t.add_row(
-            Text.from_markup(f"[dim]Scans:[/] [white]{len(rows_db)}[/]  "
-                             f"[dim]Speed:[/] [{speed_c}]{avg_ms}ms[/]"),
-            Text.from_markup(f"[dim]Signals:[/] [{sig_c}]{total_sig}[/]  "
-                             f"[dim]Skip ask:[/] [white]{skip_ask}[/]")
-        )
+        t.add_row(Text.from_markup(f"[dim]Scans:[/] [white]{len(rows_db)}[/]  "
+                                   f"[dim]Speed:[/] [{speed_c}]{avg_ms}ms[/]"))
+        t.add_row(Text.from_markup(f"[dim]Signals:[/] [{sig_c}]{total_sig}[/]  "
+                                   f"[dim]Skip:[/] [white]{skip_ask}[/]"))
     else:
-        t.add_row(
-            Text.from_markup("[dim]Waiting for scan data...[/]"),
-            Text("")
-        )
+        t.add_row(Text.from_markup("[dim]Waiting for scan data...[/]"))
 
-    t.add_row(
-        Text.from_markup(f"[dim]Entry T2:[/] [white]{os.getenv('T2_MAX_ENTRY','0.03')}[/]  "
-                        f"[dim]Cert:[/] [white]{os.getenv('MIN_NO_PRICE','0.97')}[/]"),
-        Text.from_markup(f"[dim]Window:[/] [white]{os.getenv('T2_WINDOW_MIN','3')}min[/]  "
-                        f"[dim]Liq:[/] [white]${os.getenv('MIN_LIQUIDITY','0.5')}[/]")
-    )
+    t.add_row(Text.from_markup(f"[dim]Entry T2:[/] [white]{os.getenv('T2_MAX_ENTRY','0.03')}[/]  "
+                               f"[dim]Cert:[/] [white]{os.getenv('MIN_NO_PRICE','0.97')}[/]"))
+    t.add_row(Text.from_markup(f"[dim]Window:[/] [white]{os.getenv('T2_WINDOW_MIN','3')}min[/]  "
+                               f"[dim]Liq:[/] [white]${os.getenv('MIN_LIQUIDITY','0.5')}[/]"))
 
     return Panel(t, title="[bold white]📈 Live Price Chart[/]",
                  border_style="white", box=rbox.SQUARE, padding=(0, 1))
