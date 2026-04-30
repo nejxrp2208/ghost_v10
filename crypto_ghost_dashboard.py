@@ -338,7 +338,7 @@ def render_scanner_stats():
 # ── Render: Last Trades ───────────────────────────────────────────────────────
 def render_last_trades():
     rows = safe_query("""
-        SELECT id, ts, tier, coin, question, size_usdc, pnl, status
+        SELECT id, ts, tier, coin, question, size_usdc, pnl, status, outcome
         FROM trades ORDER BY id DESC LIMIT 10
     """)
     t = Table(box=rbox.SIMPLE_HEAD, border_style="white",
@@ -347,13 +347,14 @@ def render_last_trades():
     t.add_column("ID",    width=4,  style="dim white")
     t.add_column("Time",  width=8,  style="dim white")
     t.add_column("Market",min_width=36)
+    t.add_column("Dir",   width=4)
     t.add_column("Out",   width=5)
     t.add_column("$",     width=6,  justify="right")
     t.add_column("P&L",   width=8,  justify="right")
     t.add_column("Status",width=6)
 
     colors = {1:"yellow", 2:"green", 3:"cyan", 4:"magenta"}
-    for rid, ts, tier, coin, q, size, pnl, status in rows:
+    for rid, ts, tier, coin, q, size, pnl, status, outcome in rows:
         tstr = ts[11:19] if ts else "?"
         pstr = f"+${pnl:.2f}" if (pnl and pnl>0) else (f"-${abs(pnl):.2f}" if pnl else "—")
         pc   = "green" if (pnl and pnl>0) else ("red" if (pnl and pnl<0) else "dim white")
@@ -361,8 +362,13 @@ def render_last_trades():
         stxt = (Text.from_markup("[bold green]WON[/]")  if status=="won"  else
                 Text.from_markup("[bold red]LOST[/]")   if status=="lost" else
                 Text.from_markup("[green]OPEN[/]"))
+        direction = (outcome or "").upper()
+        dtxt = (Text.from_markup("[bold green]UP[/]")   if direction == "UP"   else
+                Text.from_markup("[bold red]DOWN[/]")   if direction == "DOWN" else
+                Text("—", style="dim white"))
         t.add_row(str(rid), tstr,
-                  Text(f"T{tier} {coin} — {str(q)[:32]}", overflow="ellipsis"),
+                  Text(str(q), overflow="fold"),
+                  dtxt,
                   Text.from_markup(f"[{col}]T{tier}[/]"),
                   f"${size:.2f}",
                   Text.from_markup(f"[{pc}]{pstr}[/]"),
