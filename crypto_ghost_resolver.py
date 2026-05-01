@@ -877,7 +877,8 @@ PM verification ({PM_VERIFY_DELAY}s after close, up to {PM_VERIFY_RETRY} retries
                             try:
                                 await _tg_send(
                                     f"{icon} <b>T{tier} {coin} {side}</b> "
-                                    f"{status.upper()} <code>${pnl:+.2f}</code> {src_tag}\n"
+                                    f"{status.upper()} <code>${pnl:+.2f}</code> {src_tag} "
+                                    f"<b>#{trade_id}</b>\n"
                                     f"{question[:80]}\n"
                                     f"{tg_price}".rstrip()
                                 )
