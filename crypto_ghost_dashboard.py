@@ -2,6 +2,10 @@
 Crypto Ghost Dashboard — Clean rewrite
 """
 import sqlite3, asyncio, aiohttp, os, sys, time, re, json
+try:
+    from telegram_alerts import send_alert
+except Exception:
+    async def send_alert(msg): pass
 from datetime import datetime, timezone
 
 if sys.platform == "win32":
@@ -134,17 +138,18 @@ async def pm_oracle_checker():
             await asyncio.sleep(30)
             try:
                 rows = safe_query("""
-                    SELECT id, market_id, outcome, status, size_usdc, entry_price
+                    SELECT id, market_id, outcome, status, size_usdc, entry_price, question
                     FROM trades
                     WHERE status IN ('won','lost')
                       AND COALESCE(pm_result,'pending') = 'pending'
                       AND closed_at > datetime('now','-3 hours')
                 """)
-                for tid, market_id, outcome, status, size_usdc, entry_price in rows:
+                for tid, market_id, outcome, status, size_usdc, entry_price, question in rows:
                     pm = await _query_pm_oracle(session, market_id, outcome)
                     if pm is None:
                         continue
                     if pm != status:
+                        old_pnl = size_usdc if status == "won" else -size_usdc
                         pnl = (round(size_usdc / entry_price - size_usdc, 2)
                                if pm == "won" and entry_price else -size_usdc)
                         try:
@@ -156,6 +161,18 @@ async def pm_oracle_checker():
                             conn.close()
                         except Exception:
                             pass
+                        direction = (outcome or "").upper()
+                        old_emoji = "✅" if status == "won" else "❌"
+                        new_emoji = "✅" if pm == "won" else "❌"
+                        msg = (
+                            f"⚠️ <b>Oracle Correction — Trade #{tid}</b>\n"
+                            f"{direction} {market_id and '' or ''}{question or 'N/A'}\n\n"
+                            f"Entry: <b>${size_usdc:.2f}</b> @ ask <b>${entry_price:.3f}</b>\n\n"
+                            f"Resolver: {old_emoji} {status.upper()}\n"
+                            f"Oracle:   {new_emoji} {pm.upper()}\n\n"
+                            f"P&amp;L: <b>${old_pnl:+.2f}</b> → <b>${pnl:+.2f}</b>"
+                        )
+                        await send_alert(msg)
                     else:
                         try:
                             conn = db_connect()
