@@ -147,5 +147,68 @@ if has_verified and 'resolution_verified' in cols:
     v = sum(1 for r in rows if r['resolution_verified'])
     print(f"  ✓ {v}/{total} trades verified against Binance prices")
 
+# ── WINNING TRADES DETAIL ─────────────────────────────────────────────────────
+win_rows = conn.execute("""
+    SELECT id, ts, coin, outcome, entry_price, size_usdc, pnl, question
+    FROM trades WHERE status='won' ORDER BY id ASC
+""").fetchall()
+
+print(f"\n  WINNING TRADES ({len(win_rows)} total)")
+print("  " + "─"*65)
+print(f"  {'ID':>4}  {'Time':8}  {'Coin':4}  {'Dir':4}  {'Ask':6}  {'Size':6}  {'P&L':>10}  Question")
+print("  " + "─"*65)
+for w in win_rows:
+    ts_str = (w['ts'] or '')[:16]
+    q_short = (w['question'] or '')[:35]
+    print(f"  {w['id']:>4}  {ts_str:16}  {w['coin']:4}  {(w['outcome'] or ''):4}  "
+          f"${w['entry_price']:.3f}  ${w['size_usdc']:.2f}  ${w['pnl']:>+8.2f}  {q_short}")
+
+# ── BY ENTRY PRICE ────────────────────────────────────────────────────────────
+print(f"\n  BY ENTRY PRICE (ask)")
+print("  " + "─"*45)
+if 'entry_price' in cols:
+    buckets = {}
+    for r in rows:
+        ep = r['entry_price'] or 0
+        if ep <= 0.01:   key = "$0.010"
+        elif ep <= 0.02: key = "$0.020"
+        elif ep <= 0.03: key = "$0.030"
+        elif ep <= 0.05: key = "$0.050"
+        else:            key = ">$0.05"
+        if key not in buckets:
+            buckets[key] = {'w': 0, 'l': 0, 'pnl': 0}
+        buckets[key]['w'] += 1 if r['status'] == 'won' else 0
+        buckets[key]['l'] += 1 if r['status'] == 'lost' else 0
+        buckets[key]['pnl'] += r['pnl'] or 0
+    for key in sorted(buckets):
+        b = buckets[key]
+        t = b['w'] + b['l']
+        wr = (b['w'] / t * 100) if t else 0
+        print(f"  {key}: {b['w']:>3}W / {b['l']:>3}L | WR {wr:5.1f}% | P&L ${b['pnl']:+.2f}")
+
+# ── BY HOUR OF DAY ────────────────────────────────────────────────────────────
+print(f"\n  BY HOUR (UTC)")
+print("  " + "─"*45)
+if 'ts' in cols:
+    hours = {}
+    all_ts_rows = conn.execute(
+        "SELECT ts, status, pnl FROM trades WHERE status IN ('won','lost')").fetchall()
+    for r in all_ts_rows:
+        try:
+            hour = int((r['ts'] or '00:00')[11:13])
+        except Exception:
+            continue
+        if hour not in hours:
+            hours[hour] = {'w': 0, 'l': 0, 'pnl': 0}
+        hours[hour]['w'] += 1 if r['status'] == 'won' else 0
+        hours[hour]['l'] += 1 if r['status'] == 'lost' else 0
+        hours[hour]['pnl'] += r['pnl'] or 0
+    for h in sorted(hours):
+        b = hours[h]
+        t = b['w'] + b['l']
+        wr = (b['w'] / t * 100) if t else 0
+        bar = "★" * b['w']
+        print(f"  {h:02d}:00  {b['w']:>2}W/{b['l']:>3}L  WR {wr:5.1f}%  P&L ${b['pnl']:+7.2f}  {bar}")
+
 conn.close()
 input("\nPress Enter to close...")
