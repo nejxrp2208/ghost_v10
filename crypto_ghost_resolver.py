@@ -341,6 +341,7 @@ def ensure_schema():
         "ALTER TABLE trades ADD COLUMN redeemed INTEGER DEFAULT 0",
         "ALTER TABLE trades ADD COLUMN redeemed_at TEXT",
         "ALTER TABLE trades ADD COLUMN redeem_tx_hash TEXT",
+        "ALTER TABLE trades ADD COLUMN pm_result TEXT DEFAULT 'pending'",
     ]:
         try:
             conn.execute(ddl)
@@ -744,6 +745,90 @@ async def verify_against_pm_gamma(session, trade_id: int, token_id: str,
         print(f"[PM-VERIFY] DB override failed: {e}")
 
 
+async def pm_oracle_checker(session):
+    """Background task: verify closed trades against PM gamma every 30s.
+    Runs in the resolver so it works 24/7 on VPS without the dashboard."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            conn = db_connect()
+            rows = conn.execute("""
+                SELECT id, token_id, market_id, outcome, status,
+                       size_usdc, entry_price, question, tier, coin
+                FROM trades
+                WHERE status IN ('won','lost')
+                  AND COALESCE(pm_result,'pending') = 'pending'
+                  AND closed_at > datetime('now','-3 hours')
+            """).fetchall()
+            conn.close()
+        except Exception:
+            continue
+
+        for row in rows:
+            (tid, token_id, market_id, outcome, status,
+             size_usdc, entry_price, question, tier, coin) = row
+            try:
+                pm_status, pm_settled = await resolve_via_polymarket(
+                    session, token_id or '', market_id or '')
+            except Exception:
+                continue
+            if pm_status == 'pending':
+                continue
+
+            if pm_status == status:
+                try:
+                    conn = db_connect()
+                    conn.execute("UPDATE trades SET pm_result=? WHERE id=?",
+                                 (pm_status, tid))
+                    conn.commit()
+                    conn.close()
+                    print(f"[PM-ORC] ✓ #{tid} {coin} confirmed: {pm_status} "
+                          f"(settled={pm_settled})")
+                except Exception:
+                    pass
+            else:
+                side = (outcome or '').upper()
+                old_pnl = size_usdc if status == 'won' else -size_usdc
+                if pm_status == 'won':
+                    new_pnl = round(size_usdc / entry_price - size_usdc, 2) if entry_price else 0
+                    new_icon = "✅"
+                else:
+                    new_pnl = -float(size_usdc)
+                    new_icon = "❌"
+                delta = new_pnl - old_pnl
+                try:
+                    conn = db_connect()
+                    conn.execute("""
+                        UPDATE trades
+                        SET status=?, pnl=?, pm_result=?, resolution_verified=?
+                        WHERE id=?
+                    """, (pm_status, new_pnl, pm_status,
+                          RESOLUTION_CODE["pm_gamma_override"], tid))
+                    conn.commit()
+                    conn.close()
+                    log_event(new_icon,
+                              f"PM oracle #{tid} {coin}: {status}→{pm_status} ${delta:+.2f}")
+                    print(f"[PM-ORC] *** OVERRIDE #{tid} {coin} {side}: "
+                          f"{status}→{pm_status} ${delta:+.2f}")
+                except Exception as e:
+                    print(f"[PM-ORC] DB write failed: {e}")
+                    continue
+
+                if TELEGRAM_ENABLED:
+                    old_emoji = "✅" if status == "won" else "❌"
+                    try:
+                        await _tg_send(
+                            f"⚠️ <b>Oracle Correction — Trade #{tid}</b>\n"
+                            f"{side} {question or 'N/A'}\n\n"
+                            f"Entry: <b>${size_usdc:.2f}</b> @ ask <b>${entry_price:.3f}</b>\n\n"
+                            f"Resolver: {old_emoji} {status.upper()}\n"
+                            f"Oracle:   {new_icon} {pm_status.upper()}\n\n"
+                            f"P&amp;L: <b>${old_pnl:+.2f}</b> → <b>${new_pnl:+.2f}</b>"
+                        )
+                    except Exception:
+                        pass
+
+
 async def main():
     tg     = "ON" if TELEGRAM_ENABLED else "off"
     verify = "ON" if PM_VERIFY else "off"
@@ -773,6 +858,7 @@ PM verification ({PM_VERIFY_DELAY}s after close, up to {PM_VERIFY_RETRY} retries
 
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
+        asyncio.create_task(pm_oracle_checker(session))
         while True:
             try:
                 conn = db_connect()
