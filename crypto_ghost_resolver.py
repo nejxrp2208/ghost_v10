@@ -758,7 +758,7 @@ async def pm_oracle_checker(session):
                 FROM trades
                 WHERE status IN ('won','lost')
                   AND COALESCE(pm_result,'pending') = 'pending'
-                  AND closed_at > datetime('now','-3 hours')
+                  AND closed_at > datetime('now','-30 days')
             """).fetchall()
             conn.close()
         except Exception:
