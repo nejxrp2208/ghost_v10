@@ -745,6 +745,35 @@ async def verify_against_pm_gamma(session, trade_id: int, token_id: str,
         print(f"[PM-VERIFY] DB override failed: {e}")
 
 
+async def _query_pm_by_market_id(session, market_id: str, our_outcome: str):
+    """Fallback: query gamma by numeric market_id + outcome name."""
+    if not market_id or not str(market_id).strip().isdigit():
+        return None
+    try:
+        url = f"{GAMMA_API}/markets/{market_id}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10),
+                               headers={"User-Agent": "Mozilla/5.0"}) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+        import json as _json
+        op = data.get("outcomePrices", "[]")
+        oc = data.get("outcomes", "[]")
+        if isinstance(op, str): op = _json.loads(op)
+        if isinstance(oc, str): oc = _json.loads(oc)
+        if not op or not oc:
+            return None
+        prices = [float(p) for p in op]
+        if max(prices) < 0.99:
+            return None  # not settled yet
+        winner_idx = prices.index(max(prices))
+        winner = str(oc[winner_idx]).upper()
+        our    = (our_outcome or '').upper()
+        return "won" if winner == our else "lost"
+    except Exception:
+        return None
+
+
 async def pm_oracle_checker(session):
     """Background task: verify closed trades against PM gamma every 30s.
     Runs in the resolver so it works 24/7 on VPS without the dashboard."""
@@ -764,15 +793,33 @@ async def pm_oracle_checker(session):
         except Exception:
             continue
 
+        if rows:
+            print(f"[PM-ORC] Checking {len(rows)} pending trades...")
+
         for row in rows:
             (tid, token_id, market_id, outcome, status,
              size_usdc, entry_price, question, tier, coin) = row
-            try:
-                pm_status, pm_settled = await resolve_via_polymarket(
-                    session, token_id or '', market_id or '')
-            except Exception:
-                continue
-            if pm_status == 'pending':
+
+            pm_status = None
+            pm_settled = None
+
+            # Primary: token_id via clob_token_ids lookup
+            if token_id:
+                try:
+                    pm_status, pm_settled = await resolve_via_polymarket(
+                        session, token_id, market_id or '')
+                    if pm_status == 'pending':
+                        pm_status = None
+                except Exception:
+                    pm_status = None
+
+            # Fallback: market_id + outcome name
+            if pm_status is None:
+                result = await _query_pm_by_market_id(session, market_id or '', outcome or '')
+                if result is not None:
+                    pm_status = result
+
+            if pm_status is None:
                 continue
 
             if pm_status == status:
