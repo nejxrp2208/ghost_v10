@@ -363,8 +363,7 @@ def get_daily_loss():
 
 # ─── CRYPTO KEYWORD FILTERS ───────────────────────────────────────────────────
 COINS = {"BTC": ["btc", "bitcoin"],
-         "ETH": ["eth", "ethereum"],
-         "BNB": ["bnb", "binance coin"]}
+         "ETH": ["eth", "ethereum"]}
 
 def get_coin(question: str) -> Optional[str]:
     q = question.lower()
