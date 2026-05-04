@@ -67,12 +67,12 @@ except ImportError:
 
 # ─── CLOB CLIENT ──────────────────────────────────────────────────────────────
 try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs
-    from py_clob_client.order_builder.constants import BUY
+    from py_clob_client_v2.client import ClobClient
+    from py_clob_client_v2.clob_types import OrderArgsV2 as OrderArgs, ApiCreds
+    BUY = "BUY"
 except ImportError:
-    print("ERROR: py-clob-client not installed.")
-    print("Run: pip install py-clob-client")
+    print("ERROR: py-clob-client-v2 not installed.")
+    print("Run: pip install py-clob-client-v2")
     sys.exit(1)
 
 # ─── CONFIG (all values come from .env — edit that file, not this one) ────────
@@ -1332,9 +1332,16 @@ class CryptoGhostScanner:
             sys.exit(1)
 
         if not PAPER_TRADE:
+            _creds = ApiCreds(
+                api_key=os.getenv("API_KEY", ""),
+                api_secret=os.getenv("API_SECRET", ""),
+                api_passphrase=os.getenv("API_PASSPHRASE", ""),
+            )
             self.client = ClobClient(
                 host=POLYMARKET_HOST, key=PRIVATE_KEY,
-                chain_id=137, funder=FUNDER_ADDRESS, signature_type=1
+                chain_id=137,
+                funder=os.getenv("POLYMARKET_PROXY_ADDRESS", ""),
+                creds=_creds, signature_type=2
             )
         else:
             self.client = None
@@ -1407,7 +1414,8 @@ class CryptoGhostScanner:
             else:
                 order_args = OrderArgs(token_id=token_id, price=ask, size=shares, side=BUY)
                 resp       = self.client.create_and_post_order(order_args)
-                order_id   = resp.get("orderID", "") if resp else ""
+                order_id   = (resp.get("orderID") or resp.get("orderId") or
+                              resp.get("id") or "") if resp else ""
 
             if order_id:
                 self.open_positions[token_id] = {
