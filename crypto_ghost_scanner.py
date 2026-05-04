@@ -951,7 +951,6 @@ async def build_expected_slugs() -> list:
     coins = [
         ("BTC", "btc"),
         ("ETH", "eth"),
-        ("BNB", "bnb"),
     ]
 
     slugs = []
