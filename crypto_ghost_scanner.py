@@ -82,7 +82,7 @@ CLOB_START_CURSOR = "MTAwMA=="
 BINANCE_REST    = "https://api.binance.us/api/v3"
 BINANCE_WS_URL  = (
     "wss://stream.binance.us:9443/stream?streams="
-    "btcusdt@ticker/ethusdt@ticker/bnbusdt@ticker"
+    "btcusdt@ticker/ethusdt@ticker"
 )
 
 # ── Trade sizing per tier ──
@@ -522,7 +522,7 @@ class PriceTracker:
 
     async def run_websocket(self):
         """Maintain Binance WebSocket connection with auto-reconnect"""
-        coin_map = {"btcusdt": "BTC", "ethusdt": "ETH", "bnbusdt": "BNB"}
+        coin_map = {"btcusdt": "BTC", "ethusdt": "ETH"}
         while self.running:
             try:
                 async with aiohttp.ClientSession() as session:
