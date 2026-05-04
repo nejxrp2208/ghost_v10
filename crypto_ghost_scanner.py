@@ -1413,7 +1413,7 @@ class CryptoGhostScanner:
                 order_id = f"PAPER-{int(time.time()*1000)}"
             else:
                 order_args = OrderArgs(token_id=token_id, price=ask, size=shares, side=BUY)
-                resp       = self.client.create_and_post_order(order_args)
+                resp       = self.client.create_and_post_order(order_args, order_type="FAK")
                 order_id   = (resp.get("orderID") or resp.get("orderId") or
                               resp.get("id") or "") if resp else ""
 
