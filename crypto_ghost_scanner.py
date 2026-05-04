@@ -34,9 +34,15 @@ import sys
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List, Tuple
 
-# ─── WINDOWS FIX ──────────────────────────────────────────────────────────────
+# ─── WINDOWS FIX / UVLOOP ────────────────────────────────────────────────────
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+else:
+    try:
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except ImportError:
+        pass
 
 # ─── LOAD .ENV ────────────────────────────────────────────────────────────────
 try:
