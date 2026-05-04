@@ -1003,7 +1003,6 @@ PM verification ({PM_VERIFY_DELAY}s after close, up to {PM_VERIFY_RETRY} retries
                               f"{status.upper()} ${pnl:+.2f} {src_tag} | {price_str}")
                         if cid:
                             print(f"          condition_id = {cid[:18]}…")
-                        log_event(icon, f"T{tier} {coin} {status} ${pnl:+.2f} {src_tag}")
 
                         # Fire-and-forget Telegram alert. Silent if creds missing.
                         if TELEGRAM_ENABLED:
