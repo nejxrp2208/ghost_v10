@@ -327,5 +327,74 @@ if wins > 0 and losses > 0 and avg_payout > 0:
 else:
     print(f"  Not enough data for Kelly calculation")
 
+# ── BY ENTRY PRICE × COIN ────────────────────────────────────────────────────
+if 'entry_price' in cols:
+    print(f"\n  BY ENTRY PRICE × COIN")
+    print("  " + "─"*55)
+    cross = {}
+    for r in rows:
+        ep = r['entry_price'] or 0
+        if ep <= 0.01:   price_key = "$0.010"
+        elif ep <= 0.02: price_key = "$0.020"
+        elif ep <= 0.03: price_key = "$0.030"
+        else:            price_key = ">$0.03"
+        coin = r['coin']
+        key  = (coin, price_key)
+        if key not in cross:
+            cross[key] = {'w': 0, 'l': 0, 'pnl': 0}
+        cross[key]['w']   += 1 if r['status'] == 'won' else 0
+        cross[key]['l']   += 1 if r['status'] == 'lost' else 0
+        cross[key]['pnl'] += r['pnl'] or 0
+    for (coin, price_key) in sorted(cross):
+        b  = cross[(coin, price_key)]
+        t  = b['w'] + b['l']
+        wr = (b['w'] / t * 100) if t else 0
+        print(f"  {coin:<4} {price_key}: {b['w']:>3}W / {b['l']:>3}L | WR {wr:5.1f}% | P&L ${b['pnl']:+.2f}")
+
+# ── DAILY P&L ─────────────────────────────────────────────────────────────────
+if 'ts' in cols:
+    print(f"\n  DAILY P&L")
+    print("  " + "─"*45)
+    daily = {}
+    for r in rows:
+        try:
+            day = (r['ts'] or '')[:10]
+            if not day: continue
+        except Exception:
+            continue
+        if day not in daily:
+            daily[day] = {'w': 0, 'l': 0, 'pnl': 0}
+        daily[day]['w']   += 1 if r['status'] == 'won' else 0
+        daily[day]['l']   += 1 if r['status'] == 'lost' else 0
+        daily[day]['pnl'] += r['pnl'] or 0
+    for day in sorted(daily):
+        b  = daily[day]
+        t  = b['w'] + b['l']
+        wr = (b['w'] / t * 100) if t else 0
+        bar = "★" * b['w']
+        print(f"  {day}  {b['w']:>2}W/{b['l']:>3}L  WR {wr:5.1f}%  P&L ${b['pnl']:+8.2f}  {bar}")
+
+# ── CURRENT LOSING STREAK ─────────────────────────────────────────────────────
+print(f"\n  CURRENT STREAK")
+print("  " + "─"*45)
+current_streak = 0
+streak_type    = None
+for r in reversed(rows):
+    if streak_type is None:
+        streak_type = r['status']
+    if r['status'] == streak_type:
+        current_streak += 1
+    else:
+        break
+if streak_type == 'lost':
+    last_win = next((r for r in reversed(rows) if r['status'] == 'won'), None)
+    last_win_ts = (last_win['ts'] or '')[:16] if last_win else 'never'
+    print(f"  ❌ Current losing streak : {current_streak} trades")
+    print(f"  Last win                : {last_win_ts}")
+elif streak_type == 'won':
+    print(f"  ✅ Current winning streak: {current_streak} trades")
+else:
+    print(f"  No streak data.")
+
 conn.close()
 input("\nPress Enter to close...")
