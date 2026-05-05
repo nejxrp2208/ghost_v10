@@ -275,10 +275,17 @@ async def fetch_active_markets(session):
             return None
         # Use API date fields directly instead of regex parsing
         try:
+            def _parse_iso(s):
+                if not s:
+                    return None
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
             end_iso   = m.get("endDateIso") or m.get("endDate") or ""
             start_iso = m.get("startDateIso") or m.get("startDate") or ""
-            end_utc   = datetime.fromisoformat(end_iso.replace("Z", "+00:00")) if end_iso else None
-            start_utc = datetime.fromisoformat(start_iso.replace("Z", "+00:00")) if start_iso else None
+            end_utc   = _parse_iso(end_iso)
+            start_utc = _parse_iso(start_iso)
         except Exception:
             end_utc = start_utc = None
         # Fallback to regex if API fields missing
