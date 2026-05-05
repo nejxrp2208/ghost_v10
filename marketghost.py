@@ -89,6 +89,8 @@ def init_db():
             volume REAL,
             liquidity REAL,
             spread REAL,
+            binance_price REAL,
+            trend_dev_1h REAL,
             FOREIGN KEY (market_id) REFERENCES markets(market_id)
         );
 
@@ -110,6 +112,12 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_snap_ts ON snapshots(ts_utc);
         CREATE INDEX IF NOT EXISTS idx_mkt_end ON markets(end_utc);
     """)
+    # Migrate existing DB — safe if columns already exist
+    for col in ["binance_price REAL", "trend_dev_1h REAL"]:
+        try:
+            conn.execute(f"ALTER TABLE snapshots ADD COLUMN {col}")
+        except Exception:
+            pass
     conn.commit()
     conn.close()
 
@@ -348,6 +356,38 @@ async def fetch_orderbook(session, token_id: str):
     except Exception:
         return None, None, 0
 
+# ─── BINANCE TREND ────────────────────────────────────────────────────────────
+_trend_cache: dict = {}  # coin → (ts, price_now, dev_1h)
+_TREND_CACHE_TTL = 55    # refresh every ~55s (aligns with 60s snapshot loop)
+
+async def get_binance_trend(session, coin: str):
+    """Returns (current_price, dev_1h) for coin. Cached 55s."""
+    now = time.time()
+    cached = _trend_cache.get(coin)
+    if cached and now - cached[0] < _TREND_CACHE_TTL:
+        return cached[1], cached[2]
+
+    symbol = f"{coin}USDT"
+    try:
+        # Fetch last 2 x 1h candles: [0]=1h ago open, [1]=current
+        async with session.get(
+            f"{BINANCE_API}/api/v3/klines",
+            params={"symbol": symbol, "interval": "1h", "limit": 2},
+            timeout=aiohttp.ClientTimeout(total=8)
+        ) as r:
+            if r.status != 200:
+                return None, None
+            data = await r.json()
+            if len(data) < 2:
+                return None, None
+            price_1h_ago = float(data[0][1])  # open of 1h ago candle
+            price_now    = float(data[1][4])  # close of current candle
+            dev = round((price_now - price_1h_ago) / price_1h_ago, 6)
+            _trend_cache[coin] = (now, price_now, dev)
+            return price_now, dev
+    except Exception:
+        return None, None
+
 # ─── BINANCE RESOLUTION ───────────────────────────────────────────────────────
 async def get_binance_price_at(session, symbol: str, ts: datetime):
     target_ms = int(ts.timestamp() * 1000)
@@ -431,17 +471,22 @@ async def snapshot_once(session):
         mins_to_close = (m["end_utc"] - now).total_seconds() / 60.0
         spread = (up_ask or 0) - (up_bid or 0) if up_ask and up_bid else 0
 
+        # Fetch Binance trend (cached per coin per snapshot cycle)
+        bnc_price, trend_dev = await get_binance_trend(session, m["coin"])
+
         conn.execute("""
             INSERT INTO snapshots
             (market_id, ts_utc, mins_to_close,
              up_bid, up_ask, down_bid, down_ask,
              up_token_id, down_token_id,
-             volume, liquidity, spread)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+             volume, liquidity, spread,
+             binance_price, trend_dev_1h)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (m["market_id"], now.isoformat(), mins_to_close,
               up_bid, up_ask, down_bid, down_ask,
               up_token, down_token,
-              m["volume"], max(up_liq, down_liq), spread))
+              m["volume"], max(up_liq, down_liq), spread,
+              bnc_price, trend_dev))
         snapped += 1
         await asyncio.sleep(0.1)  # be nice to CLOB
 
