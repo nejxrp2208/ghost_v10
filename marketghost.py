@@ -27,6 +27,7 @@ import os
 import sys
 import re
 import json
+import time
 from datetime import datetime, timezone, timedelta
 
 if sys.platform == "win32":
@@ -162,38 +163,16 @@ def is_crypto_updown(title: str) -> bool:
     return any(c in t for c in ["bitcoin", "ethereum", "solana", "xrp"])
 
 def build_expected_slugs():
-    """Build Polymarket slugs for current + upcoming 5-min Up/Down markets."""
+    """Build Polymarket slugs using correct unix timestamp format."""
+    now = time.time()
     slugs = []
-    now_et = datetime.now(timezone.utc) - timedelta(hours=4)  # EDT
-
-    months = ["january","february","march","april","may","june",
-              "july","august","september","october","november","december"]
-    month = months[now_et.month - 1]
-    day   = now_et.day
-
-    for delta in range(-2, 8):
-        t = now_et + timedelta(minutes=delta * 5)
-        t_min  = (t.minute // 5) * 5
-        t2_min = t_min + 5
-        t_hour  = t.hour
-        t_hour2 = t_hour + (1 if t2_min >= 60 else 0)
-        if t2_min >= 60: t2_min -= 60
-
-        def fmt(h, m):
-            suf = "am" if h < 12 else "pm"
-            h12 = h % 12 or 12
-            return f"{h12:02d}{m:02d}{suf}" if m else f"{h12}{suf}"
-
-        t1_str = fmt(t_hour, t_min)
-        t2_str = fmt(t_hour2, t2_min)
-        if t1_str.startswith("0"): t1_str = t1_str[1:]
-        if t2_str.startswith("0"): t2_str = t2_str[1:]
-
-        for coin_slug in ["bitcoin", "ethereum", "solana", "xrp"]:
-            slug = f"{coin_slug}-up-or-down-{month}-{day}-{t1_str}-{t2_str}-et"
-            label = "XRP" if coin_slug == "xrp" else coin_slug.upper()[:3]
-            slugs.append((label, slug))
-
+    coins = [("BTC", "btc"), ("ETH", "eth")]
+    for interval_name, interval_secs in [("5m", 300), ("15m", 900)]:
+        for window in range(-1, 6):
+            end_ts = int((now // interval_secs + window) * interval_secs)
+            for coin_label, coin_slug in coins:
+                slug = f"{coin_slug}-updown-{interval_name}-{end_ts}"
+                slugs.append((coin_label, slug))
     return slugs
 
 async def fetch_via_wallet(session):
@@ -272,30 +251,25 @@ async def lookup_market_by_condition_id(session, cid):
         return None
 
 async def fetch_active_markets(session):
-    """Discover markets via wallet activity + slug fallback."""
+    """Discover markets via gamma sweep (primary) + slug scan (fallback)."""
     markets = []
     seen_ids = set()
 
-    # Method 1: Wallet watching (most reliable)
-    wallet_markets = await fetch_via_wallet(session)
-    for cid, info in wallet_markets.items():
-        m = await lookup_market_by_condition_id(session, cid)
-        if not m:
-            continue
+    def _parse_market(m, coin_fallback=None):
         mid = str(m.get("id", ""))
         if not mid or mid in seen_ids:
-            continue
-        seen_ids.add(mid)
-
+            return None
         q = m.get("question", "")
-        detected = detect_coin(q)
+        if "up or down" not in q.lower():
+            return None
+        detected = detect_coin(q) or coin_fallback
         if not detected:
-            continue
+            return None
         start_utc, end_utc = parse_market_times(q)
         if not end_utc:
-            continue
-
-        markets.append({
+            return None
+        seen_ids.add(mid)
+        return {
             "market_id": mid,
             "slug": m.get("slug", ""),
             "question": q,
@@ -307,40 +281,37 @@ async def fetch_active_markets(session):
             "outcomes": m.get("outcomes", "[]"),
             "volume": float(m.get("volume", 0) or 0),
             "liquidity": float(m.get("liquidity", 0) or 0),
-        })
-        await asyncio.sleep(0.05)
+        }
 
-    # Method 2: Slug fallback (for markets the wallet hasn't traded)
-    if len(markets) < 4:  # Only if wallet method didn't find much
-        slugs = build_expected_slugs()
-        for coin, slug in slugs:
+    # Method 1: Gamma API active sweep (primary)
+    for tag in ["crypto", "bitcoin", "ethereum"]:
+        try:
+            async with session.get(
+                f"{GAMMA_API}/markets",
+                params={"active": "true", "closed": "false",
+                        "tag": tag, "limit": 100},
+                headers=HEADERS,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    for m in (data if isinstance(data, list) else []):
+                        parsed = _parse_market(m)
+                        if parsed:
+                            markets.append(parsed)
+        except Exception as e:
+            print(f"[WARN] gamma sweep ({tag}): {e}")
+        await asyncio.sleep(0.1)
+
+    # Method 2: Slug scan fallback
+    if len(markets) < 2:
+        for coin, slug in build_expected_slugs():
             m = await lookup_market_by_slug(session, slug)
             if not m:
                 continue
-            mid = str(m.get("id", ""))
-            if not mid or mid in seen_ids:
-                continue
-            seen_ids.add(mid)
-
-            q = m.get("question", "")
-            detected = detect_coin(q) or coin
-            start_utc, end_utc = parse_market_times(q)
-            if not end_utc:
-                continue
-
-            markets.append({
-                "market_id": mid,
-                "slug": m.get("slug", slug),
-                "question": q,
-                "coin": detected,
-                "start_utc": start_utc,
-                "end_utc": end_utc,
-                "duration_min": int((end_utc - start_utc).total_seconds() / 60),
-                "clob_token_ids": m.get("clobTokenIds", "[]"),
-                "outcomes": m.get("outcomes", "[]"),
-                "volume": float(m.get("volume", 0) or 0),
-                "liquidity": float(m.get("liquidity", 0) or 0),
-            })
+            parsed = _parse_market(m, coin_fallback=coin)
+            if parsed:
+                markets.append(parsed)
             await asyncio.sleep(0.05)
 
     return markets
