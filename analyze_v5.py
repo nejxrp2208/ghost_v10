@@ -420,5 +420,33 @@ if 'trend_dev_1h' in cols:
             pnl = sum(r[1] or 0 for r in subset)
             print(f"  {label}: {w:>3}W / {l:>3}L | WR {wr:5.1f}% | P&L ${pnl:+.2f}")
 
+# ── BY SECS_LEFT ─────────────────────────────────────────────────────────────
+if 'secs_left' in cols:
+    secs_rows = conn.execute("""
+        SELECT status, pnl, secs_left FROM trades
+        WHERE status IN ('won','lost') AND secs_left IS NOT NULL
+    """).fetchall()
+    if secs_rows:
+        print(f"\n  BY SECS LEFT AT ENTRY")
+        print("  " + "─"*55)
+        sec_buckets = {
+            " 0-10s ": (0,   10),
+            "10-20s ": (10,  20),
+            "20-30s ": (20,  30),
+            "30-45s ": (30,  45),
+            "45-60s ": (45,  60),
+            "60-90s ": (60,  90),
+            " >90s  ": (90,  99999),
+        }
+        for label, (lo, hi) in sec_buckets.items():
+            subset = [r for r in secs_rows if lo <= r[2] < hi]
+            if not subset:
+                continue
+            w   = sum(1 for r in subset if r[0] == 'won')
+            l   = len(subset) - w
+            wr  = (w / len(subset) * 100) if subset else 0
+            pnl = sum(r[1] or 0 for r in subset)
+            print(f"  {label}: {w:>3}W / {l:>3}L | WR {wr:5.1f}% | P&L ${pnl:+.2f}")
+
 conn.close()
 input("\nPress Enter to close...")
