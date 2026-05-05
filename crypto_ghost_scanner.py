@@ -335,19 +335,19 @@ def log_event(icon: str, msg: str):
     except Exception:
         pass
 
-def log_trade(tier, coin, market_id, token_id, question, entry, size, order_id, outcome="UP"):
+def log_trade(tier, coin, market_id, token_id, question, entry, size, order_id, outcome="UP", trend_dev=None):
     conn = sqlite3.connect(DB_PATH)
-    # Add outcome column if missing (handles existing DBs)
-    try:
-        conn.execute("ALTER TABLE trades ADD COLUMN outcome TEXT DEFAULT 'UP'")
-        conn.commit()
-    except Exception:
-        pass
+    for col in ["outcome TEXT DEFAULT 'UP'", "trend_dev_1h REAL"]:
+        try:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {col}")
+            conn.commit()
+        except Exception:
+            pass
     conn.execute("""
-        INSERT INTO trades (ts,tier,coin,market_id,token_id,question,entry_price,size_usdc,order_id,outcome)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO trades (ts,tier,coin,market_id,token_id,question,entry_price,size_usdc,order_id,outcome,trend_dev_1h)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
     """, (datetime.now(timezone.utc).isoformat(), tier, coin,
-          market_id, token_id, question[:120], entry, size, order_id, outcome))
+          market_id, token_id, question[:120], entry, size, order_id, outcome, trend_dev))
     conn.commit()
     conn.close()
 
@@ -1393,7 +1393,8 @@ class CryptoGhostScanner:
                 3: T3_MAX_ENTRY, 4: T4_MAX_ENTRY}.get(tier, 0.15)
 
     async def fire_trade(self, tier: int, coin: str, token_id: str,
-                         market: dict, ask: float, outcome: str = "UP") -> bool:
+                         market: dict, ask: float, outcome: str = "UP",
+                         trend_dev: float = None) -> bool:
         if token_id in self.open_positions:
             return False
         if len(self.open_positions) >= MAX_OPEN_POSITIONS:
@@ -1424,7 +1425,7 @@ class CryptoGhostScanner:
                     "order_id": order_id, "ts": time.time()
                 }
                 log_trade(tier, coin, market.get("id",""),
-                          token_id, question, ask, size, order_id, outcome)
+                          token_id, question, ask, size, order_id, outcome, trend_dev)
                 self.trades_fired += 1
                 payout   = round(size / ask - size, 2)
                 ts       = datetime.now().strftime("%H:%M:%S")
@@ -1727,7 +1728,7 @@ class CryptoGhostScanner:
             print(f"         SIGNAL PASSED — YES/UP entry={ask:.3f} certainty={no_implied:.0%}")
             log_event("🎯", f"Signal T{tier} {coin} {tok_outcome} ask={ask:.3f} "
                              f"certainty={no_implied:.0%} mins={mins:.1f}")
-            if await self.fire_trade(tier, coin, token_id, m, ask, outcome=tok_outcome):
+            if await self.fire_trade(tier, coin, token_id, m, ask, outcome=tok_outcome, trend_dev=dev):
                 fired += 1
                 await asyncio.sleep(0.3)
 

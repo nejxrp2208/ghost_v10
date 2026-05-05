@@ -396,5 +396,29 @@ elif streak_type == 'won':
 else:
     print(f"  No streak data.")
 
+# ── BY TREND STRENGTH ────────────────────────────────────────────────────────
+if 'trend_dev_1h' in cols:
+    trend_rows = conn.execute("""
+        SELECT status, pnl, trend_dev_1h FROM trades
+        WHERE status IN ('won','lost') AND trend_dev_1h IS NOT NULL
+    """).fetchall()
+    if trend_rows:
+        print(f"\n  BY TREND STRENGTH (1h deviation at entry)")
+        print("  " + "─"*55)
+        buckets = {
+            "weak   0.1-0.3%": (0.001, 0.003),
+            "medium 0.3-1.0%": (0.003, 0.010),
+            "strong  >1.0%  ": (0.010, 99.0),
+        }
+        for label, (lo, hi) in buckets.items():
+            subset = [r for r in trend_rows if lo <= abs(r[2]) < hi]
+            if not subset:
+                continue
+            w   = sum(1 for r in subset if r[0] == 'won')
+            l   = len(subset) - w
+            wr  = (w / len(subset) * 100) if subset else 0
+            pnl = sum(r[1] or 0 for r in subset)
+            print(f"  {label}: {w:>3}W / {l:>3}L | WR {wr:5.1f}% | P&L ${pnl:+.2f}")
+
 conn.close()
 input("\nPress Enter to close...")
