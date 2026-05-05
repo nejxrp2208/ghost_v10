@@ -265,18 +265,29 @@ async def fetch_active_markets(session):
         detected = detect_coin(q) or coin_fallback
         if not detected:
             return None
-        start_utc, end_utc = parse_market_times(q)
+        # Use API date fields directly instead of regex parsing
+        try:
+            end_iso   = m.get("endDateIso") or m.get("endDate") or ""
+            start_iso = m.get("startDateIso") or m.get("startDate") or ""
+            end_utc   = datetime.fromisoformat(end_iso.replace("Z", "+00:00")) if end_iso else None
+            start_utc = datetime.fromisoformat(start_iso.replace("Z", "+00:00")) if start_iso else None
+        except Exception:
+            end_utc = start_utc = None
+        # Fallback to regex if API fields missing
+        if not end_utc:
+            start_utc, end_utc = parse_market_times(q)
         if not end_utc:
             return None
         seen_ids.add(mid)
+        dur = int((end_utc - start_utc).total_seconds() / 60) if start_utc else 5
         return {
             "market_id": mid,
             "slug": m.get("slug", ""),
             "question": q,
             "coin": detected,
-            "start_utc": start_utc,
+            "start_utc": start_utc or end_utc,
             "end_utc": end_utc,
-            "duration_min": int((end_utc - start_utc).total_seconds() / 60),
+            "duration_min": dur,
             "clob_token_ids": m.get("clobTokenIds", "[]"),
             "outcomes": m.get("outcomes", "[]"),
             "volume": float(m.get("volume", 0) or 0),
