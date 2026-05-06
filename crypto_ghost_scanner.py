@@ -1341,7 +1341,7 @@ class CryptoGhostScanner:
                 host=POLYMARKET_HOST, key=PRIVATE_KEY,
                 chain_id=137,
                 funder=os.getenv("POLYMARKET_PROXY_ADDRESS", ""),
-                creds=_creds, signature_type=2
+                creds=_creds, signature_type=3
             )
         else:
             self.client = None
