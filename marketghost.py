@@ -56,7 +56,7 @@ DISCOVERY_WALLET = ""
 USE_WALLET_DISCOVERY = os.getenv("WALLET_DISCOVERY", "false").strip().lower() in ("true", "1", "yes")
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-SNAPSHOT_INTERVAL = 60   # seconds between snapshots
+SNAPSHOT_INTERVAL = 15   # seconds between snapshots
 RESOLUTION_INTERVAL = 300  # check for resolutions every 5 min
 
 # ─── DB SETUP ─────────────────────────────────────────────────────────────────
