@@ -91,6 +91,10 @@ def init_db():
             spread REAL,
             binance_price REAL,
             trend_dev_1h REAL,
+            liq_usd REAL,
+            cheap_side TEXT,
+            cheap_ask REAL,
+            hour_et INTEGER,
             FOREIGN KEY (market_id) REFERENCES markets(market_id)
         );
 
@@ -113,7 +117,8 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_mkt_end ON markets(end_utc);
     """)
     # Migrate existing DB — safe if columns already exist
-    for col in ["binance_price REAL", "trend_dev_1h REAL"]:
+    for col in ["binance_price REAL", "trend_dev_1h REAL",
+                "liq_usd REAL", "cheap_side TEXT", "cheap_ask REAL", "hour_et INTEGER"]:
         try:
             conn.execute(f"ALTER TABLE snapshots ADD COLUMN {col}")
         except Exception:
@@ -481,19 +486,37 @@ async def snapshot_once(session):
         # Fetch Binance trend (cached per coin per snapshot cycle)
         bnc_price, trend_dev = await get_binance_trend(session, m["coin"])
 
+        # Derived fields for bot signal analysis
+        if up_ask is not None and down_ask is not None:
+            if up_ask <= down_ask:
+                cheap_side, cheap_ask = "UP", up_ask
+            else:
+                cheap_side, cheap_ask = "DOWN", down_ask
+        elif up_ask is not None:
+            cheap_side, cheap_ask = "UP", up_ask
+        elif down_ask is not None:
+            cheap_side, cheap_ask = "DOWN", down_ask
+        else:
+            cheap_side, cheap_ask = None, None
+
+        liq_usd = round(cheap_ask * (up_liq if cheap_side == "UP" else down_liq), 4) if cheap_ask else None
+        hour_et = (now - timedelta(hours=4)).hour  # UTC-4 approximation (ET)
+
         conn.execute("""
             INSERT INTO snapshots
             (market_id, ts_utc, mins_to_close,
              up_bid, up_ask, down_bid, down_ask,
              up_token_id, down_token_id,
              volume, liquidity, spread,
-             binance_price, trend_dev_1h)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             binance_price, trend_dev_1h,
+             liq_usd, cheap_side, cheap_ask, hour_et)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (m["market_id"], now.isoformat(), mins_to_close,
               up_bid, up_ask, down_bid, down_ask,
               up_token, down_token,
               m["volume"], max(up_liq, down_liq), spread,
-              bnc_price, trend_dev))
+              bnc_price, trend_dev,
+              liq_usd, cheap_side, cheap_ask, hour_et))
         snapped += 1
         await asyncio.sleep(0.1)  # be nice to CLOB
 
