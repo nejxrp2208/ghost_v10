@@ -85,9 +85,9 @@ CLOB_API          = "https://clob.polymarket.com"
 # Skip first 1000 old markets in CLOB API (they are old resolved sports markets)
 # Recent April 2026 crypto markets start appearing after offset 1000
 CLOB_START_CURSOR = "MTAwMA=="
-BINANCE_REST    = "https://api.binance.us/api/v3"
+BINANCE_REST    = "https://api.binance.com/api/v3"
 BINANCE_WS_URL  = (
-    "wss://stream.binance.us:9443/stream?streams="
+    "wss://stream.binance.com:9443/stream?streams="
     "btcusdt@ticker/ethusdt@ticker"
 )
 

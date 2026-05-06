@@ -313,7 +313,7 @@ DB_PATH     = os.path.join(SCRIPT_DIR,
 
 GAMMA_API    = "https://gamma-api.polymarket.com"
 DATA_API     = "https://data-api.polymarket.com"
-BINANCE_API  = "https://api.binance.us"
+BINANCE_API  = "https://api.binance.com"
 COINBASE_API = "https://api.exchange.coinbase.com"
 POLL_INTERVAL = 10
 
