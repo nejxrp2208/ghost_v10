@@ -75,6 +75,7 @@ def init_db():
             start_utc TEXT,
             end_utc TEXT,
             first_seen TEXT,
+            open_price REAL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -95,6 +96,7 @@ def init_db():
             cheap_side TEXT,
             cheap_ask REAL,
             hour_et INTEGER,
+            required_move_pct REAL,
             FOREIGN KEY (market_id) REFERENCES markets(market_id)
         );
 
@@ -118,7 +120,13 @@ def init_db():
     """)
     # Migrate existing DB — safe if columns already exist
     for col in ["binance_price REAL", "trend_dev_1h REAL",
-                "liq_usd REAL", "cheap_side TEXT", "cheap_ask REAL", "hour_et INTEGER"]:
+                "liq_usd REAL", "cheap_side TEXT", "cheap_ask REAL", "hour_et INTEGER",
+                "required_move_pct REAL"]:
+        try:
+            conn.execute(f"ALTER TABLE snapshots ADD COLUMN {col}")
+        except Exception:
+            pass
+    for col in ["open_price REAL"]:
         try:
             conn.execute(f"ALTER TABLE snapshots ADD COLUMN {col}")
         except Exception:
@@ -456,18 +464,23 @@ async def snapshot_once(session):
 
         # Register market if new
         existing = conn.execute(
-            "SELECT market_id FROM markets WHERE market_id = ?", (m["market_id"],)
+            "SELECT market_id, open_price FROM markets WHERE market_id = ?", (m["market_id"],)
         ).fetchone()
         if not existing:
+            symbol = f"{m['coin']}USDT"
+            open_price = await get_binance_price_at(session, symbol, m["start_utc"])
             conn.execute("""
                 INSERT INTO markets
                 (market_id, slug, question, coin, duration_minutes,
-                 start_utc, end_utc, first_seen)
-                VALUES (?,?,?,?,?,?,?,?)
+                 start_utc, end_utc, first_seen, open_price)
+                VALUES (?,?,?,?,?,?,?,?,?)
             """, (m["market_id"], m["slug"], m["question"], m["coin"],
                   m["duration_min"], m["start_utc"].isoformat(),
-                  m["end_utc"].isoformat(), now.isoformat()))
+                  m["end_utc"].isoformat(), now.isoformat(), open_price))
             registered += 1
+            open_price_row = open_price
+        else:
+            open_price_row = existing[1]
 
         # Only snapshot if market is still open
         if now > m["end_utc"]:
@@ -502,6 +515,14 @@ async def snapshot_once(session):
         liq_usd = round(cheap_ask * (up_liq if cheap_side == "UP" else down_liq), 4) if cheap_ask else None
         hour_et = (now - timedelta(hours=4)).hour  # UTC-4 approximation (ET)
 
+        # required_move_pct: how much % BTC needs to move for cheap side to win
+        required_move_pct = None
+        if bnc_price and open_price_row:
+            if cheap_side == "UP":
+                required_move_pct = round((open_price_row - bnc_price) / bnc_price, 6)
+            elif cheap_side == "DOWN":
+                required_move_pct = round((bnc_price - open_price_row) / bnc_price, 6)
+
         conn.execute("""
             INSERT INTO snapshots
             (market_id, ts_utc, mins_to_close,
@@ -509,14 +530,14 @@ async def snapshot_once(session):
              up_token_id, down_token_id,
              volume, liquidity, spread,
              binance_price, trend_dev_1h,
-             liq_usd, cheap_side, cheap_ask, hour_et)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             liq_usd, cheap_side, cheap_ask, hour_et, required_move_pct)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (m["market_id"], now.isoformat(), mins_to_close,
               up_bid, up_ask, down_bid, down_ask,
               up_token, down_token,
               m["volume"], max(up_liq, down_liq), spread,
               bnc_price, trend_dev,
-              liq_usd, cheap_side, cheap_ask, hour_et))
+              liq_usd, cheap_side, cheap_ask, hour_et, required_move_pct))
         snapped += 1
         await asyncio.sleep(0.1)  # be nice to CLOB
 
