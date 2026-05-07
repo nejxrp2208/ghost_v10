@@ -515,17 +515,6 @@ async def snapshot_once(session):
         # Fetch Binance trend (cached per coin per snapshot cycle)
         bnc_price, trend_dev, trend_dev_1m = await get_binance_trend(session, m["coin"])
 
-        # ask_velocity: change in cheap_ask vs previous snapshot (per minute)
-        prev = conn.execute("""
-            SELECT cheap_ask, mins_to_close FROM snapshots
-            WHERE market_id = ? ORDER BY ts_utc DESC LIMIT 1
-        """, (m["market_id"],)).fetchone()
-        ask_velocity = None
-        if prev and prev[0] is not None:
-            time_diff_min = (mins_to_close - prev[1]) if prev[1] else None
-            if time_diff_min and time_diff_min != 0:
-                ask_velocity = round((cheap_ask - prev[0]) / abs(time_diff_min), 6) if cheap_ask else None
-
         # Derived fields for bot signal analysis
         if up_ask is not None and down_ask is not None:
             if up_ask <= down_ask:
@@ -538,6 +527,17 @@ async def snapshot_once(session):
             cheap_side, cheap_ask = "DOWN", down_ask
         else:
             cheap_side, cheap_ask = None, None
+
+        # ask_velocity: change in cheap_ask vs previous snapshot (per minute)
+        prev = conn.execute("""
+            SELECT cheap_ask, mins_to_close FROM snapshots
+            WHERE market_id = ? ORDER BY ts_utc DESC LIMIT 1
+        """, (m["market_id"],)).fetchone()
+        ask_velocity = None
+        if prev and prev[0] is not None and cheap_ask is not None:
+            time_diff_min = mins_to_close - prev[1] if prev[1] is not None else None
+            if time_diff_min and time_diff_min != 0:
+                ask_velocity = round((cheap_ask - prev[0]) / abs(time_diff_min), 6)
 
         liq_usd = round(cheap_ask * (up_liq if cheap_side == "UP" else down_liq), 4) if cheap_ask else None
         hour_et = (now - timedelta(hours=4)).hour  # UTC-4 approximation (ET)
