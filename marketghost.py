@@ -288,24 +288,38 @@ async def fetch_active_markets(session):
         detected = detect_coin(q) or coin_fallback
         if not detected:
             return None
-        # Use API date fields directly instead of regex parsing
-        try:
-            def _parse_iso(s):
-                if not s:
-                    return None
-                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt
-            end_iso   = m.get("endDateIso") or m.get("endDate") or ""
-            start_iso = m.get("startDateIso") or m.get("startDate") or ""
-            end_utc   = _parse_iso(end_iso)
-            start_utc = _parse_iso(start_iso)
-        except Exception:
-            end_utc = start_utc = None
-        # Fallback to regex if API fields missing
+        end_utc = start_utc = None
+
+        # Primary: extract end time from slug unix timestamp (most reliable)
+        slug = m.get("slug", "")
+        slug_match = re.search(r'-(\d{9,11})$', slug)
+        if slug_match:
+            try:
+                end_ts = int(slug_match.group(1))
+                end_utc = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+                if "-5m-" in slug:
+                    start_utc = end_utc - timedelta(minutes=5)
+                elif "-15m-" in slug:
+                    start_utc = end_utc - timedelta(minutes=15)
+            except Exception:
+                end_utc = start_utc = None
+
+        # Secondary: regex parse from question text (ET → UTC)
         if not end_utc:
             start_utc, end_utc = parse_market_times(q)
+
+        # Last resort: ISO field — only use if it contains a time component
+        if not end_utc:
+            try:
+                end_iso = m.get("endDateIso") or m.get("endDate") or ""
+                if "T" in end_iso or "t" in end_iso:
+                    dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    end_utc = dt
+            except Exception:
+                pass
+
         if not end_utc:
             return None
         seen_ids.add(mid)
