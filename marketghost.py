@@ -520,8 +520,8 @@ async def snapshot_once(session):
         else:
             open_price_row = existing[1]
 
-        # Only snapshot if market is still open
-        if now > m["end_utc"]:
+        # Only snapshot if market is active (started AND not yet ended)
+        if now < m["start_utc"] or now > m["end_utc"]:
             continue
 
         # Fetch orderbooks
