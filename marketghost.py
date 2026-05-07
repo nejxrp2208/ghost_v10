@@ -130,7 +130,7 @@ def init_db():
             pass
     for col in ["open_price REAL"]:
         try:
-            conn.execute(f"ALTER TABLE snapshots ADD COLUMN {col}")
+            conn.execute(f"ALTER TABLE markets ADD COLUMN {col}")
         except Exception:
             pass
     conn.commit()
