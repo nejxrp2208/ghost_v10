@@ -358,18 +358,24 @@ async def fetch_active_markets(session):
             print(f"[WARN] gamma sweep ({tag}): {e}")
         await asyncio.sleep(0.1)
 
-    # Method 2: Slug scan — always run to find active 5m/15m markets
-    # Gamma sweep finds daily/4h markets (good for registration),
-    # slug scan reliably finds currently open 5m/15m markets.
+    # Method 2: Slug scan — always run, slug timestamp gives correct end_utc
+    # Reset seen_ids so slug scan can re-parse markets Gamma found with wrong time
+    seen_ids.clear()
     now_utc = datetime.now(timezone.utc)
+    slug_markets = []
     for coin, slug in build_expected_slugs():
         m = await lookup_market_by_slug(session, slug)
         if not m:
             continue
         parsed = _parse_market(m, coin_fallback=coin)
         if parsed and parsed["end_utc"] > now_utc:
-            markets.append(parsed)
+            slug_markets.append(parsed)
         await asyncio.sleep(0.05)
+
+    # Merge: slug_markets override Gamma results for same market_id
+    slug_ids = {m["market_id"] for m in slug_markets}
+    markets = [m for m in markets if m["market_id"] not in slug_ids]
+    markets.extend(slug_markets)
 
     return markets
 
