@@ -109,10 +109,11 @@ def init_db():
             end_utc TEXT,
             price_start REAL,
             price_end REAL,
-            winner TEXT,          -- 'UP' or 'DOWN'
+            winner TEXT,
             up_final_price REAL,
             down_final_price REAL,
             resolved_at TEXT,
+            winner_source TEXT DEFAULT 'polymarket',
             FOREIGN KEY (market_id) REFERENCES markets(market_id)
         );
 
@@ -131,6 +132,11 @@ def init_db():
     for col in ["open_price REAL"]:
         try:
             conn.execute(f"ALTER TABLE markets ADD COLUMN {col}")
+        except Exception:
+            pass
+    for col in ["winner_source TEXT"]:
+        try:
+            conn.execute(f"ALTER TABLE resolutions ADD COLUMN {col}")
         except Exception:
             pass
     conn.commit()
@@ -604,12 +610,12 @@ async def snapshot_once(session):
 
 # ─── RESOLUTION LOOP ──────────────────────────────────────────────────────────
 async def resolve_pending(session):
-    """For markets that ended but aren't resolved yet, fetch Binance prices."""
+    """For markets that ended but aren't resolved yet, fetch actual outcome from Polymarket."""
     conn = db_connect()
     now = datetime.now(timezone.utc)
 
     pending = conn.execute("""
-        SELECT m.market_id, m.coin, m.start_utc, m.end_utc, m.question
+        SELECT m.market_id, m.coin, m.start_utc, m.end_utc
         FROM markets m
         LEFT JOIN resolutions r ON m.market_id = r.market_id
         WHERE r.market_id IS NULL
@@ -623,43 +629,73 @@ async def resolve_pending(session):
         return 0
 
     resolved = 0
-    for market_id, coin, start_iso, end_iso, question in pending:
+    for market_id, coin, start_iso, end_iso in pending:
         try:
-            start_utc = datetime.fromisoformat(start_iso)
-            end_utc   = datetime.fromisoformat(end_iso)
+            end_utc = datetime.fromisoformat(end_iso)
         except Exception:
             continue
 
-        # Need 60s grace for Binance 1m candle
+        # Give PM 60s to settle before first attempt
         if (now - end_utc).total_seconds() < 60:
             continue
 
-        symbol = f"{coin}USDT"
-        p_start = await get_binance_price_at(session, symbol, start_utc)
-        p_end   = await get_binance_price_at(session, symbol, end_utc)
-        if p_start is None or p_end is None:
-            continue
-
-        winner = "UP" if p_end >= p_start else "DOWN"
-
-        # Get final snapshot for final prices
-        final_snap = conn.execute("""
-            SELECT up_ask, down_ask FROM snapshots
+        # Get token IDs and final ask prices from last snapshot
+        last_snap = conn.execute("""
+            SELECT up_token_id, down_token_id, up_ask, down_ask FROM snapshots
             WHERE market_id = ?
             ORDER BY ts_utc DESC LIMIT 1
         """, (market_id,)).fetchone()
-        up_final  = final_snap[0] if final_snap else None
-        down_final= final_snap[1] if final_snap else None
+
+        if not last_snap or not last_snap[0]:
+            continue  # no token IDs stored — can't query PM
+
+        up_token   = last_snap[0]
+        up_final   = last_snap[2]
+        down_final = last_snap[3]
+
+        # Query Polymarket gamma for actual settled outcomePrices
+        winner = None
+        try:
+            async with session.get(
+                f"{GAMMA_API}/markets",
+                params={"clob_token_ids": up_token},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    if isinstance(data, list) and data:
+                        m_data = data[0]
+                        if m_data.get("closed"):
+                            op  = m_data.get("outcomePrices", "[]")
+                            oc  = m_data.get("outcomes", "[]")
+                            if isinstance(op, str):
+                                try: op = json.loads(op)
+                                except Exception: op = []
+                            if isinstance(oc, str):
+                                try: oc = json.loads(oc)
+                                except Exception: oc = []
+                            if op and oc:
+                                prices = [float(p) for p in op]
+                                if max(prices) >= 0.99:
+                                    winner_idx = prices.index(max(prices))
+                                    winner_str = str(oc[winner_idx]).upper()
+                                    winner = "UP" if winner_str in ("UP", "YES", "HIGHER", "ABOVE") else "DOWN"
+        except Exception as e:
+            print(f"[WARN] PM resolve {market_id}: {e}")
+
+        if winner is None:
+            # PM not settled yet — will retry next resolution cycle
+            continue
 
         conn.execute("""
             INSERT OR REPLACE INTO resolutions
             (market_id, coin, start_utc, end_utc,
              price_start, price_end, winner,
-             up_final_price, down_final_price, resolved_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+             up_final_price, down_final_price, resolved_at, winner_source)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (market_id, coin, start_iso, end_iso,
-              p_start, p_end, winner,
-              up_final, down_final, now.isoformat()))
+              None, None, winner,
+              up_final, down_final, now.isoformat(), "polymarket"))
         resolved += 1
         await asyncio.sleep(0.2)
 
@@ -668,7 +704,7 @@ async def resolve_pending(session):
 
     if resolved:
         ts = datetime.now().strftime('%H:%M:%S')
-        print(f"[{ts}] 🏁 Resolved {resolved} markets via Binance")
+        print(f"[{ts}] 🏁 Resolved {resolved} markets via Polymarket")
     return resolved
 
 # ─── STATS DISPLAY ────────────────────────────────────────────────────────────
