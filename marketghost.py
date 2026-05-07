@@ -344,6 +344,10 @@ async def fetch_active_markets(session):
             print(f"[WARN] gamma sweep ({tag}): {e}")
         await asyncio.sleep(0.1)
 
+    # Filter out already-expired markets (Gamma has delay in marking closed)
+    now_utc = datetime.now(timezone.utc)
+    markets = [m for m in markets if m["end_utc"] > now_utc]
+
     # Method 2: Slug scan fallback
     if len(markets) < 2:
         for coin, slug in build_expected_slugs():
