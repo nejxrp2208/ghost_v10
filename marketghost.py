@@ -398,10 +398,12 @@ async def fetch_orderbook(session, token_id: str):
             data = await r.json()
             bids = data.get("bids", [])
             asks = data.get("asks", [])
-            best_bid = float(bids[0]["price"]) if bids else 0.0
-            best_ask = float(asks[0]["price"]) if asks else 0.0
-            # Liquidity = size at best ask
-            liq = float(asks[0]["size"]) if asks else 0.0
+            # Sort: bids descending (best = highest first), asks ascending (best = lowest first)
+            sorted_bids = sorted(bids, key=lambda x: float(x.get("price", 0)), reverse=True)
+            sorted_asks = sorted(asks, key=lambda x: float(x.get("price", 1)))
+            best_bid = float(sorted_bids[0]["price"]) if sorted_bids else 0.0
+            best_ask = float(sorted_asks[0]["price"]) if sorted_asks else 0.0
+            liq = float(sorted_asks[0]["size"]) if sorted_asks else 0.0
             return best_bid, best_ask, liq
     except Exception:
         return None, None, 0
