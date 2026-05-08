@@ -761,20 +761,22 @@ Press Ctrl+C to stop. Data persists in marketghost.db
             try:
                 await snapshot_once(session)
 
-                now_ts = asyncio.get_event_loop().time()
+                now_ts = time.monotonic()
                 if now_ts - last_resolve >= RESOLUTION_INTERVAL:
                     await resolve_pending(session)
                     last_resolve = now_ts
 
-                # Print stats every 10 minutes
                 if now_ts - last_stats >= 600:
                     print_stats()
                     last_stats = now_ts
 
+                await asyncio.sleep(SNAPSHOT_INTERVAL)
+
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 print(f"[WARN] Loop error: {e}")
-
-            await asyncio.sleep(SNAPSHOT_INTERVAL)
+                await asyncio.sleep(SNAPSHOT_INTERVAL)
 
 if __name__ == "__main__":
     try:
