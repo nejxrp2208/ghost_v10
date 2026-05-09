@@ -622,8 +622,8 @@ async def resolve_pending(session):
         LEFT JOIN resolutions r ON m.market_id = r.market_id
         WHERE r.market_id IS NULL
           AND datetime(m.end_utc) < datetime(?)
-        ORDER BY m.end_utc DESC
-        LIMIT 50
+        ORDER BY m.end_utc ASC
+        LIMIT 200
     """, (now.isoformat(),)).fetchall()
 
     if not pending:
@@ -669,19 +669,22 @@ async def resolve_pending(session):
                         m_data = data[0]
                         if m_data.get("closed"):
                             op  = m_data.get("outcomePrices", "[]")
-                            oc  = m_data.get("outcomes", "[]")
+                            cti = m_data.get("clobTokenIds", "[]")
                             if isinstance(op, str):
                                 try: op = json.loads(op)
                                 except Exception: op = []
-                            if isinstance(oc, str):
-                                try: oc = json.loads(oc)
-                                except Exception: oc = []
-                            if op and oc:
+                            if isinstance(cti, str):
+                                try: cti = json.loads(cti)
+                                except Exception: cti = []
+                            if op and cti:
                                 prices = [float(p) for p in op]
                                 if max(prices) >= 0.99:
-                                    winner_idx = prices.index(max(prices))
-                                    winner_str = str(oc[winner_idx]).upper()
-                                    winner = "UP" if winner_str in ("UP", "YES", "HIGHER", "ABOVE") else "DOWN"
+                                    try:
+                                        up_idx = cti.index(str(up_token))
+                                        winner = "UP" if float(op[up_idx]) >= 0.5 else "DOWN"
+                                    except (ValueError, IndexError):
+                                        winner_idx = prices.index(max(prices))
+                                        winner = "UP" if winner_idx == 0 else "DOWN"
         except Exception as e:
             print(f"[WARN] PM resolve {market_id}: {e}")
 
