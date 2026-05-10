@@ -1,442 +1,242 @@
 """
-MarketGhost v1.0 — 24/7 Polymarket Crypto Data Collector
-=========================================================
-Runs alongside your trading bot, silently collecting market data.
-Does NOT trade. Does NOT interfere. Read-only observation.
+MarketGhost v3 — 24/7 Polymarket crypto Up/Down market data collector
 
-What it does:
-  1. Every 60 seconds, fetches every active BTC/ETH/SOL/XRP Up/Down market
-  2. Stores a full snapshot: bid/ask, liquidity, volume, minutes-to-close
-  3. When markets end, records the outcome from Binance (ground truth)
-  4. All data lives in marketghost.db (separate from trading DB)
+Strategy: focus sampling on markets in their FINAL 10 minutes.
+Adaptive sampling tiers by time-to-close + compression depth.
 
-Why this matters:
-  - Lets you BACKTEST filter ideas against real data, not just guesses
-  - Answers questions like "does WR improve at X price?" with actual stats
-  - Builds a 30+ day archive so you can validate strategy over time
-  - Completely independent of the trading bot — can't break it
+Added vs v3 base:
+  - CLOB orderbook for real bid/ask prices
+  - Binance trend (dev_1h, dev_1m, current price) cached per coin
+  - ask_velocity: change in cheap_ask per minute
+  - required_move_pct: how much BTC/ETH needs to move for cheap side to win
 
-Run with: python marketghost.py
-Stop with: Ctrl+C
+Usage:  python marketghost.py
 """
 
 import asyncio
 import aiohttp
 import sqlite3
-import os
-import sys
-import re
-import json
 import time
+import json
 from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-try:
-    from dotenv import load_dotenv
-    SD = os.path.dirname(os.path.abspath(__file__))
-    ep = os.path.join(SD, ".env")
-    if os.path.exists(ep):
-        load_dotenv(ep, override=True)
-except ImportError:
-    pass
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH    = os.path.join(SCRIPT_DIR, "marketghost.db")
+# ── CONFIG ────────────────────────────────────────────────────────────────────
 GAMMA_API   = "https://gamma-api.polymarket.com"
-DATA_API    = "https://data-api.polymarket.com"
 CLOB_API    = "https://clob.polymarket.com"
 BINANCE_API = "https://api.binance.com"
+DB_PATH     = "marketghost.db"
+MIN_LIQ_USD = 0.50
+LOOP_SLEEP  = 3
 
-# Wallet-based discovery removed by default — Polymarket-only.
-# Set WALLET_DISCOVERY=true in .env to re-enable third-party wallet
-# market discovery. Default = false.
-DISCOVERY_WALLET = ""
-USE_WALLET_DISCOVERY = os.getenv("WALLET_DISCOVERY", "false").strip().lower() in ("true", "1", "yes")
-HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-SNAPSHOT_INTERVAL = 15   # seconds between snapshots
-RESOLUTION_INTERVAL = 300  # check for resolutions every 5 min
+# ── ADAPTIVE SAMPLING ────────────────────────────────────────────────────────
+def sample_interval(mins_left: float, cheap_ask: float) -> int | None:
+    """Return snapshot interval (seconds) or None to skip (> 10 min left)."""
+    if mins_left is None or mins_left <= 0 or mins_left > 10:
+        return None
+    if   mins_left > 5: base = 60
+    elif mins_left > 2: base = 20
+    elif mins_left > 1: base =  5
+    else:               base =  2
+    if cheap_ask is not None:
+        if   cheap_ask < 0.01: return 1
+        elif cheap_ask < 0.05: return 2
+        elif cheap_ask < 0.10: return max(2, base // 4)
+        elif cheap_ask < 0.20: return max(5, base // 2)
+    return base
 
-# ─── DB SETUP ─────────────────────────────────────────────────────────────────
-def db_connect():
-    return sqlite3.connect(DB_PATH, timeout=10)
 
+def comp_zone(cheap_ask) -> str:
+    if cheap_ask is None or cheap_ask >= 0.95: return 'none'
+    if cheap_ask < 0.01: return 'extreme'
+    if cheap_ask < 0.05: return 'deep'
+    if cheap_ask < 0.10: return 'medium'
+    if cheap_ask < 0.20: return 'light'
+    return 'none'
+
+
+# ── DATABASE ─────────────────────────────────────────────────────────────────
 def init_db():
-    conn = db_connect()
-    conn.executescript("""
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+
+    c.execute("""
         CREATE TABLE IF NOT EXISTS markets (
-            market_id TEXT PRIMARY KEY,
-            slug TEXT,
-            question TEXT,
-            coin TEXT,
+            market_id        TEXT PRIMARY KEY,
+            slug             TEXT,
+            question         TEXT,
+            coin             TEXT,
             duration_minutes INTEGER,
-            start_utc TEXT,
-            end_utc TEXT,
-            first_seen TEXT,
-            open_price REAL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            market_id TEXT,
-            ts_utc TEXT,
-            mins_to_close REAL,
-            up_bid REAL, up_ask REAL,
-            down_bid REAL, down_ask REAL,
-            up_token_id TEXT, down_token_id TEXT,
-            volume REAL,
-            liquidity REAL,
-            spread REAL,
-            binance_price REAL,
-            trend_dev_1h REAL,
-            liq_usd REAL,
-            cheap_side TEXT,
-            cheap_ask REAL,
-            hour_et INTEGER,
-            required_move_pct REAL,
-            binance_1m_dev REAL,
-            ask_velocity REAL,
-            FOREIGN KEY (market_id) REFERENCES markets(market_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS resolutions (
-            market_id TEXT PRIMARY KEY,
-            coin TEXT,
-            start_utc TEXT,
-            end_utc TEXT,
-            price_start REAL,
-            price_end REAL,
-            winner TEXT,
-            up_final_price REAL,
-            down_final_price REAL,
-            resolved_at TEXT,
-            winner_source TEXT DEFAULT 'polymarket',
-            FOREIGN KEY (market_id) REFERENCES markets(market_id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_snap_market ON snapshots(market_id);
-        CREATE INDEX IF NOT EXISTS idx_snap_ts ON snapshots(ts_utc);
-        CREATE INDEX IF NOT EXISTS idx_mkt_end ON markets(end_utc);
+            start_utc        TEXT,
+            end_utc          TEXT,
+            first_seen       TEXT,
+            open_price       REAL
+        )
     """)
-    # Migrate existing DB — safe if columns already exist
-    for col in ["binance_price REAL", "trend_dev_1h REAL",
-                "liq_usd REAL", "cheap_side TEXT", "cheap_ask REAL", "hour_et INTEGER",
-                "required_move_pct REAL", "binance_1m_dev REAL", "ask_velocity REAL"]:
-        try:
-            conn.execute(f"ALTER TABLE snapshots ADD COLUMN {col}")
-        except Exception:
-            pass
-    for col in ["open_price REAL"]:
-        try:
-            conn.execute(f"ALTER TABLE markets ADD COLUMN {col}")
-        except Exception:
-            pass
-    for col in ["winner_source TEXT"]:
-        try:
-            conn.execute(f"ALTER TABLE resolutions ADD COLUMN {col}")
-        except Exception:
-            pass
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_id               TEXT NOT NULL,
+            ts_utc                  TEXT NOT NULL,
+            mins_to_close           REAL,
+            up_bid                  REAL,
+            up_ask                  REAL,
+            down_bid                REAL,
+            down_ask                REAL,
+            up_token_id             TEXT,
+            down_token_id           TEXT,
+            volume                  REAL,
+            liq_usd                 REAL,
+            spread                  REAL,
+            cheap_side              TEXT,
+            cheap_ask               REAL,
+            hour_utc                INTEGER,
+            is_in_compression       INTEGER,
+            compression_zone        TEXT,
+            price_moved_since_last  REAL,
+            is_active_compression   INTEGER,
+            snapshot_interval_used  INTEGER,
+            binance_price           REAL,
+            trend_dev_1h            REAL,
+            binance_1m_dev          REAL,
+            ask_velocity            REAL,
+            required_move_pct       REAL,
+            UNIQUE(market_id, ts_utc)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS resolutions (
+            market_id        TEXT PRIMARY KEY,
+            coin             TEXT,
+            start_utc        TEXT,
+            end_utc          TEXT,
+            winner           TEXT,
+            up_final_price   REAL,
+            down_final_price REAL,
+            resolved_at      TEXT
+        )
+    """)
+
+    c.execute("DROP TABLE IF EXISTS markets_compression_summary")
+    c.execute("""
+        CREATE TABLE markets_compression_summary (
+            market_id                 TEXT PRIMARY KEY,
+            min_cheap_ask_ever        REAL,
+            compression_zone_depth    TEXT,
+            did_reach_extreme         INTEGER,
+            did_reach_deep            INTEGER,
+            did_reach_medium          INTEGER,
+            compression_duration_secs INTEGER,
+            total_snapshots           INTEGER,
+            compression_snapshots     INTEGER,
+            first_snap_ts             TEXT,
+            last_snap_ts              TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
+    print("[DB] Schema ready")
 
-# ─── PARSING ──────────────────────────────────────────────────────────────────
-def parse_market_times(question: str):
-    """Returns (start_utc, end_utc) from question text."""
-    m = re.search(
-        r'(\w+)\s+(\d+),\s+(\d+):(\d+)(AM|PM)-(\d+):(\d+)(AM|PM)',
-        question, re.IGNORECASE
-    )
-    if not m:
-        return None, None
-    month_name, day, h1, m1, ap1, h2, m2, ap2 = m.groups()
-    months = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
-              "july":7,"august":8,"september":9,"october":10,"november":11,"december":12}
-    mo = months.get(month_name.lower())
-    if not mo:
-        return None, None
-    year = datetime.now(timezone.utc).year
-    def to24(h, ap):
-        h = int(h)
-        if ap.upper() == "PM" and h != 12: h += 12
-        if ap.upper() == "AM" and h == 12: h = 0
-        return h
+
+# ── HELPERS ──────────────────────────────────────────────────────────────────
+def get_coin(question: str) -> str:
+    q = question.upper()
+    for full, short in [("BITCOIN","BTC"), ("ETHEREUM","ETH"), ("SOLANA","SOL")]:
+        if full in q: return short
+    for c in ["BTC", "ETH", "SOL", "XRP"]:
+        if c in q: return c
+    return "OTHER"
+
+
+def parse_mins_left(market: dict, now: datetime) -> float | None:
     try:
-        start_et = datetime(year, mo, int(day), to24(h1, ap1), int(m1), tzinfo=timezone.utc)
-        end_et   = datetime(year, mo, int(day), to24(h2, ap2), int(m2), tzinfo=timezone.utc)
-        start_utc = start_et + timedelta(hours=4)
-        end_utc   = end_et   + timedelta(hours=4)
-        if end_utc < start_utc:
-            end_utc += timedelta(days=1)
-        return start_utc, end_utc
-    except Exception:
-        return None, None
-
-def detect_coin(question: str):
-    q = question.lower()
-    if 'bitcoin' in q or ' btc ' in q: return 'BTC'
-    if 'ethereum' in q or ' eth ' in q: return 'ETH'
-    if 'solana' in q or ' sol ' in q: return 'SOL'
-    if 'xrp' in q or 'ripple' in q: return 'XRP'
-    return None
-
-# ─── MARKET DISCOVERY — Polymarket only (wallet discovery off by default) ──
-DATA_API = "https://data-api.polymarket.com"
-
-def is_crypto_updown(title: str) -> bool:
-    t = title.lower()
-    if "up or down" not in t:
-        return False
-    return any(c in t for c in ["bitcoin", "ethereum", "solana", "xrp"])
-
-def build_expected_slugs():
-    """Build Polymarket slugs using correct unix timestamp format."""
-    now = time.time()
-    slugs = []
-    coins = [("BTC", "btc"), ("ETH", "eth")]
-    for interval_name, interval_secs in [("5m", 300), ("15m", 900)]:
-        for window in range(-1, 6):
-            end_ts = int((now // interval_secs + window) * interval_secs)
-            for coin_label, coin_slug in coins:
-                slug = f"{coin_slug}-updown-{interval_name}-{end_ts}"
-                slugs.append((coin_label, slug))
-    return slugs
-
-async def fetch_via_wallet(session):
-    """
-    Disabled by default — third-party wallet discovery removed.
-    Returns empty dict so downstream code still works. Set
-    WALLET_DISCOVERY=true in .env AND configure DISCOVERY_WALLET
-    locally to re-enable.
-    """
-    if not USE_WALLET_DISCOVERY or not DISCOVERY_WALLET:
-        return {}
-    markets = {}
-    now = datetime.now(timezone.utc).timestamp()
-    try:
-        url = (f"{DATA_API}/activity?user={DISCOVERY_WALLET}"
-               f"&type=TRADE&limit=100&sortBy=TIMESTAMP&sortDirection=DESC")
-        async with session.get(url,
-                               headers={"User-Agent": "Mozilla/5.0"},
-                               timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status != 200:
-                return markets
-            trades = await r.json()
-            if not isinstance(trades, list):
-                return markets
-            for t in trades:
-                age = now - float(t.get("timestamp", 0))
-                if age > 1800:
-                    continue
-                title = t.get("title", "")
-                cid   = t.get("conditionId", "")
-                if not is_crypto_updown(title) or not cid:
-                    continue
-                if cid in markets:
-                    continue
-                markets[cid] = {
-                    "condition_id": cid,
-                    "question": title,
-                    "asset": str(t.get("asset", "")),
-                }
-    except Exception as e:
-        print(f"[WARN] wallet discovery: {e}")
-    return markets
-
-async def lookup_market_by_slug(session, slug):
-    """Direct slug lookup."""
-    try:
-        async with session.get(
-            f"{GAMMA_API}/markets",
-            params={"slug": slug},
-            timeout=aiohttp.ClientTimeout(total=5)
-        ) as r:
-            if r.status != 200:
-                return None
-            data = await r.json()
-            if isinstance(data, list) and data:
-                return data[0]
-            return None
+        s = (market.get("endDateIso") or market.get("endDate") or "").strip()
+        if not s: return None
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (dt - now).total_seconds() / 60.0
     except Exception:
         return None
 
-async def lookup_market_by_condition_id(session, cid):
-    """Look up full market data by condition_id (more reliable than slug)."""
+
+def parse_liq(market: dict) -> float:
+    try: return float(market.get("liquidityAmm") or market.get("liquidity") or 0)
+    except Exception: return 0.0
+
+
+def parse_token_ids(market: dict):
+    """Return (up_tok, down_tok) by matching outcomes array."""
     try:
-        async with session.get(
-            f"{GAMMA_API}/markets",
-            params={"condition_ids": cid},
-            timeout=aiohttp.ClientTimeout(total=5)
-        ) as r:
-            if r.status != 200:
-                return None
-            data = await r.json()
-            if isinstance(data, list) and data:
-                return data[0]
-            return None
+        cti = market.get("clobTokenIds", "[]")
+        oc  = market.get("outcomes",     "[]")
+        if isinstance(cti, str): cti = json.loads(cti)
+        if isinstance(oc,  str): oc  = json.loads(oc)
+        if len(cti) < 2: return None, None
+        up_tok = down_tok = None
+        for i, o in enumerate(oc):
+            if str(o).upper() in ("UP", "YES", "HIGHER", "ABOVE"):
+                up_tok = cti[i]
+            else:
+                down_tok = cti[i]
+        # Fallback: just use index 0/1
+        if not up_tok:   up_tok   = cti[0]
+        if not down_tok: down_tok = cti[1]
+        return up_tok, down_tok
     except Exception:
-        return None
+        return None, None
 
-async def fetch_active_markets(session):
-    """Discover markets via gamma sweep (primary) + slug scan (fallback)."""
-    markets = []
-    seen_ids = set()
 
-    def _parse_market(m, coin_fallback=None):
-        mid = str(m.get("id", ""))
-        if not mid or mid in seen_ids:
-            return None
-        q = m.get("question", "")
-        if "up or down" not in q.lower():
-            return None
-        detected = detect_coin(q) or coin_fallback
-        if not detected:
-            return None
-        end_utc = start_utc = None
-
-        # Primary: extract end time from slug unix timestamp (most reliable)
-        slug = m.get("slug", "")
-        slug_match = re.search(r'-(\d{9,11})$', slug)
-        if slug_match:
-            try:
-                end_ts = int(slug_match.group(1))
-                end_utc = datetime.fromtimestamp(end_ts, tz=timezone.utc)
-                if "-5m-" in slug:
-                    start_utc = end_utc - timedelta(minutes=5)
-                elif "-15m-" in slug:
-                    start_utc = end_utc - timedelta(minutes=15)
-            except Exception:
-                end_utc = start_utc = None
-
-        # Secondary: regex parse from question text (ET → UTC)
-        if not end_utc:
-            start_utc, end_utc = parse_market_times(q)
-
-        # Last resort: ISO field — only use if it contains a time component
-        if not end_utc:
-            try:
-                end_iso = m.get("endDateIso") or m.get("endDate") or ""
-                if "T" in end_iso or "t" in end_iso:
-                    dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    end_utc = dt
-            except Exception:
-                pass
-
-        if not end_utc:
-            return None
-        seen_ids.add(mid)
-        dur = int((end_utc - start_utc).total_seconds() / 60) if start_utc else 5
-        return {
-            "market_id": mid,
-            "slug": m.get("slug", ""),
-            "question": q,
-            "coin": detected,
-            "start_utc": start_utc or end_utc,
-            "end_utc": end_utc,
-            "duration_min": dur,
-            "clob_token_ids": m.get("clobTokenIds", "[]"),
-            "outcomes": m.get("outcomes", "[]"),
-            "volume": float(m.get("volume", 0) or 0),
-            "liquidity": float(m.get("liquidity", 0) or 0),
-        }
-
-    # Method 1: Gamma API active sweep (primary)
-    for tag in ["crypto", "bitcoin", "ethereum"]:
-        try:
-            async with session.get(
-                f"{GAMMA_API}/markets",
-                params={"active": "true", "closed": "false",
-                        "tag": tag, "limit": 100},
-                headers=HEADERS,
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    for m in (data if isinstance(data, list) else []):
-                        parsed = _parse_market(m)
-                        if parsed:
-                            markets.append(parsed)
-        except Exception as e:
-            print(f"[WARN] gamma sweep ({tag}): {e}")
-        await asyncio.sleep(0.1)
-
-    # Method 2: Slug scan — always run, slug timestamp gives correct end_utc
-    # Reset seen_ids so slug scan can re-parse markets Gamma found with wrong time
-    seen_ids.clear()
-    now_utc = datetime.now(timezone.utc)
-    slug_markets = []
-    for coin, slug in build_expected_slugs():
-        m = await lookup_market_by_slug(session, slug)
-        if not m:
-            continue
-        parsed = _parse_market(m, coin_fallback=coin)
-        if parsed and parsed["end_utc"] > now_utc:
-            slug_markets.append(parsed)
-        await asyncio.sleep(0.05)
-
-    # Merge: slug_markets override Gamma results for same market_id
-    slug_ids = {m["market_id"] for m in slug_markets}
-    markets = [m for m in markets if m["market_id"] not in slug_ids]
-    markets.extend(slug_markets)
-
-    return markets
-
+# ── CLOB ORDERBOOK ───────────────────────────────────────────────────────────
 async def fetch_orderbook(session, token_id: str):
-    """Get best bid/ask for a token."""
+    """Returns (best_bid, best_ask, ask_size) from CLOB."""
     try:
         async with session.get(
             f"{CLOB_API}/book",
             params={"token_id": token_id},
-            timeout=aiohttp.ClientTimeout(total=8)
+            timeout=aiohttp.ClientTimeout(total=6)
         ) as r:
-            if r.status != 200:
-                return None, None, 0
-            data = await r.json()
-            bids = data.get("bids", [])
-            asks = data.get("asks", [])
-            # Sort: bids descending (best = highest first), asks ascending (best = lowest first)
-            sorted_bids = sorted(bids, key=lambda x: float(x.get("price", 0)), reverse=True)
-            sorted_asks = sorted(asks, key=lambda x: float(x.get("price", 1)))
-            best_bid = float(sorted_bids[0]["price"]) if sorted_bids else 0.0
-            best_ask = float(sorted_asks[0]["price"]) if sorted_asks else 0.0
-            liq = float(sorted_asks[0]["size"]) if sorted_asks else 0.0
-            return best_bid, best_ask, liq
+            if r.status != 200: return None, None, 0.0
+            data  = await r.json()
+            bids  = sorted(data.get("bids", []), key=lambda x: float(x.get("price", 0)), reverse=True)
+            asks  = sorted(data.get("asks", []), key=lambda x: float(x.get("price", 1)))
+            bid   = float(bids[0]["price"]) if bids else 0.0
+            ask   = float(asks[0]["price"]) if asks else 0.0
+            size  = float(asks[0]["size"])  if asks else 0.0
+            return bid, ask, size
     except Exception:
-        return None, None, 0
+        return None, None, 0.0
 
-# ─── BINANCE TREND ────────────────────────────────────────────────────────────
-_trend_cache: dict = {}  # coin → (ts, price_now, dev_1h, dev_1m)
-_TREND_CACHE_TTL = 13    # refresh every ~13s (aligns with 15s snapshot loop)
+
+# ── BINANCE TREND (cached per coin, 13s TTL) ─────────────────────────────────
+_trend_cache: dict = {}
+_TREND_TTL = 13
+
 
 async def get_binance_trend(session, coin: str):
-    """Returns (current_price, dev_1h, dev_1m) for coin. Cached 13s."""
+    """Returns (price_now, dev_1h, dev_1m). Cached 13s."""
     now = time.time()
     cached = _trend_cache.get(coin)
-    if cached and now - cached[0] < _TREND_CACHE_TTL:
+    if cached and now - cached[0] < _TREND_TTL:
         return cached[1], cached[2], cached[3]
-
     symbol = f"{coin}USDT"
     try:
-        # Fetch last 2 x 1h candles for 1h dev
         async with session.get(
             f"{BINANCE_API}/api/v3/klines",
             params={"symbol": symbol, "interval": "1h", "limit": 2},
             timeout=aiohttp.ClientTimeout(total=8)
         ) as r:
-            if r.status != 200:
-                return None, None, None
+            if r.status != 200: return None, None, None
             data = await r.json()
-            if len(data) < 2:
-                return None, None, None
-            price_1h_ago = float(data[0][1])
+            if len(data) < 2: return None, None, None
             price_now    = float(data[1][4])
+            price_1h_ago = float(data[0][1])
             dev_1h = round((price_now - price_1h_ago) / price_1h_ago, 6)
 
-        # Fetch last 2 x 1m candles for 1m dev
         dev_1m = None
         async with session.get(
             f"{BINANCE_API}/api/v3/klines",
@@ -446,347 +246,367 @@ async def get_binance_trend(session, coin: str):
             if r.status == 200:
                 data = await r.json()
                 if len(data) >= 2:
-                    price_1m_ago = float(data[0][1])  # open of previous 1m candle
-                    dev_1m = round((price_now - price_1m_ago) / price_1m_ago, 6)
+                    dev_1m = round((price_now - float(data[0][1])) / float(data[0][1]), 6)
 
         _trend_cache[coin] = (now, price_now, dev_1h, dev_1m)
         return price_now, dev_1h, dev_1m
     except Exception:
         return None, None, None
 
-# ─── BINANCE RESOLUTION ───────────────────────────────────────────────────────
-async def get_binance_price_at(session, symbol: str, ts: datetime):
+
+async def get_binance_price_at(session, coin: str, ts: datetime):
     target_ms = int(ts.timestamp() * 1000)
     try:
         async with session.get(
             f"{BINANCE_API}/api/v3/klines",
-            params={"symbol": symbol, "interval": "1m",
+            params={"symbol": f"{coin}USDT", "interval": "1m",
                     "startTime": target_ms - 60000,
-                    "endTime": target_ms + 60000, "limit": 3},
+                    "endTime":   target_ms + 60000, "limit": 3},
             timeout=aiohttp.ClientTimeout(total=10)
         ) as r:
-            if r.status != 200:
-                return None
+            if r.status != 200: return None
             data = await r.json()
-            if not data:
-                return None
-            best = min(data, key=lambda c: abs(c[0] - target_ms))
-            return float(best[4])
+            if not data: return None
+            return float(min(data, key=lambda c: abs(c[0] - target_ms))[4])
     except Exception:
         return None
 
-# ─── SNAPSHOT LOOP ────────────────────────────────────────────────────────────
-async def snapshot_once(session):
-    markets = await fetch_active_markets(session)
-    if not markets:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] No active crypto markets found")
-        return 0
 
-    conn = db_connect()
-    now = datetime.now(timezone.utc)
-    registered = 0
-    snapped = 0
-
-    for m in markets:
-        # Parse token IDs
-        try:
-            token_ids = json.loads(m["clob_token_ids"]) if isinstance(m["clob_token_ids"], str) else m["clob_token_ids"]
-            outcomes  = json.loads(m["outcomes"]) if isinstance(m["outcomes"], str) else m["outcomes"]
-        except Exception:
-            continue
-        if len(token_ids) < 2 or len(outcomes) < 2:
-            continue
-
-        # Figure out which token is UP vs DOWN
-        up_token = down_token = None
-        for i, oc in enumerate(outcomes):
-            oc_upper = str(oc).upper()
-            if oc_upper in ("UP","YES","HIGHER","ABOVE"):
-                up_token = token_ids[i]
-            else:
-                down_token = token_ids[i]
-        if not up_token or not down_token:
-            continue
-
-        # Register market if new
-        existing = conn.execute(
-            "SELECT market_id, open_price FROM markets WHERE market_id = ?", (m["market_id"],)
-        ).fetchone()
-        if not existing:
-            symbol = f"{m['coin']}USDT"
-            open_price = await get_binance_price_at(session, symbol, m["start_utc"])
-            conn.execute("""
-                INSERT INTO markets
-                (market_id, slug, question, coin, duration_minutes,
-                 start_utc, end_utc, first_seen, open_price)
-                VALUES (?,?,?,?,?,?,?,?,?)
-            """, (m["market_id"], m["slug"], m["question"], m["coin"],
-                  m["duration_min"], m["start_utc"].isoformat(),
-                  m["end_utc"].isoformat(), now.isoformat(), open_price))
-            registered += 1
-            open_price_row = open_price
-        else:
-            open_price_row = existing[1]
-
-        # Only snapshot if market is active (started AND not yet ended)
-        if now < m["start_utc"] or now > m["end_utc"]:
-            continue
-
-        # Fetch orderbooks
-        up_bid, up_ask, up_liq = await fetch_orderbook(session, up_token)
-        down_bid, down_ask, down_liq = await fetch_orderbook(session, down_token)
-
-        if up_ask is None and down_ask is None:
-            continue
-
-        mins_to_close = (m["end_utc"] - now).total_seconds() / 60.0
-        spread = (up_ask or 0) - (up_bid or 0) if up_ask and up_bid else 0
-
-        # Fetch Binance trend (cached per coin per snapshot cycle)
-        bnc_price, trend_dev, trend_dev_1m = await get_binance_trend(session, m["coin"])
-
-        # Derived fields for bot signal analysis
-        if up_ask is not None and down_ask is not None:
-            if up_ask <= down_ask:
-                cheap_side, cheap_ask = "UP", up_ask
-            else:
-                cheap_side, cheap_ask = "DOWN", down_ask
-        elif up_ask is not None:
-            cheap_side, cheap_ask = "UP", up_ask
-        elif down_ask is not None:
-            cheap_side, cheap_ask = "DOWN", down_ask
-        else:
-            cheap_side, cheap_ask = None, None
-
-        # ask_velocity: change in cheap_ask vs previous snapshot (per minute)
-        prev = conn.execute("""
-            SELECT cheap_ask, mins_to_close FROM snapshots
-            WHERE market_id = ? ORDER BY ts_utc DESC LIMIT 1
-        """, (m["market_id"],)).fetchone()
-        ask_velocity = None
-        if prev and prev[0] is not None and cheap_ask is not None:
-            time_diff_min = mins_to_close - prev[1] if prev[1] is not None else None
-            if time_diff_min and time_diff_min != 0:
-                ask_velocity = round((cheap_ask - prev[0]) / abs(time_diff_min), 6)
-
-        liq_usd = round(cheap_ask * (up_liq if cheap_side == "UP" else down_liq), 4) if cheap_ask else None
-        hour_et = (now - timedelta(hours=4)).hour  # UTC-4 approximation (ET)
-
-        # required_move_pct: how much % BTC needs to move for cheap side to win
-        required_move_pct = None
-        if bnc_price and open_price_row:
-            if cheap_side == "UP":
-                required_move_pct = round((open_price_row - bnc_price) / bnc_price, 6)
-            elif cheap_side == "DOWN":
-                required_move_pct = round((bnc_price - open_price_row) / bnc_price, 6)
-
-        conn.execute("""
-            INSERT INTO snapshots
-            (market_id, ts_utc, mins_to_close,
-             up_bid, up_ask, down_bid, down_ask,
-             up_token_id, down_token_id,
-             volume, liquidity, spread,
-             binance_price, trend_dev_1h,
-             liq_usd, cheap_side, cheap_ask, hour_et,
-             required_move_pct, binance_1m_dev, ask_velocity)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (m["market_id"], now.isoformat(), mins_to_close,
-              up_bid, up_ask, down_bid, down_ask,
-              up_token, down_token,
-              m["volume"], max(up_liq, down_liq), spread,
-              bnc_price, trend_dev,
-              liq_usd, cheap_side, cheap_ask, hour_et,
-              required_move_pct, trend_dev_1m, ask_velocity))
-        snapped += 1
-        await asyncio.sleep(0.1)  # be nice to CLOB
-
-    conn.commit()
-    conn.close()
-
-    ts = datetime.now().strftime('%H:%M:%S')
-    if registered:
-        print(f"[{ts}] 📸 Snapshot: {snapped} markets | {registered} new registered")
-    else:
-        print(f"[{ts}] 📸 Snapshot: {snapped} markets")
-    return snapped
-
-# ─── RESOLUTION LOOP ──────────────────────────────────────────────────────────
-async def resolve_pending(session):
-    """For markets that ended but aren't resolved yet, fetch actual outcome from Polymarket."""
-    conn = db_connect()
-    now = datetime.now(timezone.utc)
-
-    pending = conn.execute("""
-        SELECT m.market_id, m.coin, m.start_utc, m.end_utc
-        FROM markets m
-        LEFT JOIN resolutions r ON m.market_id = r.market_id
-        WHERE r.market_id IS NULL
-          AND datetime(m.end_utc) < datetime(?)
-        ORDER BY m.end_utc ASC
-        LIMIT 200
-    """, (now.isoformat(),)).fetchall()
-
-    if not pending:
-        conn.close()
-        return 0
-
-    resolved = 0
-    for market_id, coin, start_iso, end_iso in pending:
-        try:
-            end_utc = datetime.fromisoformat(end_iso)
-        except Exception:
-            continue
-
-        # Give PM 60s to settle before first attempt
-        if (now - end_utc).total_seconds() < 60:
-            continue
-
-        # Get token IDs and final ask prices from last snapshot
-        last_snap = conn.execute("""
-            SELECT up_token_id, down_token_id, up_ask, down_ask FROM snapshots
-            WHERE market_id = ?
-            ORDER BY ts_utc DESC LIMIT 1
-        """, (market_id,)).fetchone()
-
-        if not last_snap or not last_snap[0]:
-            continue  # no token IDs stored — can't query PM
-
-        up_token   = last_snap[0]
-        up_final   = last_snap[2]
-        down_final = last_snap[3]
-
-        # Query Polymarket gamma for actual settled outcomePrices
-        winner = None
+# ── FETCH MARKETS ────────────────────────────────────────────────────────────
+async def fetch_markets(session) -> list:
+    """Paginated Gamma sweep — returns only active crypto Up/Down markets."""
+    markets, offset = [], 0
+    while True:
         try:
             async with session.get(
                 f"{GAMMA_API}/markets",
-                params={"clob_token_ids": up_token},
-                timeout=aiohttp.ClientTimeout(total=10)
+                params={"active": "true", "archived": "false", "closed": "false",
+                        "limit": 200, "offset": offset,
+                        "order": "endDateIso", "ascending": "true"},
+                timeout=aiohttp.ClientTimeout(total=20)
             ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    if isinstance(data, list) and data:
-                        m_data = data[0]
-                        if m_data.get("closed"):
-                            op  = m_data.get("outcomePrices", "[]")
-                            cti = m_data.get("clobTokenIds", "[]")
-                            if isinstance(op, str):
-                                try: op = json.loads(op)
-                                except Exception: op = []
-                            if isinstance(cti, str):
-                                try: cti = json.loads(cti)
-                                except Exception: cti = []
-                            if op and cti:
-                                prices = [float(p) for p in op]
-                                if max(prices) >= 0.99:
-                                    try:
-                                        up_idx = cti.index(str(up_token))
-                                        winner = "UP" if float(op[up_idx]) >= 0.5 else "DOWN"
-                                    except (ValueError, IndexError):
-                                        winner_idx = prices.index(max(prices))
-                                        winner = "UP" if winner_idx == 0 else "DOWN"
+                if r.status != 200: break
+                batch = await r.json()
+                if not batch: break
+                found_any = False
+                for m in batch:
+                    q = (m.get("question") or "").lower()
+                    if (any(x in q for x in ["up or down", "higher or lower"]) and
+                            any(x in q for x in ["bitcoin","ethereum","solana","xrp","btc","eth","sol"])):
+                        markets.append(m)
+                        found_any = True
+                if not found_any:
+                    break
+                offset += 200
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            break
         except Exception as e:
-            print(f"[WARN] PM resolve {market_id}: {e}")
+            print(f"[ERROR] fetch_markets: {e}")
+            break
+    return markets
 
-        if winner is None:
-            # PM not settled yet — will retry next resolution cycle
-            continue
 
-        conn.execute("""
-            INSERT OR REPLACE INTO resolutions
-            (market_id, coin, start_utc, end_utc,
-             price_start, price_end, winner,
-             up_final_price, down_final_price, resolved_at, winner_source)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
-        """, (market_id, coin, start_iso, end_iso,
-              None, None, winner,
-              up_final, down_final, now.isoformat(), "polymarket"))
-        resolved += 1
-        await asyncio.sleep(0.2)
-
-    conn.commit()
-    conn.close()
-
-    if resolved:
-        ts = datetime.now().strftime('%H:%M:%S')
-        print(f"[{ts}] 🏁 Resolved {resolved} markets via Polymarket")
-    return resolved
-
-# ─── STATS DISPLAY ────────────────────────────────────────────────────────────
-def print_stats():
-    conn = db_connect()
+# ── FETCH RESOLUTIONS ────────────────────────────────────────────────────────
+async def fetch_resolutions(session, conn):
     try:
-        n_markets = conn.execute("SELECT COUNT(*) FROM markets").fetchone()[0]
-        n_snaps   = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
-        n_resolved= conn.execute("SELECT COUNT(*) FROM resolutions").fetchone()[0]
-        by_coin = conn.execute("""
-            SELECT coin, COUNT(*) FROM markets GROUP BY coin
-        """).fetchall()
-        up_wins = conn.execute("SELECT COUNT(*) FROM resolutions WHERE winner='UP'").fetchone()[0]
-        dn_wins = conn.execute("SELECT COUNT(*) FROM resolutions WHERE winner='DOWN'").fetchone()[0]
-    finally:
-        conn.close()
+        async with session.get(
+            f"{GAMMA_API}/markets",
+            params={"closed": "true", "archived": "false",
+                    "limit": 200, "order": "endDateIso", "ascending": "false"},
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as r:
+            if r.status != 200: return
+            markets = await r.json()
 
-    print(f"""
-╔═══════════════════════════════════════════════════════════╗
-║              MARKETGHOST STATS                           ║
-╠═══════════════════════════════════════════════════════════╣
-║  Markets tracked   : {n_markets:<36} ║
-║  Snapshots taken   : {n_snaps:<36} ║
-║  Markets resolved  : {n_resolved:<36} ║
-║  UP vs DOWN        : {up_wins}W / {dn_wins}W                                 ║""")
-    for coin, cnt in by_coin:
-        print(f"║  {coin:<4} markets       : {cnt:<36} ║")
-    print("╚═══════════════════════════════════════════════════════════╝")
+        c = conn.cursor()
+        stored = 0
+        for m in (markets or []):
+            mid = m.get("id")
+            if not mid: continue
+            c.execute("SELECT 1 FROM resolutions WHERE market_id=?", (mid,))
+            if c.fetchone(): continue
+            op = m.get("outcomePrices", [])
+            if isinstance(op, str):
+                try: op = json.loads(op)
+                except Exception: op = []
+            if not op or len(op) < 2: continue
+            up_f, down_f = float(op[0]), float(op[1])
+            c.execute("""
+                INSERT OR IGNORE INTO resolutions
+                (market_id,coin,start_utc,end_utc,winner,up_final_price,down_final_price,resolved_at)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (mid, get_coin(m.get("question", "")),
+                  m.get("creationTime"), m.get("endDateIso"),
+                  "UP" if up_f >= 0.5 else "DOWN", up_f, down_f,
+                  datetime.now(timezone.utc).isoformat()))
+            stored += 1
+        conn.commit()
+        if stored: print(f"[RES] {stored} new resolutions stored")
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        pass
+    except Exception as e:
+        print(f"[ERROR] fetch_resolutions: {e}")
 
-# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
+
+# ── DB WRITES ─────────────────────────────────────────────────────────────────
+def upsert_market(conn, market: dict, open_price=None):
+    c = conn.cursor()
+    duration = None
+    try:
+        s = datetime.fromisoformat((market.get("creationTime") or "").replace("Z", "+00:00"))
+        e = datetime.fromisoformat((market.get("endDateIso")   or "").replace("Z", "+00:00"))
+        duration = int((e - s).total_seconds() / 60)
+    except Exception:
+        pass
+    c.execute("""
+        INSERT OR IGNORE INTO markets
+        (market_id,slug,question,coin,duration_minutes,start_utc,end_utc,first_seen,open_price)
+        VALUES (?,?,?,?,?,?,?,?,?)
+    """, (market.get("id"), market.get("slug"), market.get("question"),
+          get_coin(market.get("question", "")), duration,
+          market.get("creationTime"), market.get("endDateIso"),
+          datetime.now(timezone.utc).isoformat(),
+          open_price))
+    conn.commit()
+
+
+def store_snapshot(conn, snap: dict) -> bool:
+    try:
+        conn.execute("""
+            INSERT OR IGNORE INTO snapshots
+            (market_id,ts_utc,mins_to_close,
+             up_bid,up_ask,down_bid,down_ask,up_token_id,down_token_id,
+             volume,liq_usd,spread,cheap_side,cheap_ask,hour_utc,
+             is_in_compression,compression_zone,
+             price_moved_since_last,is_active_compression,snapshot_interval_used,
+             binance_price,trend_dev_1h,binance_1m_dev,ask_velocity,required_move_pct)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (snap["market_id"], snap["ts_utc"], snap.get("mins_to_close"),
+              snap.get("up_bid"),   snap.get("up_ask"),
+              snap.get("down_bid"), snap.get("down_ask"),
+              snap.get("up_tok"),   snap.get("down_tok"),
+              snap.get("volume"), snap.get("liq_usd"), snap.get("spread"),
+              snap.get("cheap_side"), snap.get("cheap_ask"), snap.get("hour_utc"),
+              1 if snap.get("in_comp") else 0, snap.get("zone"),
+              snap.get("price_moved"), 1 if snap.get("is_active") else 0,
+              snap.get("interval"),
+              snap.get("binance_price"), snap.get("trend_dev_1h"),
+              snap.get("binance_1m_dev"), snap.get("ask_velocity"),
+              snap.get("required_move_pct")))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"[ERROR] store_snapshot: {e}")
+        return False
+
+
+def rebuild_compression_summary(conn):
+    try:
+        conn.execute("""
+            INSERT OR REPLACE INTO markets_compression_summary
+            SELECT
+                market_id,
+                MIN(cheap_ask),
+                CASE WHEN MIN(cheap_ask)<0.01 THEN 'extreme'
+                     WHEN MIN(cheap_ask)<0.05 THEN 'deep'
+                     WHEN MIN(cheap_ask)<0.10 THEN 'medium'
+                     WHEN MIN(cheap_ask)<0.20 THEN 'light'
+                     ELSE 'none' END,
+                CAST(MIN(cheap_ask)<0.01 AS INTEGER),
+                CAST(MIN(cheap_ask)<0.05 AS INTEGER),
+                CAST(MIN(cheap_ask)<0.10 AS INTEGER),
+                CAST(
+                    (julianday(MAX(CASE WHEN is_in_compression=1 THEN ts_utc END))
+                   - julianday(MIN(CASE WHEN is_in_compression=1 THEN ts_utc END)))*86400
+                AS INTEGER),
+                COUNT(*),
+                SUM(is_in_compression),
+                MIN(ts_utc),
+                MAX(ts_utc)
+            FROM snapshots WHERE cheap_ask IS NOT NULL
+            GROUP BY market_id
+        """)
+        conn.commit()
+        print("[INFO] Compression summary rebuilt")
+    except Exception as e:
+        print(f"[ERROR] rebuild_compression_summary: {e}")
+
+
+# ── MAIN LOOP ─────────────────────────────────────────────────────────────────
 async def main():
     init_db()
 
-    print(f"""
-╔═══════════════════════════════════════════════════════════╗
-║   MARKETGHOST v1.0 — 24/7 DATA COLLECTOR                 ║
-║   DB: {os.path.basename(DB_PATH):<50}  ║
-║   Snapshot every {SNAPSHOT_INTERVAL}s | Resolve every {RESOLUTION_INTERVAL}s           ║
-║   Read-only — does NOT affect your trading bot           ║
-╚═══════════════════════════════════════════════════════════╝
+    last_snap_ts    = defaultdict(float)
+    last_cheap_ask  = {}
+    last_mins       = {}
+    open_prices     = {}   # market_id → open_price (Binance at start)
 
-Collecting data on all BTC/ETH/SOL/XRP Up/Down markets...
-Press Ctrl+C to stop. Data persists in marketghost.db
-    """)
+    connector = aiohttp.TCPConnector(limit_per_host=5, limit=50)
+    async with aiohttp.ClientSession(
+        connector=connector,
+        timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
+    ) as session:
 
-    last_resolve = 0
-    last_stats = 0
+        conn      = sqlite3.connect(DB_PATH, timeout=10)
+        iteration = 0
+        res_tick  = 0
 
-    connector = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
         while True:
             try:
-                await snapshot_once(session)
+                iteration += 1
+                now    = datetime.now(timezone.utc)
+                now_ts = time.time()
+                print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')} UTC]  Iter {iteration}")
 
-                now_ts = time.monotonic()
-                if now_ts - last_resolve >= RESOLUTION_INTERVAL:
-                    await resolve_pending(session)
-                    last_resolve = now_ts
+                markets = await fetch_markets(session)
+                print(f"[INFO] {len(markets)} active markets found")
 
-                if now_ts - last_stats >= 600:
-                    print_stats()
-                    last_stats = now_ts
+                ins = skip_early = skip_liq = skip_int = skip_np = 0
 
-                await asyncio.sleep(SNAPSHOT_INTERVAL)
+                for market in markets:
+                    mid = market.get("id")
+                    if not mid: continue
 
-            except asyncio.CancelledError:
-                raise
+                    mins_left = parse_mins_left(market, now)
+                    if mins_left is None or mins_left > 10:
+                        skip_early += 1
+                        continue
+
+                    coin = get_coin(market.get("question", ""))
+
+                    # Token IDs
+                    up_tok, down_tok = parse_token_ids(market)
+                    if not up_tok or not down_tok:
+                        skip_np += 1
+                        continue
+
+                    # CLOB orderbook (real bid/ask)
+                    up_bid,   up_ask,   up_liq   = await fetch_orderbook(session, up_tok)
+                    down_bid, down_ask, down_liq = await fetch_orderbook(session, down_tok)
+
+                    # Fallback to outcomePrices if CLOB fails
+                    if up_ask is None or down_ask is None:
+                        op = market.get("outcomePrices", "[]")
+                        if isinstance(op, str):
+                            try: op = json.loads(op)
+                            except Exception: op = []
+                        if op and len(op) >= 2:
+                            up_ask   = up_ask   or float(op[0])
+                            down_ask = down_ask or float(op[1])
+
+                    if up_ask is None or down_ask is None:
+                        skip_np += 1
+                        continue
+
+                    cheap_side = "UP"   if up_ask <= down_ask else "DOWN"
+                    cheap_ask  = up_ask if cheap_side == "UP"  else down_ask
+
+                    liq_usd = parse_liq(market)
+                    if liq_usd < MIN_LIQ_USD:
+                        skip_liq += 1
+                        continue
+
+                    interval = sample_interval(mins_left, cheap_ask)
+                    if interval is None:
+                        skip_early += 1
+                        continue
+
+                    prev_ask  = last_cheap_ask.get(mid)
+                    price_moved = abs(cheap_ask - prev_ask) if prev_ask is not None else None
+                    is_active   = price_moved is not None and price_moved > 0.02
+
+                    if not is_active and (now_ts - last_snap_ts[mid]) < interval:
+                        skip_int += 1
+                        continue
+
+                    # Register market if first time seen
+                    if mid not in open_prices:
+                        open_price = None
+                        try:
+                            start_str = (market.get("creationTime") or "").replace("Z", "+00:00")
+                            if start_str:
+                                start_utc = datetime.fromisoformat(start_str)
+                                if start_utc.tzinfo is None:
+                                    start_utc = start_utc.replace(tzinfo=timezone.utc)
+                                open_price = await get_binance_price_at(session, coin, start_utc)
+                        except Exception:
+                            pass
+                        open_prices[mid] = open_price
+                        upsert_market(conn, market, open_price)
+
+                    # Binance trend (cached per coin)
+                    bnc_price, dev_1h, dev_1m = await get_binance_trend(session, coin)
+
+                    # ask_velocity: change in cheap_ask per minute
+                    ask_velocity = None
+                    prev_mins = last_mins.get(mid)
+                    if prev_ask is not None and prev_mins is not None and cheap_ask is not None:
+                        time_diff = prev_mins - mins_left
+                        if time_diff > 0:
+                            ask_velocity = round((cheap_ask - prev_ask) / time_diff, 6)
+
+                    # required_move_pct: how much coin needs to move for cheap side to win
+                    required_move_pct = None
+                    open_p = open_prices.get(mid)
+                    if bnc_price and open_p:
+                        if cheap_side == "UP":
+                            required_move_pct = round((open_p - bnc_price) / bnc_price, 6)
+                        else:
+                            required_move_pct = round((bnc_price - open_p) / bnc_price, 6)
+
+                    zone = comp_zone(cheap_ask)
+                    snap = {
+                        "market_id":        mid,
+                        "ts_utc":           now.isoformat(),
+                        "mins_to_close":    mins_left,
+                        "up_bid":           up_bid,   "up_ask":   up_ask,
+                        "down_bid":         down_bid, "down_ask": down_ask,
+                        "up_tok":           up_tok,   "down_tok": down_tok,
+                        "volume":           float(market.get("volume", 0) or 0),
+                        "liq_usd":          liq_usd,
+                        "spread":           abs(up_ask - down_ask),
+                        "cheap_side":       cheap_side,
+                        "cheap_ask":        cheap_ask,
+                        "hour_utc":         now.hour,
+                        "in_comp":          zone != "none",
+                        "zone":             zone,
+                        "price_moved":      price_moved,
+                        "is_active":        is_active,
+                        "interval":         interval,
+                        "binance_price":    bnc_price,
+                        "trend_dev_1h":     dev_1h,
+                        "binance_1m_dev":   dev_1m,
+                        "ask_velocity":     ask_velocity,
+                        "required_move_pct": required_move_pct,
+                    }
+
+                    if store_snapshot(conn, snap):
+                        ins += 1
+                        last_snap_ts[mid]   = now_ts
+                        last_cheap_ask[mid] = cheap_ask
+                        last_mins[mid]      = mins_left
+
+                print(f"[INFO] Inserted {ins} | "
+                      f"too-early={skip_early}  liq={skip_liq}  "
+                      f"interval={skip_int}  no-prices={skip_np}")
+
+                res_tick += 1
+                if res_tick % 5 == 0:
+                    await fetch_resolutions(session, conn)
+                if iteration % 24 == 0:
+                    rebuild_compression_summary(conn)
+
+                await asyncio.sleep(LOOP_SLEEP)
+
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                print("\n[STOP] Shutting down...")
+                rebuild_compression_summary(conn)
+                conn.close()
+                break
             except Exception as e:
-                print(f"[WARN] Loop error: {e}")
-                await asyncio.sleep(SNAPSHOT_INTERVAL)
+                print(f"[ERROR] Iter {iteration}: {e}")
+                await asyncio.sleep(15)
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n[STOPPED] MarketGhost exited. Data saved.")
-        try:
-            print_stats()
-        except Exception:
-            pass
+    asyncio.run(main())
