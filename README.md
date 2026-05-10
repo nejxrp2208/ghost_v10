@@ -1,113 +1,189 @@
-# Crypto Ghost Scanner v2.0
-## Polymarket 4-Tier Crypto Sniper
+# GhostScanner v10
+## Polymarket 4-Tier Crypto Sniper Bot
 
 ---
 
-## STRATEGY OVERVIEW
+## Strategy Overview
 
-Based on the April 3-8 BTC rally analysis ($90k+ in wins):
+Targets cheap longshot tokens on Polymarket crypto Up/Down markets. Fires only in the final minutes when Binance has already moved but Polymarket hasn't repriced yet.
 
-| Tier | Market Type | Entry | Payout | Signal |
-|------|------------|-------|--------|--------|
-| T1 | "Will BTC hit $X?" strike markets | $0.01-0.03 | ~$495 | Binance spot ≥ strike |
-| T2 | "BTC Up or Down [Hour]" | $0.03-0.10 | ~$95 | Final 20 min + 0.3% deviation |
-| T3 | "BTC Up or Down [4hr]" | $0.05-0.15 | ~$45 | Final 60 min + 0.5% deviation |
-| T4 | "BTC Up or Down [Day]" | $0.10-0.20 | ~$25 | Final 4 hrs + 0.4% deviation |
+| Tier | Market | Entry ceiling | Window | Signal |
+|------|--------|--------------|--------|--------|
+| T1 | "Will BTC hit $X?" strike markets | $0.03 | Any | Binance spot ≥ strike |
+| T2 | BTC/ETH/BNB Up or Down (5-min) | $0.03 | Last 3 min | Binance deviation + stale ask |
+| T3 | Up or Down (1-hr) | $0.15 | Last 60 min | 0.5% deviation |
+| T4 | Up or Down (4-hr) | $0.20 | Last 4 hrs | 0.4% deviation |
+
+**Key filters (v111 overlay):**
+- `MIN_NO_PRICE=0.97` — other side must be ≥97% certain before entering
+- `SKIP_DOWN_BIASED_COINS=BNB,ETH` — skip cheap-DOWN on high UP base-rate coins
+- `T2_MAX_SECS_LEFT=60` / `T2_MIN_SECS_LEFT=5` — stale-ask snipe window
 
 ---
 
-## SETUP
+## Architecture
 
-### Step 1: Place files
-Copy the entire `CryptoGhostScanner` folder to:
 ```
-C:\Users\ramos\OneDrive\Desktop\CryptoGhostScanner\
+ghost_v10/
+├── crypto_ghost_scanner.py    ← Main engine: finds + enters trades
+├── crypto_ghost_resolver.py   ← Resolves trades (Chainlink → Polymarket)
+├── crypto_ghost_redeemer.py   ← Claims winnings on-chain (Polygon)
+├── crypto_ghost_dashboard.py  ← Live terminal dashboard
+├── marketghost.py             ← Silent data collector (no trades)
+├── marketghost_stats.py       ← Stats/analysis on collected data
+├── .env                       ← Config (keys, sizing, filters)
+├── crypto_ghost_PAPER.db      ← Paper trades DB
+└── scanner.db                 ← Real-time order book snapshots
 ```
 
-### Step 2: Install dependencies
-Double-click `install.bat` OR run:
-```
-pip install aiohttp py-clob-client web3 python-dotenv websockets
+---
+
+## VPS Deployment
+
+The bot runs 24/7 on a VPS managed via PM2.
+
+**Server:** `root@70.34.204.152` — Ubuntu 24.04, Stockholm  
+**Repo:** `/root/ghost_v10`
+
+### Deploy changes
+
+```bash
+# 1. Local — push to GitHub
+git add <files> && git commit -m "..." && git push origin master
+
+# 2. VPS — pull + restart
+cd /root/ghost_v10 && git pull && pm2 restart <process>
 ```
 
-### Step 3: .env file
-The scanner automatically finds your existing UnifiedBot .env file.
-No changes needed — it uses the same PRIVATE_KEY and POLYMARKET_PROXY_ADDRESS.
+### PM2 processes
 
-Optionally add these to your .env to customize sizing:
+```bash
+pm2 ls                        # show all processes
+pm2 logs marketghost          # live logs
+pm2 restart marketghost       # restart data collector
+pm2 restart scanner           # restart scanner
+pm2 restart resolver          # restart resolver
+pm2 restart redeemer          # restart redeemer
+pm2 restart ghostscanner-rt   # restart real-time scanner
+pm2 restart all               # restart everything
+pm2 save                      # save state (persists across reboots)
 ```
+
+---
+
+## Local Setup
+
+### 1. Install dependencies
+
+```bash
+python -m venv venv
+source venv/bin/activate        # Linux/Mac
+venv\Scripts\activate           # Windows
+pip install aiohttp python-dotenv web3 websockets
+```
+
+### 2. Configure .env
+
+```env
+PAPER_TRADE=true               # Keep true until 100+ trades validated
+PORTFOLIO_SIZE=200.00
+
+# Wallet (Polymarket)
+PRIVATE_KEY=
+POLYMARKET_PROXY_ADDRESS=
+FUNDER_ADDRESS=
+
+# Polymarket API
+API_KEY=
+API_SECRET=
+API_PASSPHRASE=
+
+# Trade sizing
 T1_SIZE_USDC=5.0
 T2_SIZE_USDC=3.0
-T3_SIZE_USDC=3.0
-T4_SIZE_USDC=2.0
+T2_SIZE_BTC=5.0
+T2_SIZE_ETH=3.0
+T2_SIZE_BNB=3.0
+
+# Telegram (optional)
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 ```
 
-### Step 4: Start
-Double-click `start_crypto_scanner.bat`
-This opens 3 windows: Scanner, Resolver, Dashboard.
+### 3. Run locally
 
----
-
-## FILE STRUCTURE
-
-```
-CryptoGhostScanner/
-├── crypto_ghost_scanner.py   ← Main engine (run this)
-├── crypto_ghost_resolver.py  ← Position monitor + PnL tracker
-├── crypto_ghost_dashboard.py ← Live terminal dashboard
-├── start_crypto_scanner.bat  ← Launch all 3 windows
-├── install.bat               ← Install dependencies
-├── requirements_crypto.txt   ← Python packages
-└── crypto_ghost.db           ← SQLite DB (auto-created)
+```bash
+python crypto_ghost_scanner.py   # scanner
+python crypto_ghost_resolver.py  # resolver (separate terminal)
+python marketghost.py            # data collector (separate terminal)
 ```
 
 ---
 
-## HOW T1 (STRIKE CROSSING) WORKS
+## Resolution Chain
 
-1. At startup, scanner pre-loads all "Will BTC hit $X?" markets from Polymarket
-2. Binance WebSocket streams real-time BTC/ETH/SOL/XRP prices
-3. When BTC spot price crosses a strike (e.g. $67k), the YES token is
-   worth $1.00 but stale asks may still sit at $0.01
-4. Scanner fires immediately → $5 buys ~500 shares → payout ~$495
-5. Once a strike is fired, it's marked and won't fire again
+Trades resolve via (in order of priority):
+1. **Chainlink AggregatorV3 on Polygon** — same feed PM's UMA oracle uses
+2. **Coinbase 1m candles** — close approximation
+3. **Binance USDT klines** — last resort
 
----
-
-## TUNING
-
-Edit top of `crypto_ghost_scanner.py`:
-
-```python
-T1_MAX_ENTRY = 0.03   # Raise to 0.05 to catch more (lower payout)
-MIN_NO_PRICE = 0.90   # Lower to 0.85 for more T2/T3/T4 trades
-T2_WINDOW_MIN = 20    # Raise to 30 if missing signals
-MAX_DAILY_LOSS = 50.0 # Kill switch
+Settlement rule (per Polymarket docs):
+```
+p_end >= p_start  →  UP wins  (flat = UP, ties go to UP)
+p_end <  p_start  →  DOWN wins (strict drop required)
 ```
 
 ---
 
-## DATABASE QUERIES
+## MarketGhost Data Collector
+
+`marketghost.py` runs silently alongside the bot — no trading, read-only.
+
+**Adaptive sampling** (focuses on final 10 minutes):
+```
+5-10 min left  → snapshot every 60s
+2-5  min left  → every 20s
+1-2  min left  → every 5s
+< 1  min left  → every 2s  (+1s if extreme compression < $0.01)
+```
+
+**Collected per snapshot:** bid/ask (CLOB), Binance price, trend_dev_1h, trend_dev_1m, cheap_side, ask_velocity, required_move_pct, compression zone.
+
+```bash
+python marketghost_stats.py    # print analysis
+```
+
+---
+
+## Useful DB Queries
 
 ```sql
 -- Today's P&L
-SELECT SUM(pnl) FROM trades WHERE ts LIKE '2024-%' AND status IN ('won','lost');
+SELECT SUM(pnl) FROM trades
+WHERE date(closed_at) = date('now') AND status IN ('won','lost');
 
--- By tier
-SELECT tier, COUNT(*), SUM(pnl) FROM trades GROUP BY tier;
+-- Win rate by tier
+SELECT tier,
+       COUNT(*) as trades,
+       ROUND(SUM(CASE WHEN status='won' THEN 1.0 ELSE 0 END)/COUNT(*)*100,1) as wr_pct,
+       ROUND(SUM(pnl),2) as total_pnl
+FROM trades WHERE status IN ('won','lost')
+GROUP BY tier;
 
--- Win rate
-SELECT 
-  SUM(CASE WHEN status='won' THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as win_rate
-FROM trades WHERE status IN ('won','lost');
+-- Compression depth distribution (marketghost.db)
+SELECT compression_zone_depth, COUNT(*), ROUND(AVG(min_cheap_ask_ever),4)
+FROM markets_compression_summary
+GROUP BY compression_zone_depth;
+
+-- MarketGhost resolution stats
+SELECT winner, COUNT(*) FROM resolutions GROUP BY winner;
 ```
 
 ---
 
-## NOTES
+## Notes
 
-- This bot is SEPARATE from UnifiedBot — different DB, different strategy
-- Both can run at the same time (they use different databases)
-- The DB file is `crypto_ghost.db` in the CryptoGhostScanner folder
-- T1 strikes only fire ONCE per strike level (no duplicates)
-- The Binance WebSocket auto-reconnects if connection drops
+- **Paper mode** (`PAPER_TRADE=true`) is mandatory until 100+ trades are validated — never disable without explicit decision
+- Scanner and MarketGhost use separate databases — they don't interfere
+- Resolver runs Chainlink queries against Polygon RPC — needs internet access to `polygon-rpc.com`
+- The redeemer only runs in live mode — no on-chain transactions in paper mode
