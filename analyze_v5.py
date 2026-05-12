@@ -152,36 +152,39 @@ if has_verified and 'resolution_verified' in cols:
     print(f"  ✓ {v}/{total} trades verified against Chainlink prices")
 
 # ── WINNING TRADES DETAIL ─────────────────────────────────────────────────────
-win_rows = conn.execute("""
-    SELECT id, ts, coin, outcome, entry_price, size_usdc, pnl, question
+_secs_col = ", secs_left" if 'secs_left' in cols else ""
+win_rows = conn.execute(f"""
+    SELECT id, ts, coin, outcome, entry_price, size_usdc, pnl, question{_secs_col}
     FROM trades WHERE status='won' ORDER BY id ASC
 """).fetchall()
 
 print(f"\n  WINNING TRADES ({len(win_rows)} total)")
-print("  " + "─"*65)
-print(f"  {'ID':>4}  {'Time':16}  {'Coin':4}  {'Dir':4}  {'Ask':6}  {'Size':6}  {'P&L':>10}  Question")
-print("  " + "─"*65)
+print("  " + "─"*72)
+print(f"  {'ID':>4}  {'Time':16}  {'Coin':4}  {'Dir':4}  {'Ask':6}  {'Size':6}  {'Secs':>4}  {'P&L':>10}  Question")
+print("  " + "─"*72)
 for w in win_rows:
     ts_str  = (w['ts'] or '')[:16]
-    q_short = (w['question'] or '')[:35]
+    q_short = (w['question'] or '')[:30]
+    secs    = w['secs_left'] if 'secs_left' in cols and w['secs_left'] is not None else '?'
     print(f"  {w['id']:>4}  {ts_str:16}  {w['coin']:4}  {(w['outcome'] or ''):4}  "
-          f"${w['entry_price']:.3f}  ${w['size_usdc']:.2f}  ${w['pnl']:>+8.2f}  {q_short}")
+          f"${w['entry_price']:.3f}  ${w['size_usdc']:.2f}  {str(secs):>4}s  ${w['pnl']:>+8.2f}  {q_short}")
 
 # ── LOSING TRADES DETAIL ──────────────────────────────────────────────────────
-loss_rows = conn.execute("""
-    SELECT id, ts, coin, outcome, entry_price, size_usdc, pnl, question
+loss_rows = conn.execute(f"""
+    SELECT id, ts, coin, outcome, entry_price, size_usdc, pnl, question{_secs_col}
     FROM trades WHERE status='lost' ORDER BY id ASC
 """).fetchall()
 
 print(f"\n  LOSING TRADES ({len(loss_rows)} total)")
-print("  " + "─"*65)
-print(f"  {'ID':>4}  {'Time':16}  {'Coin':4}  {'Dir':4}  {'Ask':6}  {'Size':6}  {'P&L':>10}  Question")
-print("  " + "─"*65)
+print("  " + "─"*72)
+print(f"  {'ID':>4}  {'Time':16}  {'Coin':4}  {'Dir':4}  {'Ask':6}  {'Size':6}  {'Secs':>4}  {'P&L':>10}  Question")
+print("  " + "─"*72)
 for w in loss_rows:
     ts_str  = (w['ts'] or '')[:16]
-    q_short = (w['question'] or '')[:35]
+    q_short = (w['question'] or '')[:30]
+    secs    = w['secs_left'] if 'secs_left' in cols and w['secs_left'] is not None else '?'
     print(f"  {w['id']:>4}  {ts_str:16}  {w['coin']:4}  {(w['outcome'] or ''):4}  "
-          f"${w['entry_price']:.3f}  ${w['size_usdc']:.2f}  ${w['pnl']:>+8.2f}  {q_short}")
+          f"${w['entry_price']:.3f}  ${w['size_usdc']:.2f}  {str(secs):>4}s  ${w['pnl']:>+8.2f}  {q_short}")
 
 # ── BY ENTRY PRICE ────────────────────────────────────────────────────────────
 print(f"\n  BY ENTRY PRICE (ask)")

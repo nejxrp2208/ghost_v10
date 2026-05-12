@@ -6,11 +6,14 @@
 
 | Process | File | Role |
 |---------|------|------|
-| `scanner` | `crypto_ghost_scanner.py` | Finds and enters trades |
-| `resolver` | `crypto_ghost_resolver.py` | Resolves trades via Chainlink → Polymarket |
-| `redeemer` | `crypto_ghost_redeemer.py` | Claims winnings on-chain |
+| `scanner` | `crypto_ghost_scanner.py` | Scanner 1: cheap longshot (entry ≤$0.03, last 5-60s) |
+| `scanner2` | `crypto_ghost_scanner2.py` | Scanner 2: mean-reversion mid-prob (entry $0.35-$0.45) |
+| `resolver` | `crypto_ghost_resolver.py` | Resolves trades via Chainlink → Polymarket (shared) |
+| `redeemer` | `crypto_ghost_redeemer.py` | Claims winnings on-chain (shared) |
 | `marketghost` | `marketghost.py` | Silent data collector (no trades) |
 | `ghostscanner-rt` | — | Real-time scanner variant |
+
+**Scanner architecture:** Each scanner = one strategy = one PM2 process. Both write to the same `crypto_ghost_PAPER.db` (tier=2 for Scanner 1, tier=5 for Scanner 2). Resolver handles both.
 
 **Tech:** Python async (`asyncio` + `aiohttp`), SQLite, Polygon/Chainlink, Polymarket CLOB + Gamma APIs.
 
@@ -36,9 +39,10 @@ VPS: `root@70.34.204.152` · `/root/ghost_v10` · Ubuntu 24.04 · Stockholm
 
 ```bash
 pm2 restart marketghost      # data collector
-pm2 restart scanner          # trade scanner
-pm2 restart resolver         # trade resolver
-pm2 restart redeemer         # on-chain redeemer
+pm2 restart scanner          # Scanner 1: cheap longshot
+pm2 restart scanner2         # Scanner 2: mean-reversion
+pm2 restart resolver         # trade resolver (shared)
+pm2 restart redeemer         # on-chain redeemer (shared)
 pm2 restart ghostscanner-rt  # real-time scanner
 pm2 restart all              # everything at once
 ```
