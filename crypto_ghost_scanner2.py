@@ -357,7 +357,9 @@ class Scanner2:
     async def scan(self, session: aiohttp.ClientSession):
         self._sync_open_positions()
         markets = await fetch_markets(session)
+        ts = datetime.now().strftime("%H:%M:%S")
         if not markets:
+            print(f"[{ts}] S2 scan: 0 in window | fired=0 | open={len(self.open_positions)} | total={self.trades_fired}")
             return
 
         fired = 0
