@@ -33,6 +33,8 @@ import sys
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+sys.stdout.reconfigure(line_buffering=True)
+
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 else:
