@@ -292,24 +292,37 @@ async def fetch_markets(session: aiohttp.ClientSession) -> list:
                 continue
         _market_cache["markets"] = raw_markets
         _market_cache["ts"] = now_ts
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] S2 sweep: {len(raw_markets)} updown crypto markets found")
 
     # Filter to markets in S2_WINDOW_SECS and correct coins
     now = time.time()
     result = []
+    skipped_coin = 0
+    skipped_time = 0
     for token_id, m in raw_markets.items():
         coin = m.get("_coin")
         if coin not in S2_COINS:
+            skipped_coin += 1
             continue
         end_iso = m.get("endDateIso", "")
         try:
-            end_dt    = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-            secs_left = end_dt.timestamp() - now
+            # Handle both ISO string and unix timestamp
+            try:
+                end_dt    = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                secs_left = end_dt.timestamp() - now
+            except ValueError:
+                secs_left = float(end_iso) - now
         except Exception:
             continue
         if secs_left < 0 or secs_left > S2_WINDOW_SECS:
+            skipped_time += 1
             continue
         m["_secs_left"] = secs_left
         result.append(m)
+
+    ts2 = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts2}] S2 filter: {len(result)} in window | skip_coin={skipped_coin} skip_time={skipped_time}")
     return result
 
 # ─── POLYMARKET — ORDERBOOK ───────────────────────────────────────────────────
