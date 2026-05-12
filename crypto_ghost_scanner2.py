@@ -300,6 +300,7 @@ async def fetch_markets(session: aiohttp.ClientSession) -> list:
     result = []
     skipped_coin = 0
     skipped_time = 0
+    valid_secs = []
     for token_id, m in raw_markets.items():
         coin = m.get("_coin")
         if coin not in S2_COINS:
@@ -307,14 +308,14 @@ async def fetch_markets(session: aiohttp.ClientSession) -> list:
             continue
         end_iso = m.get("endDateIso", "")
         try:
-            # Handle both ISO string and unix timestamp
             try:
-                end_dt    = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                end_dt    = datetime.fromisoformat(str(end_iso).replace("Z", "+00:00"))
                 secs_left = end_dt.timestamp() - now
             except ValueError:
                 secs_left = float(end_iso) - now
         except Exception:
             continue
+        valid_secs.append(round(secs_left))
         if secs_left < 0 or secs_left > S2_WINDOW_SECS:
             skipped_time += 1
             continue
@@ -322,7 +323,8 @@ async def fetch_markets(session: aiohttp.ClientSession) -> list:
         result.append(m)
 
     ts2 = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts2}] S2 filter: {len(result)} in window | skip_coin={skipped_coin} skip_time={skipped_time}")
+    min_s = min(valid_secs) if valid_secs else "?"
+    print(f"[{ts2}] S2 filter: {len(result)} in window | skip_coin={skipped_coin} skip_time={skipped_time} | nearest={min_s}s")
     return result
 
 # ─── POLYMARKET — ORDERBOOK ───────────────────────────────────────────────────
