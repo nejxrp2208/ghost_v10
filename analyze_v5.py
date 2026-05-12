@@ -330,6 +330,31 @@ if wins > 0 and losses > 0 and avg_payout > 0:
 else:
     print(f"  Not enough data for Kelly calculation")
 
+# ── BY STRATEGY ──────────────────────────────────────────────────────────────
+print(f"\n  BY STRATEGY")
+print("  " + "─"*55)
+strategy_names = {2: "S1 Cheap Longshot", 5: "S2 Mean-Reversion"}
+if 'tier' in cols:
+    strat_rows = conn.execute("""
+        SELECT tier, status, pnl FROM trades WHERE status IN ('won','lost')
+    """).fetchall()
+    strats = {}
+    for r in strat_rows:
+        t = r[0] or 0
+        if t not in strats:
+            strats[t] = {'w': 0, 'l': 0, 'pnl': 0}
+        strats[t]['w']   += 1 if r[1] == 'won' else 0
+        strats[t]['l']   += 1 if r[1] == 'lost' else 0
+        strats[t]['pnl'] += r[2] or 0
+    for t in sorted(strats):
+        s  = strats[t]
+        n  = s['w'] + s['l']
+        wr = (s['w'] / n * 100) if n else 0
+        name = strategy_names.get(t, f"Tier {t}")
+        print(f"  {name}: {s['w']:>3}W / {s['l']:>3}L | WR {wr:5.1f}% | P&L ${s['pnl']:+.2f}")
+else:
+    print("  tier column not in DB yet")
+
 # ── BY ENTRY PRICE × COIN ────────────────────────────────────────────────────
 if 'entry_price' in cols:
     print(f"\n  BY ENTRY PRICE × COIN")
