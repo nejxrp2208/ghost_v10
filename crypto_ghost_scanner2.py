@@ -416,8 +416,8 @@ class Scanner2:
                 fired += 1
 
         ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] S2 scan: {len(markets)} markets in window | fired={fired} | "
-              f"open={len(self.open_positions)} | total={self.trades_fired}", end="\r")
+        print(f"[{ts}] S2 scan: {len(markets)} in window | fired={fired} | "
+              f"open={len(self.open_positions)} | total={self.trades_fired}")
 
     async def run(self):
         init_db()
