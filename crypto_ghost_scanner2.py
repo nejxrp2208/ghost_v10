@@ -206,126 +206,95 @@ def is_updown(question: str) -> bool:
     return "up or down" in q or "up-or-down" in q
 
 
-_SWEEP_URLS = [
-    f"{GAMMA_API}/markets?closed=false&order=endDate&ascending=true&limit=500",
-    f"{GAMMA_API}/markets?active=true&closed=false&order=endDate&ascending=true&limit=500",
-    f"{GAMMA_API}/markets?end_date_min=now&closed=false&limit=500",
-    f"{GAMMA_API}/markets?tag_id=21&closed=false&order=endDate&ascending=true&limit=500",
-    f"{GAMMA_API}/markets?active=true&closed=false&limit=500",
-]
+_SLUG_COINS = {
+    "BTC": "btc", "ETH": "eth", "BNB": "bnb",
+    "SOL": "sol", "XRP": "xrp",
+}
 
-_market_cache: dict = {"markets": None, "ts": 0.0}
-_MARKET_CACHE_TTL = 30  # seconds
+def _build_slugs(coins: set) -> list:
+    """Build slug list for upcoming 5-min markets. Same approach as scanner1."""
+    now_ts = int(time.time())
+    slugs  = []
+    curr_5m = ((now_ts // 300) + 1) * 300
+    prev_5m = curr_5m - 300
+    for i in range(6):   # covers prev + next 4 windows (~25 min)
+        end_ts = prev_5m + i * 300
+        for coin in coins:
+            slug_coin = _SLUG_COINS.get(coin)
+            if slug_coin:
+                slugs.append((coin, f"{slug_coin}-updown-5m-{end_ts}"))
+    return slugs
+
 
 async def fetch_markets(session: aiohttp.ClientSession) -> list:
-    """Fetch active Up/Down markets using same sweep as scanner1. Cached 30s."""
-    global _market_cache
-    now_ts = time.time()
+    """Fetch active 5-min Up/Down markets via slug lookup (same method as scanner1)."""
+    HEADERS = {"User-Agent": "Mozilla/5.0"}
+    now     = time.time()
+    slugs   = _build_slugs(S2_COINS)
 
-    # Use cached token_markets if fresh
-    if _market_cache["markets"] is not None and now_ts - _market_cache["ts"] < _MARKET_CACHE_TTL:
-        raw_markets = _market_cache["markets"]
-    else:
-        raw_markets = {}
-        HEADERS = {"User-Agent": "Mozilla/5.0"}
-        for sweep_url in _SWEEP_URLS:
+    sem = asyncio.Semaphore(15)
+
+    async def _try_slug(coin, slug):
+        async with sem:
             try:
-                async with session.get(sweep_url, headers=HEADERS,
-                                       timeout=aiohttp.ClientTimeout(total=10)) as r:
+                async with session.get(f"{GAMMA_API}/markets",
+                                       params={"slug": slug}, headers=HEADERS,
+                                       timeout=aiohttp.ClientTimeout(total=4)) as r:
                     if r.status != 200:
-                        continue
+                        return None
                     data = await r.json()
-                    items = data if isinstance(data, list) else data.get("data", [])
-                    if not items:
-                        continue
-                    added = 0
-                    for m in items:
-                        q = m.get("question", "")
-                        coin = parse_coin(q)
-                        if not coin or not is_updown(q):
-                            continue
-                        if m.get("closed") is True:
-                            continue
-                        end = m.get("endDate") or m.get("endDateIso", "")
-                        if not end:
-                            continue
-                        # Parse tokens (same logic as scanner1)
-                        tokens = m.get("tokens", []) or []
-                        cti = m.get("clobTokenIds") or m.get("clob_token_ids") or []
-                        if isinstance(cti, str):
-                            try:
-                                cti = json.loads(cti)
-                            except Exception:
-                                cti = []
-                        outs = m.get("outcomes") or m.get("outcome_names") or []
-                        if isinstance(outs, str):
-                            try:
-                                outs = json.loads(outs)
-                            except Exception:
-                                outs = []
-                        if not tokens and cti:
-                            tokens = []
-                            for i, tid in enumerate(cti):
-                                out = outs[i] if i < len(outs) else ("UP" if i == 0 else "DOWN")
-                                tokens.append({"token_id": str(tid), "outcome": str(out).upper()})
-                        if not tokens:
-                            continue
-                        # Key by first UP token_id
-                        primary = None
-                        for t in tokens:
-                            if isinstance(t, dict) and (t.get("outcome","")).upper() in ("UP","YES","HIGHER","ABOVE"):
-                                primary = t.get("token_id") or t.get("id")
-                                break
-                        if not primary:
-                            primary = tokens[0].get("token_id") if isinstance(tokens[0], dict) else str(tokens[0])
-                        if primary and primary not in raw_markets:
-                            raw_markets[primary] = {
-                                "question": q, "id": m.get("id",""),
-                                "tokens": tokens, "endDateIso": end,
-                                "_coin": coin,
-                            }
-                            added += 1
-                    if added > 0:
-                        break  # good sweep, stop
-            except Exception as e:
-                print(f"[S2] Sweep error: {e}")
-                continue
-        _market_cache["markets"] = raw_markets
-        _market_cache["ts"] = now_ts
-        ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] S2 sweep: {len(raw_markets)} updown crypto markets found")
+                    items = data if isinstance(data, list) else []
+                    return (coin, slug, items[0]) if items else None
+            except Exception:
+                return None
 
-    # Filter to markets in S2_WINDOW_SECS and correct coins
-    now = time.time()
-    result = []
-    skipped_coin = 0
-    skipped_time = 0
-    valid_secs = []
-    for token_id, m in raw_markets.items():
-        coin = m.get("_coin")
-        if coin not in S2_COINS:
-            skipped_coin += 1
+    results = await asyncio.gather(*[_try_slug(c, s) for c, s in slugs])
+
+    markets = []
+    for res in results:
+        if not res:
             continue
-        end_iso = m.get("endDateIso", "")
+        coin, slug, m = res
+        end = m.get("endDate") or m.get("endDateIso", "")
+        if not end:
+            continue
         try:
-            try:
-                end_dt    = datetime.fromisoformat(str(end_iso).replace("Z", "+00:00"))
-                secs_left = end_dt.timestamp() - now
-            except ValueError:
-                secs_left = float(end_iso) - now
+            end_dt    = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+            secs_left = end_dt.timestamp() - now
         except Exception:
             continue
-        valid_secs.append(round(secs_left))
         if secs_left < 0 or secs_left > S2_WINDOW_SECS:
-            skipped_time += 1
             continue
-        m["_secs_left"] = secs_left
-        result.append(m)
 
-    ts2 = datetime.now().strftime("%H:%M:%S")
-    min_s = min(valid_secs) if valid_secs else "?"
-    print(f"[{ts2}] S2 filter: {len(result)} in window | skip_coin={skipped_coin} skip_time={skipped_time} | nearest={min_s}s")
-    return result
+        # Parse tokens
+        tokens = m.get("tokens", []) or []
+        cti    = m.get("clobTokenIds") or m.get("clob_token_ids") or []
+        if isinstance(cti, str):
+            try: cti = json.loads(cti)
+            except Exception: cti = []
+        outs = m.get("outcomes") or m.get("outcome_names") or []
+        if isinstance(outs, str):
+            try: outs = json.loads(outs)
+            except Exception: outs = []
+        if not tokens and cti:
+            for i, tid in enumerate(cti):
+                out = outs[i] if i < len(outs) else ("UP" if i == 0 else "DOWN")
+                tokens.append({"token_id": str(tid), "outcome": str(out).upper()})
+        if not tokens:
+            continue
+
+        markets.append({
+            "question":   m.get("question", ""),
+            "id":         m.get("id", "") or slug,
+            "tokens":     tokens,
+            "endDateIso": end,
+            "_coin":      coin,
+            "_secs_left": secs_left,
+        })
+
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] S2 scan: {len(markets)} in window | slugs tried={len(slugs)}")
+    return markets
 
 # ─── POLYMARKET — ORDERBOOK ───────────────────────────────────────────────────
 async def fetch_orderbook(session: aiohttp.ClientSession,
@@ -434,9 +403,7 @@ class Scanner2:
     async def scan(self, session: aiohttp.ClientSession):
         self._sync_open_positions()
         markets = await fetch_markets(session)
-        ts = datetime.now().strftime("%H:%M:%S")
         if not markets:
-            print(f"[{ts}] S2 scan: 0 in window | fired=0 | open={len(self.open_positions)} | total={self.trades_fired}")
             return
 
         fired = 0
@@ -496,9 +463,9 @@ class Scanner2:
             if ok:
                 fired += 1
 
-        ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] S2 scan: {len(markets)} in window | fired={fired} | "
-              f"open={len(self.open_positions)} | total={self.trades_fired}")
+        if fired:
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"[{ts}] S2 total fired={self.trades_fired} | open={len(self.open_positions)}")
 
     async def run(self):
         init_db()
