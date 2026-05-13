@@ -165,7 +165,7 @@ print("  " + "─"*72)
 for w in win_rows:
     ts_str  = (w['ts'] or '')[:16]
     q_short = (w['question'] or '')[:30]
-    secs    = w['secs_left'] if 'secs_left' in cols and w['secs_left'] is not None else '?'
+    secs    = int(w['secs_left']) if 'secs_left' in cols and w['secs_left'] is not None else '?'
     print(f"  {w['id']:>4}  {ts_str:16}  {w['coin']:4}  {(w['outcome'] or ''):4}  "
           f"${w['entry_price']:.3f}  ${w['size_usdc']:.2f}  {str(secs):>4}s  ${w['pnl']:>+8.2f}  {q_short}")
 
@@ -182,7 +182,7 @@ print("  " + "─"*72)
 for w in loss_rows:
     ts_str  = (w['ts'] or '')[:16]
     q_short = (w['question'] or '')[:30]
-    secs    = w['secs_left'] if 'secs_left' in cols and w['secs_left'] is not None else '?'
+    secs    = int(w['secs_left']) if 'secs_left' in cols and w['secs_left'] is not None else '?'
     print(f"  {w['id']:>4}  {ts_str:16}  {w['coin']:4}  {(w['outcome'] or ''):4}  "
           f"${w['entry_price']:.3f}  ${w['size_usdc']:.2f}  {str(secs):>4}s  ${w['pnl']:>+8.2f}  {q_short}")
 
