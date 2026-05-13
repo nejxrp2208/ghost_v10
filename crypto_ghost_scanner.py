@@ -171,12 +171,12 @@ SKIP_DOWN_BIASED_COINS = set(
 # UP — flip the strategy in those hours, or skip outright.
 DEAD_UP_HOURS_ET = set(
     int(h.strip()) for h in
-    os.getenv("DEAD_UP_HOURS_ET", "11,1").split(",")
+    os.getenv("DEAD_UP_HOURS_ET", "").split(",")
     if h.strip().isdigit()
 )
 DEAD_DOWN_HOURS_ET = set(
     int(h.strip()) for h in
-    os.getenv("DEAD_DOWN_HOURS_ET", "4,5,19").split(",")
+    os.getenv("DEAD_DOWN_HOURS_ET", "").split(",")
     if h.strip().isdigit()
 )
 BIAS_FILTERS_ENABLED = os.getenv("BIAS_FILTERS", "true").strip().lower() in ("true","1","yes")
@@ -200,6 +200,29 @@ if _blocked_raw:
             pass
 if BLOCKED_HOURS:
     print(f"[ENV] BLOCKED_HOURS = {sorted(BLOCKED_HOURS)} (UTC)")
+
+# ── Brain state skip list ──────────────────────────────────────────────────────
+# DORMANT = 0/43 wins post-fix — well below break-even. If brain file is
+# stale/missing the filter is skipped (fail-open). Default: no states blocked.
+_skip_brain_raw = os.getenv("SKIP_BRAIN_STATES", "").strip()
+SKIP_BRAIN_STATES: set = set()
+for _sb in _skip_brain_raw.split(","):
+    _sb = _sb.strip().upper()
+    if _sb in ("HAUNTING", "STALKING", "DRIFTING", "DORMANT"):
+        SKIP_BRAIN_STATES.add(_sb)
+if SKIP_BRAIN_STATES:
+    print(f"[ENV] SKIP_BRAIN_STATES = {sorted(SKIP_BRAIN_STATES)}")
+else:
+    print(f"[ENV] SKIP_BRAIN_STATES = (none — brain state has no effect on filtering)")
+
+# ── Direction filter + MarketGhost hour bias ───────────────────────────────────
+# DIRECTION_FILTER: auto → use MarketGhost DB bias | up_only / down_only | off
+HOUR_BIAS_STRONG      = int(os.getenv("HOUR_BIAS_STRONG",      "60"))  # % threshold
+HOUR_BIAS_MIN_SAMPLES = int(os.getenv("HOUR_BIAS_MIN_SAMPLES", "15"))  # min resolved markets
+DIRECTION_FILTER = os.getenv("DIRECTION_FILTER", "auto").strip().lower()
+if DIRECTION_FILTER not in ("auto", "up_only", "down_only", "off"):
+    DIRECTION_FILTER = "auto"
+print(f"[ENV] DIRECTION_FILTER = {DIRECTION_FILTER}")
 
 # ── V2 momentum gate (ported 2026-05-13) ─────────────────────────────────────
 # When TREND_ENHANCED=true, refuses to fire if Binance is reversing at entry.
@@ -1966,6 +1989,51 @@ class CryptoGhostScanner:
                           f"(>75% UP, cheap-DOWN bad EV)")
                     skip_cert += 1
                     return
+
+            # ── Brain state filter ───────────────────────────────────────────
+            # DORMANT = 0/43 wins post-fix. Fail-open if brain file stale/missing.
+            if SKIP_BRAIN_STATES:
+                brain_now = read_brain_state(coin)
+                if brain_now and brain_now.get("state") in SKIP_BRAIN_STATES:
+                    print(f"         SKIP: Brain state {brain_now['state']} blocked "
+                          f"(score={brain_now.get('score')})")
+                    skip_cert += 1
+                    return
+
+            # ── Direction filter (MarketGhost hour bias) ─────────────────────
+            if DIRECTION_FILTER == "up_only" and not buying_up:
+                print(f"         SKIP: DIRECTION_FILTER=up_only — DOWN trade blocked")
+                skip_cert += 1
+                return
+            if DIRECTION_FILTER == "down_only" and buying_up:
+                print(f"         SKIP: DIRECTION_FILTER=down_only — UP trade blocked")
+                skip_cert += 1
+                return
+            if DIRECTION_FILTER == "auto":
+                up_pct, mg_samples = get_hour_bias(coin)
+                if mg_samples >= HOUR_BIAS_MIN_SAMPLES:
+                    dn_pct = 100 - up_pct
+                    if up_pct >= HOUR_BIAS_STRONG and not buying_up:
+                        print(f"         SKIP: MarketGhost hour bias {up_pct:.0f}% UP "
+                              f"({mg_samples} samples) — DOWN trade blocked")
+                        skip_cert += 1
+                        return
+                    if dn_pct >= HOUR_BIAS_STRONG and buying_up:
+                        print(f"         SKIP: MarketGhost hour bias {dn_pct:.0f}% DOWN "
+                              f"({mg_samples} samples) — UP trade blocked")
+                        skip_cert += 1
+                        return
+                    if up_pct >= HOUR_BIAS_STRONG and buying_up:
+                        print(f"         ★ Hour bias confirms: {up_pct:.0f}% UP "
+                              f"({mg_samples} samples) — UP trade aligned")
+                    elif dn_pct >= HOUR_BIAS_STRONG and not buying_up:
+                        print(f"         ★ Hour bias confirms: {dn_pct:.0f}% DOWN "
+                              f"({mg_samples} samples) — DOWN trade aligned")
+                    else:
+                        print(f"         Hour bias: {up_pct:.0f}% UP / {dn_pct:.0f}% DOWN "
+                              f"({mg_samples} samples) — neutral")
+                else:
+                    print(f"         Hour bias: insufficient data ({mg_samples} samples) — neutral")
 
             # Trend filter already gated above. Just final invariants.
             if not token_id or ask is None or ask <= 0:
