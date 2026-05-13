@@ -251,7 +251,8 @@ def init_db():
             outcome     TEXT DEFAULT 'UP',
             status      TEXT DEFAULT 'open',
             pnl         REAL DEFAULT 0,
-            closed_at   TEXT
+            closed_at   TEXT,
+            strategy    TEXT DEFAULT 'lottery'
         )
     """)
     conn.execute("""
@@ -375,17 +376,18 @@ def log_event(icon: str, msg: str):
 
 def log_trade(tier, coin, market_id, token_id, question, entry, size, order_id, outcome="UP", trend_dev=None, secs_left=None):
     conn = sqlite3.connect(DB_PATH)
-    for col in ["outcome TEXT DEFAULT 'UP'", "trend_dev_1h REAL", "secs_left REAL"]:
+    for col in ["outcome TEXT DEFAULT 'UP'", "trend_dev_1h REAL", "secs_left REAL",
+                "strategy TEXT DEFAULT 'lottery'"]:
         try:
             conn.execute(f"ALTER TABLE trades ADD COLUMN {col}")
             conn.commit()
         except Exception:
             pass
     conn.execute("""
-        INSERT INTO trades (ts,tier,coin,market_id,token_id,question,entry_price,size_usdc,order_id,outcome,trend_dev_1h,secs_left)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO trades (ts,tier,coin,market_id,token_id,question,entry_price,size_usdc,order_id,outcome,trend_dev_1h,secs_left,strategy)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (datetime.now(timezone.utc).isoformat(), tier, coin,
-          market_id, token_id, question[:120], entry, size, order_id, outcome, trend_dev, secs_left))
+          market_id, token_id, question[:120], entry, size, order_id, outcome, trend_dev, secs_left, "lottery"))
     conn.commit()
     conn.close()
 
@@ -710,6 +712,7 @@ class PriceTracker:
         """Maintain Binance WebSocket connection with auto-reconnect"""
         coin_map = {"btcusdt": "BTC", "ethusdt": "ETH",
                     "bnbusdt": "BNB", "solusdt": "SOL", "xrpusdt": "XRP"}
+        _backoff = 1
         while self.running:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -719,6 +722,7 @@ class PriceTracker:
                         timeout=aiohttp.ClientWSTimeout(ws_close=10)
                     ) as ws:
                         self._ws_connected = True
+                        _backoff = 1  # reset on clean connect
                         ts = datetime.now().strftime("%H:%M:%S")
                         print(f"[{ts}] Binance WebSocket connected ✓")
                         async for msg in ws:
@@ -745,8 +749,9 @@ class PriceTracker:
                                 break
             except Exception as e:
                 self._ws_connected = False
-                print(f"[PriceTracker] WS error: {e} — reconnecting in 5s")
-                await asyncio.sleep(5)
+                print(f"[PriceTracker] WS error: {e} — reconnecting in {_backoff}s")
+                await asyncio.sleep(_backoff)
+                _backoff = min(_backoff * 2, 30)
 
 # ─── STRIKE MARKET PRELOADER ──────────────────────────────────────────────────
 class StrikePreloader:
@@ -2012,6 +2017,19 @@ class CryptoGhostScanner:
                 if time.time() - self._signaled_lastclear > 300:
                     self._signaled.clear()
                     self._signaled_lastclear = time.time()
+
+                # Circuit breaker halt check — ghost_circuit_breaker.py writes this flag
+                _halt_flag = os.path.join(SCRIPT_DIR, "tasks", "HALT.flag")
+                if os.path.exists(_halt_flag):
+                    try:
+                        with open(_halt_flag) as _hf:
+                            _reason = _hf.read().strip() or "(unspecified)"
+                    except Exception:
+                        _reason = "(unreadable)"
+                    print(f"[HALT] Circuit breaker active: {_reason}")
+                    print(f"[HALT] Delete tasks/HALT.flag to resume.")
+                    await asyncio.sleep(30)
+                    continue
 
                 kill = self.kill_check()
                 if kill:

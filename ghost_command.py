@@ -42,7 +42,7 @@ INTERVAL   = 3600  # run all agents every hour
 AGENTS = [
     ("ghost_analyst.py",    "Analyst",    "Deep data analysis"),
     ("ghost_optimizer.py",  "Optimizer",  "Parameter grid search"),
-    ("ghost_strategist.py", "Strategist", "Signal research"),
+    ("ghost_strategist_v2.py", "Strategist", "Signal research"),
     ("ghost_scaler.py",     "Scaler",     "Position sizing"),
 ]
 
