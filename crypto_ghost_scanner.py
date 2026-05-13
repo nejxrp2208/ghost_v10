@@ -181,6 +181,26 @@ DEAD_DOWN_HOURS_ET = set(
 )
 BIAS_FILTERS_ENABLED = os.getenv("BIAS_FILTERS", "true").strip().lower() in ("true","1","yes")
 
+# ── Coin disable list (ghost_analyst auto-tunes via .env) ─────────────────────
+_disabled_raw = os.getenv("DISABLED_COINS", "")
+DISABLED_COINS: set = {c.strip().upper() for c in _disabled_raw.split(",") if c.strip()}
+if DISABLED_COINS:
+    print(f"[ENV] DISABLED_COINS = {sorted(DISABLED_COINS)}")
+
+# ── Cold-hour UTC filter (ghost_analyst auto-tunes via .env) ──────────────────
+_blocked_raw = os.getenv("BLOCKED_HOURS", "").strip()
+BLOCKED_HOURS: set = set()
+if _blocked_raw:
+    for _h in _blocked_raw.split(","):
+        try:
+            _v = int(_h.strip())
+            if 0 <= _v <= 23:
+                BLOCKED_HOURS.add(_v)
+        except Exception:
+            pass
+if BLOCKED_HOURS:
+    print(f"[ENV] BLOCKED_HOURS = {sorted(BLOCKED_HOURS)} (UTC)")
+
 # ── V2 momentum gate (ported 2026-05-13) ─────────────────────────────────────
 # When TREND_ENHANCED=true, refuses to fire if Binance is reversing at entry.
 # L23 forensics: 92/115 losses had price reversing after entry (0% WR).
@@ -252,7 +272,9 @@ def init_db():
             status      TEXT DEFAULT 'open',
             pnl         REAL DEFAULT 0,
             closed_at   TEXT,
-            strategy    TEXT DEFAULT 'lottery'
+            strategy    TEXT DEFAULT 'lottery',
+            brain_state TEXT,
+            brain_score REAL
         )
     """)
     conn.execute("""
@@ -374,20 +396,22 @@ def log_event(icon: str, msg: str):
     except Exception:
         pass
 
-def log_trade(tier, coin, market_id, token_id, question, entry, size, order_id, outcome="UP", trend_dev=None, secs_left=None):
+def log_trade(tier, coin, market_id, token_id, question, entry, size, order_id,
+              outcome="UP", trend_dev=None, secs_left=None, brain_state=None, brain_score=None):
     conn = sqlite3.connect(DB_PATH)
     for col in ["outcome TEXT DEFAULT 'UP'", "trend_dev_1h REAL", "secs_left REAL",
-                "strategy TEXT DEFAULT 'lottery'"]:
+                "strategy TEXT DEFAULT 'lottery'", "brain_state TEXT", "brain_score REAL"]:
         try:
             conn.execute(f"ALTER TABLE trades ADD COLUMN {col}")
             conn.commit()
         except Exception:
             pass
     conn.execute("""
-        INSERT INTO trades (ts,tier,coin,market_id,token_id,question,entry_price,size_usdc,order_id,outcome,trend_dev_1h,secs_left,strategy)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO trades (ts,tier,coin,market_id,token_id,question,entry_price,size_usdc,order_id,outcome,trend_dev_1h,secs_left,strategy,brain_state,brain_score)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (datetime.now(timezone.utc).isoformat(), tier, coin,
-          market_id, token_id, question[:120], entry, size, order_id, outcome, trend_dev, secs_left, "lottery"))
+          market_id, token_id, question[:120], entry, size, order_id, outcome, trend_dev, secs_left, "lottery",
+          brain_state, brain_score))
     conn.commit()
     conn.close()
 
@@ -627,7 +651,8 @@ class PriceTracker:
 
     async def fetch_opens(self, session: aiohttp.ClientSession):
         """Fetch current candle opens from Binance REST"""
-        symbols = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "BNB": "BNBUSDT"}
+        symbols = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "BNB": "BNBUSDT",
+                   "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
         for coin, sym in symbols.items():
             try:
                 # 1h candle
@@ -1623,7 +1648,8 @@ class CryptoGhostScanner:
         question = market.get("question", "")[:70]
 
         try:
-            shares = max(round(size / ask, 4), 5.0)  # Polymarket CLOB minimum 5 shares
+            ask    = round(round(ask / 0.001) * 0.001, 4)  # tick-round to $0.001 grid
+            shares = max(round(size / ask, 4), 5.0)        # Polymarket CLOB minimum 5 shares
 
             if PAPER_TRADE:
                 order_id = f"PAPER-{int(time.time()*1000)}"
@@ -1647,8 +1673,12 @@ class CryptoGhostScanner:
                     "entry": ask, "size": size,
                     "order_id": order_id, "ts": time.time()
                 }
+                brain   = read_brain_state(coin)
+                b_state = brain.get("state") if brain else None
+                b_score = brain.get("score") if brain else None
                 log_trade(tier, coin, market.get("id",""),
-                          token_id, question, ask, size, order_id, outcome, trend_dev, secs_left)
+                          token_id, question, ask, size, order_id, outcome, trend_dev, secs_left,
+                          brain_state=b_state, brain_score=b_score)
                 self.trades_fired += 1
                 payout   = round(size / ask - size, 2)
                 ts       = datetime.now().strftime("%H:%M:%S")
@@ -1775,6 +1805,11 @@ class CryptoGhostScanner:
             q    = m.get("question", "")
             coin = get_coin(q)
             if not coin or "up or down" not in q.lower():
+                return
+            if coin in DISABLED_COINS:
+                return
+            if BLOCKED_HOURS and datetime.now(timezone.utc).hour in BLOCKED_HOURS:
+                skip_win += 1
                 return
             tier = classify_tier(q)
             if tier not in (2, 3, 4):
