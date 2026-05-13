@@ -82,7 +82,7 @@ S2_SIZE_USDC       = float(os.getenv("S2_SIZE_USDC",       "3.0"))
 S2_MIN_LIQUIDITY   = float(os.getenv("S2_MIN_LIQUIDITY",   "10.0"))   # higher req for mid-prob
 S2_COINS           = set(
     c.strip().upper() for c in
-    os.getenv("S2_COINS", "BTC,ETH,BNB").split(",") if c.strip()
+    os.getenv("S2_COINS", "BTC,ETH,BNB,XRP,SOL").split(",") if c.strip()
 )
 S2_SCAN_INTERVAL   = float(os.getenv("S2_SCAN_INTERVAL",   "5.0"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS",   "20"))
