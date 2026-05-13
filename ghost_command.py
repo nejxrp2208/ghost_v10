@@ -43,7 +43,7 @@ AGENTS = [
     ("ghost_analyst.py",    "Analyst",    "Deep data analysis"),
     ("ghost_optimizer.py",  "Optimizer",  "Parameter grid search"),
     ("ghost_strategist_v2.py", "Strategist", "Signal research"),
-    ("ghost_scaler.py",     "Scaler",     "Position sizing"),
+    ("ghost_scaler_v2.py",  "Scaler",     "Position sizing"),
 ]
 
 # ── DB helpers ──────────────────────────────────────────────────────────────────

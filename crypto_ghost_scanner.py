@@ -252,6 +252,14 @@ except Exception as _gge:
     _GHOST_GUARD_OK = False
     _ghost_guard    = None
 
+try:
+    from ghost_oracle_agreement import allow_fire as _oracle_allow_fire
+    _ORACLE_OK = True
+except Exception as _ooe:
+    print(f"[WARN] ghost_oracle_agreement unavailable ({_ooe}) — oracle gate off (fail-open)")
+    _ORACLE_OK = False
+    _oracle_allow_fire = None
+
 
 # ─── DATABASE ─────────────────────────────────────────────────────────────────
 def init_db():
@@ -1635,6 +1643,10 @@ class CryptoGhostScanner:
 
         # ── Ghost fill guard ─────────────────────────────────────────────────
         if _GHOST_GUARD_OK and not _ghost_guard.can_fire(token_id, coin):
+            return False
+
+        # ── Oracle agreement gate (Coinbase direction vs Binance prediction) ──
+        if _ORACLE_OK and not _oracle_allow_fire(coin, outcome):
             return False
 
         # ── Momentum gate (TREND_ENHANCED) ────────────────────────────────────
