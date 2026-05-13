@@ -88,7 +88,7 @@ CLOB_START_CURSOR = "MTAwMA=="
 BINANCE_REST    = "https://api.binance.com/api/v3"
 BINANCE_WS_URL  = (
     "wss://stream.binance.com:9443/stream?streams="
-    "btcusdt@ticker/ethusdt@ticker"
+    "btcusdt@ticker/ethusdt@ticker/bnbusdt@ticker/solusdt@ticker/xrpusdt@ticker"
 )
 
 # ── Trade sizing per tier ──
@@ -181,6 +181,31 @@ DEAD_DOWN_HOURS_ET = set(
 )
 BIAS_FILTERS_ENABLED = os.getenv("BIAS_FILTERS", "true").strip().lower() in ("true","1","yes")
 
+# ── V2 momentum gate (ported 2026-05-13) ─────────────────────────────────────
+# When TREND_ENHANCED=true, refuses to fire if Binance is reversing at entry.
+# L23 forensics: 92/115 losses had price reversing after entry (0% WR).
+TREND_ENHANCED      = os.getenv("TREND_ENHANCED", "false").strip().lower() in ("true","1","yes")
+TREND_N_TICKS       = int(os.getenv("TREND_N_TICKS", "10"))
+TREND_MOMENTUM_MIN  = float(os.getenv("TREND_MOMENTUM_MIN", "0.30"))
+TREND_VELOCITY_MIN  = float(os.getenv("TREND_VELOCITY_MIN", "0.0000005"))
+
+# ── Direction-based entry multipliers ─────────────────────────────────────────
+# Set <1.0 to tighten the UP cap (UP historically weaker than DOWN).
+UP_MAX_ENTRY_MULT   = float(os.getenv("UP_MAX_ENTRY_MULT",   "1.0"))
+DOWN_MAX_ENTRY_MULT = float(os.getenv("DOWN_MAX_ENTRY_MULT", "1.0"))
+
+# ── Entry price floor (skip near-zero junk tokens) ────────────────────────────
+MIN_ENTRY_PRICE = float(os.getenv("MIN_ENTRY_PRICE", "0.008"))
+
+# ── Regime gate config (requires ghost_regime_sentinel.py running) ────────────
+TREND_REGIME_GATE      = os.getenv("TREND_REGIME_GATE", "false").strip().lower() in ("true","1","yes")
+TREND_REGIME_VOL_MIN   = float(os.getenv("TREND_REGIME_VOL_MIN",  "0.0005"))
+TREND_REGIME_MAX_AGE_S = int(os.getenv("TREND_REGIME_MAX_AGE_S", "600"))
+
+# ── Hour-bias + brain state caches (module-level, filled lazily) ──────────────
+_hour_bias_cache: Dict[str, Any] = {}
+_brain_cache: Dict[str, Any] = {"ts": 0, "data": None}
+
 # v9 Engine Change 1: Lazy orderbook fetch (filters → predict side → 1 fetch).
 # Strategy-neutral in 95%+ of cases per analysis. Default ON.
 # Set LAZY_ORDERBOOK=false to fall back to v7-style fetch-both-then-pick.
@@ -193,6 +218,19 @@ PORTFOLIO_SIZE = float(os.getenv("PORTFOLIO_SIZE", "200.0"))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH    = os.path.join(SCRIPT_DIR,
                 "crypto_ghost_PAPER.db" if PAPER_TRADE else "crypto_ghost.db")
+
+# ── Ghost Fill Guard (duplicate + ghost-fill prevention) ──────────────────────
+try:
+    from ghost_fill_guard import GhostFillGuard
+    _ghost_guard = GhostFillGuard(
+        guard_db=os.path.join(SCRIPT_DIR, "agent_reports.db"),
+        trades_db=DB_PATH,
+    )
+    _GHOST_GUARD_OK = True
+except Exception as _gge:
+    print(f"[WARN] GhostFillGuard unavailable ({_gge}) — duplicate protection off")
+    _GHOST_GUARD_OK = False
+    _ghost_guard    = None
 
 
 # ─── DATABASE ─────────────────────────────────────────────────────────────────
@@ -368,8 +406,117 @@ def get_daily_loss():
     return -min(pnl, 0)  # Return loss as positive number
 
 # ─── CRYPTO KEYWORD FILTERS ───────────────────────────────────────────────────
-COINS = {"BTC": ["btc", "bitcoin"],
-         "ETH": ["eth", "ethereum"]}
+COINS = {
+    "BTC": ["btc", "bitcoin"],
+    "ETH": ["eth", "ethereum"],
+    "BNB": ["bnb", "binance coin"],
+    "SOL": ["sol", "solana"],
+    "XRP": ["xrp", "ripple"],
+}
+
+# ─── HOUR BIAS & BRAIN STATE HELPERS (V2 port) ────────────────────────────────
+
+def get_hour_bias(coin: str) -> tuple:
+    """
+    Read MarketGhost DB for current UTC hour's UP win % for this coin.
+    Returns (up_pct: float, samples: int). Cached 5 min per coin+hour.
+    Returns (50.0, 0) if DB unavailable or too few samples.
+    """
+    try:
+        now  = time.time()
+        hour = datetime.utcnow().hour
+        key  = f"{coin}-{hour:02d}"
+        entry = _hour_bias_cache.get(key)
+        if entry and now - entry["ts"] < 300:
+            return entry["up_pct"], entry["samples"]
+        mg_db = os.path.join(SCRIPT_DIR, "marketghost.db")
+        if not os.path.exists(mg_db):
+            return 50.0, 0
+        con = sqlite3.connect(mg_db, timeout=3)
+        row = con.execute("""
+            SELECT COUNT(*) total,
+                   SUM(CASE WHEN winner='UP' THEN 1 ELSE 0 END) up_wins
+            FROM resolutions
+            WHERE coin=?
+              AND CAST(strftime('%H', end_utc) AS INTEGER) = ?
+        """, (coin, hour)).fetchone()
+        con.close()
+        total   = row[0] or 0
+        up_wins = row[1] or 0
+        up_pct  = (up_wins / total * 100) if total > 0 else 50.0
+        _hour_bias_cache[key] = {"up_pct": up_pct, "samples": total, "ts": now}
+        return up_pct, total
+    except Exception:
+        return 50.0, 0
+
+
+def read_brain_state(coin: str) -> Optional[dict]:
+    """
+    Read brain state for a coin from ghost_brain.json. Cached 5s.
+    Returns dict {state, score, direction, dir_consistent} or None if stale/missing.
+    """
+    try:
+        now = time.time()
+        bf  = os.path.join(SCRIPT_DIR, "ghost_brain.json")
+        if not os.path.exists(bf):
+            return None
+        if now - _brain_cache["ts"] < 5 and _brain_cache["data"] is not None:
+            data = _brain_cache["data"]
+        else:
+            with open(bf, "r") as f:
+                data = json.load(f)
+            _brain_cache["ts"]   = now
+            _brain_cache["data"] = data
+        coins = data.get("coins", {}) if isinstance(data, dict) else {}
+        info  = coins.get(coin.upper()) or coins.get(coin)
+        if not info:
+            return None
+        last_real = info.get("last_real_ts") or 0
+        if now - last_real > 90:
+            return None
+        return {
+            "state":          info.get("state"),
+            "score":          info.get("score"),
+            "direction":      info.get("direction"),
+            "dir_consistent": info.get("dir_consistent"),
+        }
+    except Exception:
+        return None
+
+
+def _check_regime_chop() -> Tuple[bool, str]:
+    """
+    Read latest regime_log from agent_reports.db. Returns (halt, reason).
+    Halts when BOTH BTC and ETH 5m vol are below TREND_REGIME_VOL_MIN.
+    Fails open (no halt) when sentinel data is missing/stale.
+    """
+    if not TREND_REGIME_GATE:
+        return False, ""
+    try:
+        rdb = os.path.join(SCRIPT_DIR, "agent_reports.db")
+        con = sqlite3.connect(rdb, timeout=2)
+        row = con.execute(
+            "SELECT ts, btc_vol_5m, eth_vol_5m FROM regime_log ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        con.close()
+    except Exception:
+        return False, ""
+    if not row or row[1] is None or row[2] is None:
+        return False, ""
+    try:
+        d = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - d).total_seconds() > TREND_REGIME_MAX_AGE_S:
+            return False, ""
+    except Exception:
+        return False, ""
+    btc_v, eth_v = row[1], row[2]
+    if btc_v < TREND_REGIME_VOL_MIN and eth_v < TREND_REGIME_VOL_MIN:
+        return True, (f"BTC vol={btc_v*100:.3f}% AND ETH vol={eth_v*100:.3f}% "
+                      f"both < {TREND_REGIME_VOL_MIN*100:.2f}%")
+    return False, ""
+
 
 def get_coin(question: str) -> Optional[str]:
     q = question.lower()
@@ -469,6 +616,12 @@ class PriceTracker:
         self.crossed_strikes: set = set()            # (coin, strike) already fired
         self.running = True
         self._ws_connected = False
+        # Ring buffer of (ts, price) per coin — feeds momentum gate
+        from collections import deque
+        _N = TREND_N_TICKS
+        self._tick_history: Dict[str, "deque"] = {
+            c: deque(maxlen=_N) for c in ("BTC", "ETH", "BNB", "SOL", "XRP")
+        }
 
     async def fetch_opens(self, session: aiohttp.ClientSession):
         """Fetch current candle opens from Binance REST"""
@@ -512,6 +665,33 @@ class PriceTracker:
             return None
         return (price - open_price) / open_price
 
+    def get_momentum(self, coin: str, buying_up: bool) -> Tuple[float, float]:
+        """
+        Returns (momentum_pct, velocity_pct_per_sec).
+        momentum_pct = fraction of intra-window deltas in the bet direction.
+        velocity     = price range / price_first / dt (always positive if active).
+        Neutral (0.5, 0.0) when fewer than 3 ticks — won't block early.
+        """
+        hist = list(self._tick_history.get(coin, []))
+        if len(hist) < 3:
+            return 0.5, 0.0
+        matches = 0; moves = 0
+        for i in range(1, len(hist)):
+            p_prev = hist[i-1][1]; p_now = hist[i][1]
+            if p_now == p_prev:
+                continue
+            moves += 1
+            if (p_now > p_prev) == buying_up:
+                matches += 1
+        momentum_pct = matches / moves if moves else 0.5
+        prices = [p for _, p in hist]
+        ts_first = hist[0][0]; ts_last = hist[-1][0]
+        dt = ts_last - ts_first
+        p_first = prices[0]
+        price_range = max(prices) - min(prices)
+        velocity = (price_range / p_first / dt) if (dt > 0 and p_first > 0) else 0.0
+        return momentum_pct, velocity
+
     def check_strike_crossing(self, coin: str, strike: float) -> bool:
         """Returns True if spot has crossed this strike (and not yet fired)."""
         price = self.prices.get(coin)
@@ -528,7 +708,8 @@ class PriceTracker:
 
     async def run_websocket(self):
         """Maintain Binance WebSocket connection with auto-reconnect"""
-        coin_map = {"btcusdt": "BTC", "ethusdt": "ETH"}
+        coin_map = {"btcusdt": "BTC", "ethusdt": "ETH",
+                    "bnbusdt": "BNB", "solusdt": "SOL", "xrpusdt": "XRP"}
         while self.running:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -551,7 +732,12 @@ class PriceTracker:
                                     sym = stream.split("@")[0]
                                     coin = coin_map.get(sym)
                                     if coin and ticker:
-                                        self.prices[coin] = float(ticker.get("c", 0))
+                                        _new = float(ticker.get("c", 0))
+                                        if _new > 0:
+                                            self.prices[coin] = _new
+                                            hist = self._tick_history.get(coin)
+                                            if hist is not None:
+                                                hist.append((time.time(), _new))
                                 except Exception:
                                     pass
                             elif msg.type in (aiohttp.WSMsgType.CLOSED,
@@ -1354,6 +1540,10 @@ class CryptoGhostScanner:
         self.trades_fired   = 0
         self.scan_count     = 0
         self.running        = True
+        # Dedup: log each (token_id, side) signal once per close window.
+        # Cleared every 5 min to prevent unbounded growth.
+        self._signaled: set = set()
+        self._signaled_lastclear: float = 0.0
         init_db()
         self._print_banner()
 
@@ -1388,9 +1578,14 @@ class CryptoGhostScanner:
             return T2_SIZE_PER_COIN.get(coin.upper(), T2_SIZE)
         return {1: T1_SIZE, 2: T2_SIZE, 3: T3_SIZE, 4: T4_SIZE}.get(tier, 2.0)
 
-    def get_max_entry(self, tier: int) -> float:
-        return {1: T1_MAX_ENTRY, 2: T2_MAX_ENTRY,
+    def get_max_entry(self, tier: int, outcome: str = "UP") -> float:
+        base = {1: T1_MAX_ENTRY, 2: T2_MAX_ENTRY,
                 3: T3_MAX_ENTRY, 4: T4_MAX_ENTRY}.get(tier, 0.15)
+        if tier == 2:
+            buying_up = outcome.upper() in ("UP", "YES", "HIGHER", "ABOVE")
+            mult = UP_MAX_ENTRY_MULT if buying_up else DOWN_MAX_ENTRY_MULT
+            return base * mult
+        return base
 
     async def fire_trade(self, tier: int, coin: str, token_id: str,
                          market: dict, ask: float, outcome: str = "UP",
@@ -1403,6 +1598,21 @@ class CryptoGhostScanner:
             return False
         if self.kill_check():
             return False
+
+        # ── Entry price floor ────────────────────────────────────────────────
+        if ask < MIN_ENTRY_PRICE:
+            return False
+
+        # ── Ghost fill guard ─────────────────────────────────────────────────
+        if _GHOST_GUARD_OK and not _ghost_guard.can_fire(token_id, coin):
+            return False
+
+        # ── Momentum gate (TREND_ENHANCED) ────────────────────────────────────
+        if TREND_ENHANCED and tier == 2:
+            buying_up = outcome.upper() in ("UP", "YES", "HIGHER", "ABOVE")
+            mom, vel = self.tracker.get_momentum(coin, buying_up)
+            if mom < TREND_MOMENTUM_MIN or vel < TREND_VELOCITY_MIN:
+                return False
 
         size     = self.get_size(tier, coin)
         question = market.get("question", "")[:70]
@@ -1419,6 +1629,14 @@ class CryptoGhostScanner:
                               resp.get("id") or "") if resp else ""
 
             if order_id:
+                if _GHOST_GUARD_OK:
+                    try:
+                        _ghost_guard.register_order(
+                            order_id=order_id, token_id=token_id, coin=coin,
+                            tier=f"T{tier}", ask_price=ask, size_usdc=size,
+                        )
+                    except Exception as _gge:
+                        print(f"[GhostGuard] register_order failed (non-fatal): {_gge}")
                 self.open_positions[token_id] = {
                     "tier": tier, "coin": coin, "question": question,
                     "entry": ask, "size": size,
@@ -1703,7 +1921,7 @@ class CryptoGhostScanner:
             if token_id in self.open_positions:
                 return
 
-            max_e      = self.get_max_entry(tier)
+            max_e      = self.get_max_entry(tier, tok_outcome)
             no_implied = round(1 - ask, 4)
 
             ts = datetime.now().strftime("%H:%M:%S")
@@ -1725,9 +1943,12 @@ class CryptoGhostScanner:
                 return
 
             signals += 1
-            print(f"         SIGNAL PASSED — YES/UP entry={ask:.3f} certainty={no_implied:.0%}")
-            log_event("🎯", f"Signal T{tier} {coin} {tok_outcome} ask={ask:.3f} "
-                             f"certainty={no_implied:.0%} mins={mins:.1f}")
+            print(f"         SIGNAL PASSED — {tok_outcome} entry={ask:.3f} certainty={no_implied:.0%}")
+            sig_key = f"{token_id}:{tok_outcome}"
+            if sig_key not in self._signaled:
+                self._signaled.add(sig_key)
+                log_event("🎯", f"Signal T{tier} {coin} {tok_outcome} ask={ask:.3f} "
+                                 f"certainty={no_implied:.0%} mins={mins:.1f}")
             if await self.fire_trade(tier, coin, token_id, m, ask, outcome=tok_outcome, trend_dev=dev, secs_left=secs):
                 fired += 1
                 await asyncio.sleep(0.3)
@@ -1779,6 +2000,18 @@ class CryptoGhostScanner:
                 self.scan_count += 1
                 ts_now = datetime.now().strftime("%H:%M:%S")
                 print(f"[{ts_now}] Starting scan #{self.scan_count}...")
+
+                # Ghost fill guard sweep — every ~60 scan cycles
+                if _GHOST_GUARD_OK and self.scan_count % 60 == 0:
+                    try:
+                        _ghost_guard.sweep_ghosts(clob_client=None)
+                    except Exception as _gge:
+                        print(f"[GhostGuard] sweep failed (non-fatal): {_gge}")
+
+                # Periodic _signaled clear — prevents unbounded set growth
+                if time.time() - self._signaled_lastclear > 300:
+                    self._signaled.clear()
+                    self._signaled_lastclear = time.time()
 
                 kill = self.kill_check()
                 if kill:
