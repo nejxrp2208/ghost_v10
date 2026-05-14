@@ -136,6 +136,13 @@ def init_db():
         except Exception:
             pass  # column already exists
 
+    # Migrate resolutions table: add PM ground truth columns
+    for col_def in ["pm_winner TEXT", "binance_winner TEXT", "resolution_source TEXT"]:
+        try:
+            c.execute(f"ALTER TABLE resolutions ADD COLUMN {col_def}")
+        except Exception:
+            pass
+
     c.execute("DROP TABLE IF EXISTS markets_compression_summary")
     c.execute("""
         CREATE TABLE markets_compression_summary (
@@ -297,80 +304,195 @@ async def get_binance_price_at(session, coin: str, ts: datetime):
         return None
 
 
-# ── FETCH MARKETS ────────────────────────────────────────────────────────────
+# ── MARKET DISCOVERY ─────────────────────────────────────────────────────────
+def build_expected_slugs() -> list:
+    """Builds slug candidates for current + upcoming 5m and 15m markets.
+    Format: {coin}-updown-{5m|15m}-{unix_end_timestamp}
+    Covers BTC/ETH/SOL/XRP/BNB. Returns list of (coin, slug) tuples."""
+    import time as _time
+    now_ts = int(_time.time())
+    SLUG_COINS = [("BTC","btc"), ("ETH","eth"), ("SOL","sol"), ("XRP","xrp"), ("BNB","bnb")]
+
+    curr_5m = ((now_ts // 300) + 1) * 300
+    slots_5m = [(curr_5m + i * 300, "5m") for i in range(-1, 4)]
+
+    curr_15m = ((now_ts // 900) + 1) * 900
+    slots_15m = [(curr_15m + i * 900, "15m") for i in range(-1, 3)]
+
+    slugs = []
+    for end_ts, interval in slots_5m + slots_15m:
+        for coin, slug_coin in SLUG_COINS:
+            slugs.append((coin, f"{slug_coin}-updown-{interval}-{end_ts}"))
+    return slugs
+
+
+async def _lookup_slug(session, slug: str):
+    try:
+        async with session.get(
+            f"{GAMMA_API}/markets",
+            params={"slug": slug},
+            timeout=aiohttp.ClientTimeout(total=6)
+        ) as r:
+            if r.status != 200: return None
+            data = await r.json()
+            return data[0] if isinstance(data, list) and data else None
+    except Exception:
+        return None
+
+
 async def fetch_markets(session) -> list:
-    """Paginated Gamma sweep — returns only active crypto Up/Down markets."""
-    markets, offset = [], 0
-    while True:
+    """Slug-based discovery (primary) + Gamma sweep fallback.
+    Slug lookup returns full market objects with clobTokenIds reliably."""
+    seen_ids = set()
+    markets  = []
+
+    # Primary: hit known slugs directly
+    for coin, slug in build_expected_slugs():
+        m = await _lookup_slug(session, slug)
+        if not m:
+            continue
+        mid = str(m.get("id", ""))
+        if not mid or mid in seen_ids:
+            continue
+        seen_ids.add(mid)
+        markets.append(m)
+        await asyncio.sleep(0.05)
+
+    # Fallback: Gamma sweep catches any markets the slug pattern missed
+    if len(markets) < 3:
         try:
             async with session.get(
                 f"{GAMMA_API}/markets",
                 params={"active": "true", "archived": "false", "closed": "false",
-                        "limit": 200, "offset": offset,
-                        "order": "endDateIso", "ascending": "true"},
+                        "limit": 200, "order": "endDateIso", "ascending": "true"},
                 timeout=aiohttp.ClientTimeout(total=20)
             ) as r:
-                if r.status != 200: break
-                batch = await r.json()
-                if not batch: break
-                found_any = False
-                for m in batch:
-                    q = (m.get("question") or "").lower()
-                    if (any(x in q for x in ["up or down", "higher or lower"]) and
-                            any(x in q for x in ["bitcoin","ethereum","solana","xrp","btc","eth","sol"])):
-                        markets.append(m)
-                        found_any = True
-                if not found_any:
-                    break
-                offset += 200
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            break
+                if r.status == 200:
+                    for m in (await r.json() or []):
+                        mid = str(m.get("id", ""))
+                        if mid in seen_ids: continue
+                        q = (m.get("question") or "").lower()
+                        if (any(x in q for x in ["up or down", "higher or lower"]) and
+                                any(x in q for x in ["bitcoin","ethereum","solana","xrp","btc","eth","sol","bnb"])):
+                            seen_ids.add(mid)
+                            markets.append(m)
         except Exception as e:
-            print(f"[ERROR] fetch_markets: {e}")
-            break
+            print(f"[WARN] fetch_markets fallback: {e}")
+
     return markets
 
 
-# ── FETCH RESOLUTIONS ────────────────────────────────────────────────────────
-async def fetch_resolutions(session, conn):
+# ── RESOLUTION (PM ground truth) ─────────────────────────────────────────────
+async def fetch_pm_winner(session, slug: str):
+    """Returns 'UP'/'DOWN' from Polymarket's actual oracle, or None if not finalized."""
     try:
         async with session.get(
             f"{GAMMA_API}/markets",
-            params={"closed": "true", "archived": "false",
-                    "limit": 200, "order": "endDateIso", "ascending": "false"},
-            timeout=aiohttp.ClientTimeout(total=20)
+            params={"slug": slug, "closed": "true"},
+            timeout=aiohttp.ClientTimeout(total=6)
         ) as r:
-            if r.status != 200: return
-            markets = await r.json()
-
-        c = conn.cursor()
-        stored = 0
-        for m in (markets or []):
-            mid = m.get("id")
-            if not mid: continue
-            c.execute("SELECT 1 FROM resolutions WHERE market_id=?", (mid,))
-            if c.fetchone(): continue
-            op = m.get("outcomePrices", [])
-            if isinstance(op, str):
-                try: op = json.loads(op)
-                except Exception: op = []
-            if not op or len(op) < 2: continue
-            up_f, down_f = float(op[0]), float(op[1])
-            c.execute("""
-                INSERT OR IGNORE INTO resolutions
-                (market_id,coin,start_utc,end_utc,winner,up_final_price,down_final_price,resolved_at)
-                VALUES (?,?,?,?,?,?,?,?)
-            """, (mid, get_coin(m.get("question", "")),
-                  m.get("creationTime"), m.get("endDateIso"),
-                  "UP" if up_f >= 0.5 else "DOWN", up_f, down_f,
-                  datetime.now(timezone.utc).isoformat()))
-            stored += 1
-        conn.commit()
-        if stored: print(f"[RES] {stored} new resolutions stored")
-    except (asyncio.CancelledError, asyncio.TimeoutError):
+            if r.status != 200: return None
+            data = await r.json()
+            if not data: return None
+            cid = data[0].get("conditionId")
+            if not cid: return None
+        async with session.get(
+            f"{CLOB_API}/markets/{cid}",
+            timeout=aiohttp.ClientTimeout(total=6)
+        ) as cr:
+            if cr.status != 200: return None
+            cm = await cr.json()
+            for tok in cm.get("tokens", []):
+                if tok.get("winner"):
+                    outcome = (tok.get("outcome") or "").upper()
+                    if outcome in ("UP", "YES", "HIGHER", "ABOVE"): return "UP"
+                    if outcome in ("DOWN", "NO", "LOWER", "BELOW"):  return "DOWN"
+                    return outcome
+    except Exception:
         pass
-    except Exception as e:
-        print(f"[ERROR] fetch_resolutions: {e}")
+    return None
+
+
+async def fetch_resolutions(session, conn):
+    """Resolve closed markets using PM oracle first, Binance fallback after 60 min."""
+    now = datetime.now(timezone.utc)
+    pending = conn.execute("""
+        SELECT m.market_id, m.coin, m.start_utc, m.end_utc, m.slug
+        FROM markets m
+        LEFT JOIN resolutions r ON m.market_id = r.market_id
+        WHERE r.market_id IS NULL
+          AND datetime(m.end_utc) < datetime(?)
+        ORDER BY m.end_utc DESC LIMIT 50
+    """, (now.isoformat(),)).fetchall()
+
+    if not pending:
+        return
+
+    res_pm = res_bnc = skipped = 0
+    for market_id, coin, start_iso, end_iso, slug in pending:
+        try:
+            end_utc = datetime.fromisoformat(end_iso)
+        except Exception:
+            continue
+        secs_since = (now - end_utc).total_seconds()
+
+        # 15-min grace: PM oracle needs time to finalize
+        if secs_since < 900:
+            skipped += 1
+            continue
+
+        # Primary: PM ground truth
+        pm_winner = None
+        if slug:
+            pm_winner = await fetch_pm_winner(session, slug)
+
+        # Always fetch Binance for audit trail
+        symbol = f"{coin}USDT"
+        try:
+            start_utc = datetime.fromisoformat(start_iso)
+        except Exception:
+            start_utc = None
+        p_start = await get_binance_price_at(session, coin, start_utc) if start_utc else None
+        p_end   = await get_binance_price_at(session, coin, end_utc)
+        binance_winner = ("UP" if p_end >= p_start else "DOWN") if (p_start and p_end) else None
+
+        # Decide canonical winner
+        if pm_winner in ("UP", "DOWN"):
+            winner = pm_winner
+            source = "polymarket"
+            res_pm += 1
+        elif secs_since < 3600:
+            # PM not resolved yet, market still fresh — skip, retry next cycle
+            skipped += 1
+            continue
+        elif binance_winner in ("UP", "DOWN"):
+            winner = binance_winner
+            source = "binance_fallback"
+            res_bnc += 1
+        else:
+            skipped += 1
+            continue
+
+        final_snap = conn.execute("""
+            SELECT up_ask, down_ask FROM snapshots
+            WHERE market_id=? ORDER BY ts_utc DESC LIMIT 1
+        """, (market_id,)).fetchone()
+
+        conn.execute("""
+            INSERT OR REPLACE INTO resolutions
+            (market_id,coin,start_utc,end_utc,winner,
+             up_final_price,down_final_price,resolved_at,
+             pm_winner,binance_winner,resolution_source)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """, (market_id, coin, start_iso, end_iso, winner,
+              final_snap[0] if final_snap else None,
+              final_snap[1] if final_snap else None,
+              now.isoformat(), pm_winner, binance_winner, source))
+        await asyncio.sleep(0.15)
+
+    conn.commit()
+    if res_pm or res_bnc:
+        print(f"[RES] PM={res_pm}  Binance fallback={res_bnc}  skipped={skipped}")
 
 
 # ── DB WRITES ─────────────────────────────────────────────────────────────────
