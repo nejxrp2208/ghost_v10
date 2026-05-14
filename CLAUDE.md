@@ -6,14 +6,21 @@
 
 | Process | File | Role |
 |---------|------|------|
-| `scanner` | `crypto_ghost_scanner.py` | Scanner 1: cheap longshot (entry ≤$0.03, last 5-60s) |
-| `scanner2` | `crypto_ghost_scanner2.py` | Scanner 2: mean-reversion mid-prob (entry $0.35-$0.45) |
-| `resolver` | `crypto_ghost_resolver.py` | Resolves trades via Chainlink → Polymarket (shared) |
+| `scanner` | `crypto_ghost_scanner.py` | Scanner 1: cheap longshot (entry ≤$0.03, last 5-60s) — `strategy='lottery'` |
+| `scanner3` | `crypto_ghost_scanner3.py` | Scanner 3: precision sniper (hardcoded filters, parallel S1 test) — `strategy='s3'` |
+| `scanner2` | `crypto_ghost_scanner2.py` | Scanner 2: raw data collector (tier=6) — `strategy='raw'` |
+| `resolver` | `crypto_ghost_resolver.py` | Resolves trades via Chainlink → Polymarket (shared, handles all scanners) |
 | `redeemer` | `crypto_ghost_redeemer.py` | Claims winnings on-chain (shared) |
 | `marketghost` | `marketghost.py` | Silent data collector (no trades) |
 | `ghostscanner-rt` | — | Real-time scanner variant |
 
-**Scanner architecture:** Each scanner = one strategy = one PM2 process. Both write to the same `crypto_ghost_PAPER.db` (tier=2 for Scanner 1, tier=5 for Scanner 2). Resolver handles both.
+**Scanner architecture:** Each scanner = one strategy = one PM2 process. All write to the same `crypto_ghost_PAPER.db`, distinguished by `strategy` column. Resolver handles all.
+
+**Scanner 3 hardcoded overrides (does NOT read these from .env):**
+- `T2_MAX_ENTRY = 0.010` (S1 reads from .env, default 0.030)
+- `MIN_NO_PRICE = 0.98` (S1 reads from .env, default 0.97)
+- `MIN_TREND_STRENGTH = 0.003` (S1 hardcoded at 0.001)
+- Exhaustion gate: skips if 1h trend direction contradicts last 3 Binance ticks
 
 **Tech:** Python async (`asyncio` + `aiohttp`), SQLite, Polygon/Chainlink, Polymarket CLOB + Gamma APIs.
 
@@ -39,9 +46,10 @@ VPS: `root@70.34.204.152` · `/root/ghost_v10` · Ubuntu 24.04 · Stockholm
 
 ```bash
 pm2 restart marketghost      # data collector
-pm2 restart scanner          # Scanner 1: cheap longshot
-pm2 restart scanner2         # Scanner 2: mean-reversion
-pm2 restart resolver         # trade resolver (shared)
+pm2 restart scanner          # Scanner 1: cheap longshot (strategy='lottery')
+pm2 restart scanner3         # Scanner 3: precision sniper (strategy='s3', parallel test)
+pm2 restart scanner2         # Scanner 2: raw data collector (strategy='raw')
+pm2 restart resolver         # trade resolver (shared — handles all scanners)
 pm2 restart redeemer         # on-chain redeemer (shared)
 pm2 restart ghostscanner-rt  # real-time scanner
 pm2 restart all              # everything at once

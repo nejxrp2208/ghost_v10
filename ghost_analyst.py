@@ -1054,6 +1054,141 @@ def analyze_coin_ranking(lines):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SECTION S3 — S1 vs S3 STRATEGY COMPARISON
+# ═══════════════════════════════════════════════════════════════════════════════
+def analyze_s3_comparison(lines):
+    """Side-by-side comparison of S1 (strategy='lottery') vs S3 (strategy='s3').
+    Answers: are S3's stricter filters producing a higher win rate?
+    Safe to run even if S3 has zero trades -- shows waiting message."""
+    lines.append("\n" + "═"*70)
+    lines.append("  SECTION S3 — S1 vs S3 PRECISION FILTER COMPARISON")
+    lines.append("  Strategy='lottery' (S1, all filters) vs strategy='s3' (S3, precision)")
+    lines.append("═"*70)
+
+    if not os.path.exists(TRADE_DB):
+        lines.append("  No trade DB found — run scanner first.")
+        return
+
+    def fetch_stats(strategy_tag):
+        rows = q(TRADE_DB, """
+            SELECT COUNT(*) as total,
+                   SUM(CASE WHEN status='won' THEN 1 ELSE 0 END) as wins,
+                   SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END) as losses,
+                   COALESCE(SUM(pnl), 0) as total_pnl,
+                   COALESCE(AVG(entry_price), 0) as avg_entry,
+                   COALESCE(MIN(entry_price), 0) as min_entry,
+                   COALESCE(MAX(entry_price), 0) as max_entry
+            FROM trades
+            WHERE strategy=? AND status IN ('won','lost','open')
+        """, (strategy_tag,))
+        if not rows:
+            return None
+        total, wins, losses, total_pnl, avg_entry, min_entry, max_entry = rows[0]
+        resolved = (wins or 0) + (losses or 0)
+        wr = pct(wins or 0, resolved) if resolved else 0
+        return {
+            "total": total or 0, "wins": wins or 0, "losses": losses or 0,
+            "resolved": resolved, "wr": wr,
+            "total_pnl": total_pnl or 0, "avg_entry": avg_entry or 0,
+            "min_entry": min_entry or 0, "max_entry": max_entry or 0,
+        }
+
+    def fetch_entry_buckets(strategy_tag):
+        return q(TRADE_DB, """
+            SELECT
+                CASE
+                    WHEN entry_price < 0.010 THEN '<$0.010'
+                    WHEN entry_price < 0.015 THEN '$0.010-0.015'
+                    WHEN entry_price < 0.020 THEN '$0.015-0.020'
+                    WHEN entry_price < 0.025 THEN '$0.020-0.025'
+                    ELSE '>=$0.025'
+                END as bucket,
+                COUNT(*) as n,
+                SUM(CASE WHEN status='won' THEN 1 ELSE 0 END) as wins
+            FROM trades
+            WHERE strategy=? AND status IN ('won','lost')
+            GROUP BY bucket ORDER BY bucket
+        """, (strategy_tag,))
+
+    s1 = fetch_stats("lottery")
+    s3 = fetch_stats("s3")
+
+    # ── Header row ──────────────────────────────────────────────────────────
+    lines.append(f"\n  {'Metric':<28} {'S1 (lottery)':>16} {'S3 (precision)':>16}")
+    lines.append(f"  {'-'*28} {'-'*16} {'-'*16}")
+
+    def row(label, v1, v3, fmt=None):
+        if fmt:
+            sv1 = fmt.format(v1) if v1 is not None else "---"
+            sv3 = fmt.format(v3) if v3 is not None else "waiting..."
+        else:
+            sv1 = str(v1) if v1 is not None else "---"
+            sv3 = str(v3) if v3 is not None else "waiting..."
+        lines.append(f"  {label:<28} {sv1:>16} {sv3:>16}")
+
+    if s1:
+        row("Total trades",       s1["total"],      s3["total"] if s3 else None)
+        row("Resolved (won+lost)", s1["resolved"],   s3["resolved"] if s3 else None)
+        row("Win rate",           s1["wr"],          s3["wr"] if s3 else None,       fmt="{:.1f}%")
+        row("Total P&L",          s1["total_pnl"],   s3["total_pnl"] if s3 else None, fmt="${:+.2f}")
+        row("Avg entry price",    s1["avg_entry"],   s3["avg_entry"] if s3 else None, fmt="${:.4f}")
+        row("Entry range",
+            f"${s1['min_entry']:.3f}-${s1['max_entry']:.3f}",
+            f"${s3['min_entry']:.3f}-${s3['max_entry']:.3f}" if s3 else None)
+    else:
+        lines.append("  No S1 trades found yet.")
+
+    # ── Entry bucket breakdown ────────────────────────────────────────────────
+    lines.append(f"\n  ENTRY BUCKET BREAKDOWN:")
+    lines.append(f"  {'Bucket':<16} {'S1 n':>6} {'S1 WR':>7} {'S3 n':>6} {'S3 WR':>7}  Verdict")
+    lines.append(f"  {'-'*16} {'-'*6} {'-'*7} {'-'*6} {'-'*7}  {'-'*20}")
+
+    s1_buckets = {b: (n, w) for b, n, w in fetch_entry_buckets("lottery")}
+    s3_buckets = {b: (n, w) for b, n, w in fetch_entry_buckets("s3")}
+    all_buckets = sorted(set(list(s1_buckets.keys()) + list(s3_buckets.keys())))
+
+    for bucket in all_buckets:
+        s1n, s1w = s1_buckets.get(bucket, (0, 0))
+        s3n, s3w = s3_buckets.get(bucket, (0, 0))
+        s1wr = pct(s1w, s1n) if s1n else 0
+        s3wr = pct(s3w, s3n) if s3n else 0
+        # Verdict
+        if s3n == 0:
+            verdict = "S3 not firing here (filtered)"
+        elif s3wr > s1wr + 5:
+            verdict = "S3 BETTER +"
+        elif s3wr < s1wr - 5:
+            verdict = "S3 worse"
+        else:
+            verdict = "similar"
+        lines.append(f"  {bucket:<16} {s1n:>6} {s1wr:>6.1f}% {s3n:>6} "
+                     f"{s3wr:>6.1f}%  {verdict}")
+
+    # ── Verdict ──────────────────────────────────────────────────────────────
+    lines.append(f"\n  VERDICT:")
+    if s3 and s3["resolved"] >= 20:
+        delta_wr = (s3["wr"] - s1["wr"]) if s1 else 0
+        delta_pnl = (s3["total_pnl"] - s1["total_pnl"]) if s1 else 0
+        if delta_wr > 5:
+            verdict = f"S3 WINS: +{delta_wr:.1f}% WR improvement. Precision filters are working."
+        elif delta_wr < -5:
+            verdict = f"S3 LOSES: {delta_wr:.1f}% WR vs S1. Filters may be over-restrictive."
+        else:
+            verdict = f"NEUTRAL: S3 within +/-5% WR of S1 ({delta_wr:+.1f}%). More data needed."
+        lines.append(f"  {verdict}")
+        lines.append(f"  S3 fires {s3['total']} trades vs S1 {s1['total'] if s1 else 0} "
+                     f"(signal rate: {pct(s3['total'], s1['total']) if s1 and s1['total'] else 0:.0f}% of S1)")
+        save_finding("s3", "s3_wr",    s3["wr"],         f"S3 win rate",  s3["resolved"])
+        save_finding("s3", "s1_wr",    s1["wr"] if s1 else 0, "S1 win rate", s1["resolved"] if s1 else 0)
+        save_finding("s3", "wr_delta", delta_wr,          "S3 vs S1 WR delta", s3["resolved"])
+    elif s3 and s3["total"] > 0:
+        lines.append(f"  Waiting for data: S3 has {s3['total']} trades "
+                     f"({s3['resolved']} resolved). Need 20+ resolved to judge.")
+    else:
+        lines.append("  S3 has no trades yet. Start scanner3 to collect comparison data.")
+        lines.append("  PM2: pm2 start scanner3")
+
+
 # SECTION 11 — RECOMMENDATIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 def generate_recommendations(lines):
@@ -1337,6 +1472,7 @@ def run_analysis():
     analyze_penny_ask(lines)
     analyze_bnb(lines)
     analyze_coin_ranking(lines)
+    analyze_s3_comparison(lines)
     generate_recommendations(lines)
 
     lines.append("\n" + "═"*70)

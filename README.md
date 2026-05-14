@@ -14,6 +14,10 @@ Targets cheap longshot tokens on Polymarket crypto Up/Down markets. Fires only i
 | T3 | Up or Down (1-hr) | $0.15 | Last 60 min | 0.5% deviation |
 | T4 | Up or Down (4-hr) | $0.20 | Last 4 hrs | 0.4% deviation |
 
+**Scanner 3 (S3) — Precision Sniper:** fork of Scanner 1 with stricter hardcoded filters.
+Runs in parallel to measure whether tighter thresholds improve win rate.
+DB tag: `strategy='s3'` — `ghost_analyst.py` shows S1 vs S3 comparison automatically.
+
 **Key filters (v111 overlay):**
 - `MIN_NO_PRICE=0.97` — other side must be ≥97% certain before entering
 - `SKIP_DOWN_BIASED_COINS=BNB,ETH` — skip cheap-DOWN on high UP base-rate coins
@@ -25,14 +29,17 @@ Targets cheap longshot tokens on Polymarket crypto Up/Down markets. Fires only i
 
 ```
 ghost_v10/
-├── crypto_ghost_scanner.py    ← Main engine: finds + enters trades
+├── crypto_ghost_scanner.py    ← Scanner 1: main sniper (T2_MAX_ENTRY from .env)
+├── crypto_ghost_scanner3.py   ← Scanner 3: precision sniper (hardcoded, parallel test)
+├── crypto_ghost_scanner2.py   ← Scanner 2: raw data collector (tier=6, strategy='raw')
 ├── crypto_ghost_resolver.py   ← Resolves trades (Chainlink → Polymarket)
 ├── crypto_ghost_redeemer.py   ← Claims winnings on-chain (Polygon)
 ├── crypto_ghost_dashboard.py  ← Live terminal dashboard
 ├── marketghost.py             ← Silent data collector (no trades)
 ├── marketghost_stats.py       ← Stats/analysis on collected data
+├── ghost_analyst.py           ← Data analysis agent (includes S1 vs S3 comparison)
 ├── .env                       ← Config (keys, sizing, filters)
-├── crypto_ghost_PAPER.db      ← Paper trades DB
+├── crypto_ghost_PAPER.db      ← Paper trades DB (S1=lottery, S3=s3, S2=raw)
 └── scanner.db                 ← Real-time order book snapshots
 ```
 
@@ -61,8 +68,10 @@ cd /root/ghost_v10 && git pull && pm2 restart <process>
 pm2 ls                        # show all processes
 pm2 logs marketghost          # live logs
 pm2 restart marketghost       # restart data collector
-pm2 restart scanner           # restart scanner
-pm2 restart resolver          # restart resolver
+pm2 restart scanner           # restart Scanner 1 (main sniper)
+pm2 restart scanner3          # restart Scanner 3 (precision sniper, parallel test)
+pm2 restart scanner2          # restart Scanner 2 (raw data collector)
+pm2 restart resolver          # restart resolver (handles all scanners)
 pm2 restart redeemer          # restart redeemer
 pm2 restart ghostscanner-rt   # restart real-time scanner
 pm2 restart all               # restart everything
