@@ -118,7 +118,8 @@ S4_MAX_SPREAD  = 0.04    # max CLOB bid-ask spread (audit: spread trap filter)
 S4_MIN_MINS    = 4.0     # enter only at market open (first ~90s of 5-min market)
 S4_MAX_MINS    = 5.5     # max minutes left
 S4_MIN_OBI     = 0.12    # OBI threshold (net buy/sell imbalance)
-S4_MIN_DEV_1H  = 0.002   # min 1h Binance trend required
+S4_MIN_DEV_1H  = 0.0005  # min 1h Binance trend required (0.05%)
+S4_CVD_MOM_MIN = 3.0     # min |cvd_mom| to count as directional pressure
 S4_CVD_CANDLES = 5       # 1-min candles for rolling CVD
 S4_ATR_PERIOD  = 10      # ATR period (1-min candles)
 S4_ATR_MULT    = 0.6     # squeeze: tick_range < S4_ATR_MULT * ATR
@@ -2076,15 +2077,15 @@ class CryptoGhostScanner:
                     print(dbg + f" → SKIP spread>{S4_MAX_SPREAD}")
                     continue
 
-                # ── PILLAR 1: Rolling CVD ────────────────────────────────────
-                if cvd_sum is None or cvd_mom is None:
+                # ── PILLAR 1: Rolling CVD (mom only — more responsive at open) ──
+                if cvd_mom is None:
                     print(dbg + " → SKIP cvd=None")
                     continue
-                if side == "UP"   and not (cvd_sum > 0 and cvd_mom > 0):
-                    print(dbg + f" → SKIP cvd UP need sum>0&mom>0")
+                if side == "UP"   and cvd_mom < S4_CVD_MOM_MIN:
+                    print(dbg + f" → SKIP cvd_mom={cvd_mom:.2f} need>{S4_CVD_MOM_MIN}")
                     continue
-                if side == "DOWN" and not (cvd_sum < 0 and cvd_mom < 0):
-                    print(dbg + f" → SKIP cvd DOWN need sum<0&mom<0")
+                if side == "DOWN" and cvd_mom > -S4_CVD_MOM_MIN:
+                    print(dbg + f" → SKIP cvd_mom={cvd_mom:.2f} need<{-S4_CVD_MOM_MIN}")
                     continue
 
                 # ── PILLAR 2: ATR-relative squeeze + OBI ─────────────────────
@@ -2117,8 +2118,8 @@ class CryptoGhostScanner:
                     print(dbg + " → SKIP anomaly")
                     continue
 
-                # ── PILLAR 3: HMA direction ───────────────────────────────────
-                if hma_dir != side:
+                # ── PILLAR 3: HMA direction (skip if not enough ticks yet) ──────
+                if hma_dir is not None and hma_dir != side:
                     print(dbg + f" → SKIP hma={hma_dir}")
                     continue
 
