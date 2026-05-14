@@ -2062,21 +2062,31 @@ class CryptoGhostScanner:
                 if tok_id in self.open_positions:
                     continue
 
-                # ── SPREAD FILTER ─────────────────────────────────────────────
                 spread = ask - (bid or 0.0)
+                ts_dbg = datetime.now().strftime("%H:%M:%S")
+                dbg = (f"[{ts_dbg}] S4 {coin} {side} ask={ask:.3f} spread={spread:.3f} "
+                       f"CVD={cvd_sum}/{cvd_mom} OBI={obi} HMA={hma_dir} "
+                       f"sqz={squeeze_pct} atr={atr_pct} dev={dev} mins={mins:.1f}")
+
+                # ── SPREAD FILTER ─────────────────────────────────────────────
                 if spread > S4_MAX_SPREAD:
+                    print(dbg + f" → SKIP spread>{S4_MAX_SPREAD}")
                     continue
 
                 # ── PILLAR 1: Rolling CVD ────────────────────────────────────
                 if cvd_sum is None or cvd_mom is None:
+                    print(dbg + " → SKIP cvd=None")
                     continue
                 if side == "UP"   and not (cvd_sum > 0 and cvd_mom > 0):
+                    print(dbg + f" → SKIP cvd UP need sum>0&mom>0")
                     continue
                 if side == "DOWN" and not (cvd_sum < 0 and cvd_mom < 0):
+                    print(dbg + f" → SKIP cvd DOWN need sum<0&mom<0")
                     continue
 
                 # ── PILLAR 2: ATR-relative squeeze + OBI ─────────────────────
                 if squeeze_pct is None:
+                    print(dbg + " → SKIP squeeze=None")
                     continue
                 in_squeeze = (
                     squeeze_pct < S4_ATR_MULT * atr_pct
@@ -2084,30 +2094,40 @@ class CryptoGhostScanner:
                     squeeze_pct < 0.0020
                 )
                 if not in_squeeze:
+                    print(dbg + f" → SKIP no_squeeze")
                     continue
                 if obi is None:
+                    print(dbg + " → SKIP obi=None")
                     continue
                 if side == "UP"   and obi < S4_MIN_OBI:
+                    print(dbg + f" → SKIP obi<{S4_MIN_OBI}")
                     continue
                 if side == "DOWN" and obi > -S4_MIN_OBI:
+                    print(dbg + f" → SKIP obi>{-S4_MIN_OBI}")
                     continue
 
                 # ── ANOMALY SWITCH: OBI vs CVD conflict = trap ───────────────
                 if side == "UP"   and obi > 0.30 and cvd_sum < -3.0:
+                    print(dbg + " → SKIP anomaly")
                     continue
                 if side == "DOWN" and obi < -0.30 and cvd_sum > 3.0:
+                    print(dbg + " → SKIP anomaly")
                     continue
 
                 # ── PILLAR 3: HMA direction ───────────────────────────────────
                 if hma_dir != side:
+                    print(dbg + f" → SKIP hma={hma_dir}")
                     continue
 
                 # ── 1H TREND ALIGNMENT ────────────────────────────────────────
                 if dev is None or abs(dev) < S4_MIN_DEV_1H:
+                    print(dbg + f" → SKIP dev={dev}")
                     continue
                 if side == "UP"   and dev < 0:
+                    print(dbg + f" → SKIP dev_dir")
                     continue
                 if side == "DOWN" and dev > 0:
+                    print(dbg + f" → SKIP dev_dir")
                     continue
 
                 # ── ALL PILLARS PASSED ────────────────────────────────────────
