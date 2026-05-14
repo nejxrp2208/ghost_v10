@@ -1,10 +1,10 @@
 """
-Crypto Ghost Scanner 4 (S4) -- Early 50/50 Zone Predator
-=========================================================
+Crypto Ghost Scanner 4 (S4) -- Market Open Predator
+====================================================
 Fork of Scanner 3. Completely different entry logic.
 
-Enters UP/DOWN markets at $0.38-$0.45 (50/50 zone) early in the market
-(1.5-5.5 minutes left) using 3-pillar order flow confirmation:
+Enters UP/DOWN markets at $0.38-$0.62 at market open (4.0-5.5 min left),
+holds until resolution. Uses 3-pillar order flow confirmation:
 
   Pillar 1 — Rolling CVD (5x1min Binance klines):
              buy_vol - sell_vol sum must be positive AND improving.
@@ -112,11 +112,11 @@ T3_MAX_ENTRY = float(os.getenv("T3_MAX_ENTRY", "0.15"))
 T4_MAX_ENTRY = float(os.getenv("T4_MAX_ENTRY", "0.20"))
 
 # ── S4 HARDCODED ENTRY CONFIG (ignores .env) ──────────────────────────────────
-S4_ENTRY_MIN   = 0.38    # token price floor for 50/50 zone
-S4_ENTRY_MAX   = 0.45    # token price ceiling
+S4_ENTRY_MIN   = 0.38    # token price floor
+S4_ENTRY_MAX   = 0.62    # token price ceiling (wider at open, price ~$0.50)
 S4_MAX_SPREAD  = 0.04    # max CLOB bid-ask spread (audit: spread trap filter)
-S4_MIN_MINS    = 1.5     # min minutes left (90s cliff guard)
-S4_MAX_MINS    = 5.5     # max minutes left (enter early in 5-min markets)
+S4_MIN_MINS    = 4.0     # enter only at market open (first ~90s of 5-min market)
+S4_MAX_MINS    = 5.5     # max minutes left
 S4_MIN_OBI     = 0.12    # OBI threshold (net buy/sell imbalance)
 S4_MIN_DEV_1H  = 0.002   # min 1h Binance trend required
 S4_CVD_CANDLES = 5       # 1-min candles for rolling CVD
