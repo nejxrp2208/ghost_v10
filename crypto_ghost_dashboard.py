@@ -320,7 +320,8 @@ def render_open_positions():
     t.add_column("Edge%", width=7,  justify="right")
     t.add_column("Time",  width=8,  style="dim")
 
-    colors = {1:"yellow", 2:"green", 3:"cyan", 4:"magenta"}
+    colors = {1:"yellow", 2:"green", 3:"cyan", 4:"magenta",
+              6:"bright_black", 7:"bright_blue", 8:"bright_magenta"}
     for rid, tier, coin, q, entry, size, ts in rows:
         col  = colors.get(tier, "white")
         edge = round((1/entry - 1)*100, 0) if entry else 0
@@ -442,7 +443,8 @@ def render_last_trades():
     t.add_column("P&L",    width=8,  justify="right")
     t.add_column("Status", width=6)
 
-    colors = {1:"yellow", 2:"green", 3:"cyan", 4:"magenta"}
+    colors = {1:"yellow", 2:"green", 3:"cyan", 4:"magenta",
+              6:"bright_black", 7:"bright_blue", 8:"bright_magenta"}
     for rid, ts, tier, coin, q, size, pnl, status, outcome, pm_result, market_id, entry_price in rows:
         tstr = ts[11:19] if ts else "?"
         pstr = f"+${pnl:.2f}" if (pnl and pnl>0) else (f"-${abs(pnl):.2f}" if pnl else "—")
