@@ -2014,6 +2014,9 @@ class CryptoGhostScanner:
 
             # ── TIME WINDOW: enter early (1.5–5.5 min left) ──────────────────
             if not (S4_MIN_MINS * 60 <= secs <= S4_MAX_MINS * 60):
+                if secs > 0 and secs < 600:  # only log markets <10min to reduce noise
+                    ts_w = datetime.now().strftime("%H:%M:%S")
+                    print(f"[{ts_w}] S4 TIME_SKIP {coin} secs={secs:.0f} ({mins:.2f}min) need={S4_MIN_MINS}-{S4_MAX_MINS}min")
                 skip_win += 1
                 return
 
