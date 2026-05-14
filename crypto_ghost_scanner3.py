@@ -104,6 +104,7 @@ T2_SIZE_PER_COIN = {
 # ── Entry price ceilings per tier ──
 T1_MAX_ENTRY = float(os.getenv("T1_MAX_ENTRY", "0.03"))
 T2_MAX_ENTRY = 0.010  # S3 hardcoded: only genuine stale orders (ignores .env)
+S3_TIER      = 7      # S3 writes tier=7 to DB so dashboard shows T7, not T2
 T3_MAX_ENTRY = float(os.getenv("T3_MAX_ENTRY", "0.15"))
 T4_MAX_ENTRY = float(os.getenv("T4_MAX_ENTRY", "0.20"))
 
@@ -1717,17 +1718,18 @@ class CryptoGhostScanner:
                 brain   = read_brain_state(coin)
                 b_state = brain.get("state") if brain else None
                 b_score = brain.get("score") if brain else None
-                log_trade(tier, coin, market.get("id",""),
+                db_tier  = S3_TIER if tier == 2 else tier  # T7 in DB, T2 internally
+                log_trade(db_tier, coin, market.get("id",""),
                           token_id, question, ask, size, order_id, outcome, trend_dev, secs_left,
                           brain_state=b_state, brain_score=b_score)
                 self.trades_fired += 1
                 payout   = round(size / ask - size, 2)
                 ts       = datetime.now().strftime("%H:%M:%S")
                 mode_tag = "[PAPER]" if PAPER_TRADE else "[LIVE] "
-                tier_names = {1:"STRIKE",2:"HOURLY",3:"4HR",4:"DAILY"}
-                print(f"[{ts}] {mode_tag} T{tier} {tier_names.get(tier,'')} | "
+                tier_names = {1:"STRIKE",2:"HOURLY",3:"4HR",4:"DAILY",7:"S3-PRECISION"}
+                print(f"[{ts}] {mode_tag} T{db_tier} {tier_names.get(db_tier,'')} | "
                       f"{coin} @ ${ask:.3f} | Size:${size} -> +${payout:.2f} | '{question[:40]}'")
-                log_event("📋", f"T{tier} {coin} BUY @ ${ask:.3f} | +${payout:.2f} | {question}")
+                log_event("📋", f"T{db_tier} {coin} BUY @ ${ask:.3f} | +${payout:.2f} | {question}")
                 write_stats_json()
                 return True
             else:
