@@ -120,6 +120,22 @@ def init_db():
         )
     """)
 
+    # Migrate snapshots table: add columns that may be missing from older DBs
+    new_cols = [
+        "up_token_id TEXT", "down_token_id TEXT", "volume REAL", "liq_usd REAL",
+        "spread REAL", "cheap_side TEXT", "cheap_ask REAL", "hour_utc INTEGER",
+        "is_in_compression INTEGER", "compression_zone TEXT",
+        "price_moved_since_last REAL", "is_active_compression INTEGER",
+        "snapshot_interval_used INTEGER", "binance_price REAL",
+        "trend_dev_1h REAL", "binance_1m_dev REAL",
+        "ask_velocity REAL", "required_move_pct REAL",
+    ]
+    for col_def in new_cols:
+        try:
+            c.execute(f"ALTER TABLE snapshots ADD COLUMN {col_def}")
+        except Exception:
+            pass  # column already exists
+
     c.execute("DROP TABLE IF EXISTS markets_compression_summary")
     c.execute("""
         CREATE TABLE markets_compression_summary (
@@ -170,12 +186,21 @@ def parse_liq(market: dict) -> float:
 
 
 def parse_token_ids(market: dict):
-    """Return (up_tok, down_tok) by matching outcomes array."""
+    """Return (up_tok, down_tok) by matching outcomes array.
+    Tries clobTokenIds first, then tokens array (newer Gamma API format)."""
     try:
-        cti = market.get("clobTokenIds", "[]")
-        oc  = market.get("outcomes",     "[]")
+        cti = market.get("clobTokenIds") or market.get("clob_token_ids") or "[]"
+        oc  = market.get("outcomes", "[]")
         if isinstance(cti, str): cti = json.loads(cti)
         if isinstance(oc,  str): oc  = json.loads(oc)
+
+        # Fallback: newer Gamma API returns tokens[] array instead of clobTokenIds
+        if len(cti) < 2:
+            tokens = market.get("tokens") or []
+            if isinstance(tokens, list) and len(tokens) >= 2:
+                cti = [t.get("token_id") or t.get("id") for t in tokens if isinstance(t, dict)]
+                oc  = [t.get("outcome", "") for t in tokens if isinstance(t, dict)]
+
         if len(cti) < 2: return None, None
         up_tok = down_tok = None
         for i, o in enumerate(oc):
