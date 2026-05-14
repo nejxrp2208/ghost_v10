@@ -117,7 +117,7 @@ S4_ENTRY_MAX   = 0.62    # token price ceiling (wider at open, price ~$0.50)
 S4_MAX_SPREAD  = 0.04    # max CLOB bid-ask spread (audit: spread trap filter)
 S4_MIN_MINS    = 4.0     # enter only at market open (first ~90s of 5-min market)
 S4_MAX_MINS    = 5.5     # max minutes left
-S4_MIN_OBI     = 0.12    # OBI threshold (net buy/sell imbalance)
+S4_MIN_OBI     = 0.03    # OBI threshold (net buy/sell imbalance — low at 50/50 zone)
 S4_MIN_DEV_1H  = 0.0005  # min 1h Binance trend required (0.05%)
 S4_CVD_MOM_MIN = 3.0     # min |cvd_mom| to count as directional pressure
 S4_CVD_CANDLES = 5       # 1-min candles for rolling CVD
@@ -2123,16 +2123,6 @@ class CryptoGhostScanner:
                     print(dbg + f" → SKIP hma={hma_dir}")
                     continue
 
-                # ── 1H TREND ALIGNMENT ────────────────────────────────────────
-                if dev is None or abs(dev) < S4_MIN_DEV_1H:
-                    print(dbg + f" → SKIP dev={dev}")
-                    continue
-                if side == "UP"   and dev < 0:
-                    print(dbg + f" → SKIP dev_dir")
-                    continue
-                if side == "DOWN" and dev > 0:
-                    print(dbg + f" → SKIP dev_dir")
-                    continue
 
                 # ── ALL PILLARS PASSED ────────────────────────────────────────
                 signals += 1
