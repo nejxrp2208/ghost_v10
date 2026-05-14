@@ -330,14 +330,44 @@ if wins > 0 and losses > 0 and avg_payout > 0:
 else:
     print(f"  Not enough data for Kelly calculation")
 
-# ── BY STRATEGY ──────────────────────────────────────────────────────────────
+# ── BY STRATEGY (uses strategy column; falls back to tier) ───────────────────
 print(f"\n  BY STRATEGY")
 print("  " + "─"*55)
-strategy_names = {2: "S1 Cheap Longshot", 5: "S2 Mean-Reversion"}
-if 'tier' in cols:
-    strat_rows = conn.execute("""
-        SELECT tier, status, pnl FROM trades WHERE status IN ('won','lost')
-    """).fetchall()
+
+STRAT_LABELS = {
+    'lottery': 'S1 Standard   (T2_MAX=0.030)',
+    's3':      'S3 Precision  (T2_MAX=0.010, exhaust gate)',
+    'raw':     'S2 Raw        (no filters, baseline)',
+}
+STRAT_ORDER = ['lottery', 's3', 'raw']
+
+use_strategy_col = 'strategy' in cols
+if use_strategy_col:
+    strat_rows = conn.execute(
+        "SELECT strategy, status, pnl FROM trades WHERE status IN ('won','lost')"
+    ).fetchall()
+    strats = {}
+    for r in strat_rows:
+        tag = r[0] or 'unknown'
+        if tag not in strats:
+            strats[tag] = {'w': 0, 'l': 0, 'pnl': 0}
+        strats[tag]['w']   += 1 if r[1] == 'won' else 0
+        strats[tag]['l']   += 1 if r[1] == 'lost' else 0
+        strats[tag]['pnl'] += r[2] or 0
+    ordered = STRAT_ORDER + sorted(k for k in strats if k not in STRAT_ORDER)
+    for tag in ordered:
+        if tag not in strats:
+            continue
+        s  = strats[tag]
+        n  = s['w'] + s['l']
+        wr = (s['w'] / n * 100) if n else 0
+        name = STRAT_LABELS.get(tag, tag)
+        print(f"  {name}: {s['w']:>3}W / {s['l']:>3}L | WR {wr:5.1f}% | P&L ${s['pnl']:+.2f}")
+elif 'tier' in cols:
+    strat_rows = conn.execute(
+        "SELECT tier, status, pnl FROM trades WHERE status IN ('won','lost')"
+    ).fetchall()
+    tier_names = {2: 'S1 (tier=2)', 5: 'S2 (tier=5)', 6: 'S2-raw (tier=6)'}
     strats = {}
     for r in strat_rows:
         t = r[0] or 0
@@ -350,85 +380,156 @@ if 'tier' in cols:
         s  = strats[t]
         n  = s['w'] + s['l']
         wr = (s['w'] / n * 100) if n else 0
-        name = strategy_names.get(t, f"Tier {t}")
-        print(f"  {name}: {s['w']:>3}W / {s['l']:>3}L | WR {wr:5.1f}% | P&L ${s['pnl']:+.2f}")
+        print(f"  {tier_names.get(t, f'Tier {t}')}: {s['w']:>3}W / {s['l']:>3}L | WR {wr:5.1f}% | P&L ${s['pnl']:+.2f}")
 else:
-    print("  tier column not in DB yet")
+    print("  strategy/tier column not in DB yet")
 
 # ── BY STRATEGY × SIDE ───────────────────────────────────────────────────────
-if 'tier' in cols and 'outcome' in cols:
-    print(f"\n  BY STRATEGY × SIDE")
+if 'outcome' in cols and (use_strategy_col or 'tier' in cols):
+    print(f"\n  BY STRATEGY x SIDE")
     print("  " + "─"*55)
-    ss_rows = conn.execute("""
-        SELECT tier, outcome, status, pnl FROM trades WHERE status IN ('won','lost')
-    """).fetchall()
-    ss = {}
-    for r in ss_rows:
-        tier = r[0] or 0
-        side = 'UP' if (r[1] or '').upper() in ('UP', 'YES', 'HIGHER') else 'DOWN'
-        key  = (tier, side)
-        if key not in ss:
-            ss[key] = {'w': 0, 'l': 0, 'pnl': 0}
-        ss[key]['w']   += 1 if r[2] == 'won' else 0
-        ss[key]['l']   += 1 if r[2] == 'lost' else 0
-        ss[key]['pnl'] += r[3] or 0
-    for (tier, side) in sorted(ss):
-        b    = ss[(tier, side)]
-        t    = b['w'] + b['l']
-        wr   = (b['w'] / t * 100) if t else 0
-        name = strategy_names.get(tier, f"Tier {tier}")
-        print(f"  {name} {side:<4}: {b['w']:>3}W / {b['l']:>3}L | WR {wr:5.1f}% | P&L ${b['pnl']:+.2f}")
-
-# ── S2 BY COIN × DIRECTION ───────────────────────────────────────────────────
-if 'tier' in cols and 'outcome' in cols:
-    s2_cd = conn.execute("""
-        SELECT coin, outcome, status, pnl FROM trades
-        WHERE status IN ('won','lost') AND tier = 5
-    """).fetchall()
-    if s2_cd:
-        print(f"\n  S2 BY COIN × DIRECTION")
-        print("  " + "─"*55)
-        cd = {}
-        for r in s2_cd:
+    if use_strategy_col:
+        ss_rows = conn.execute(
+            "SELECT strategy, outcome, status, pnl FROM trades WHERE status IN ('won','lost')"
+        ).fetchall()
+        ss = {}
+        for r in ss_rows:
+            tag  = r[0] or 'unknown'
             side = 'UP' if (r[1] or '').upper() in ('UP', 'YES', 'HIGHER') else 'DOWN'
-            key  = (r[0], side)
-            if key not in cd:
-                cd[key] = {'w': 0, 'l': 0, 'pnl': 0}
-            cd[key]['w']   += 1 if r[2] == 'won' else 0
-            cd[key]['l']   += 1 if r[2] == 'lost' else 0
-            cd[key]['pnl'] += r[3] or 0
-        for (coin, side) in sorted(cd):
-            b  = cd[(coin, side)]
-            t  = b['w'] + b['l']
-            wr = (b['w'] / t * 100) if t else 0
-            flag = " ✅" if wr >= 41 else (" ⚠" if wr >= 35 else " ❌")
-            print(f"  {coin:<4} {side:<4}: {b['w']:>3}W / {b['l']:>3}L | WR {wr:5.1f}% | P&L ${b['pnl']:+.2f}{flag}")
+            key  = (tag, side)
+            if key not in ss:
+                ss[key] = {'w': 0, 'l': 0, 'pnl': 0}
+            ss[key]['w']   += 1 if r[2] == 'won' else 0
+            ss[key]['l']   += 1 if r[2] == 'lost' else 0
+            ss[key]['pnl'] += r[3] or 0
+        for tag in STRAT_ORDER + sorted(k for k in {k for k,_ in ss} if k not in STRAT_ORDER):
+            for side in ['UP', 'DOWN']:
+                key = (tag, side)
+                if key not in ss:
+                    continue
+                b  = ss[key]
+                t  = b['w'] + b['l']
+                wr = (b['w'] / t * 100) if t else 0
+                name = STRAT_LABELS.get(tag, tag)
+                print(f"  {name} {side:<4}: {b['w']:>3}W / {b['l']:>3}L | WR {wr:5.1f}% | P&L ${b['pnl']:+.2f}")
 
-# ── S2 BY ENTRY PRICE SUB-BUCKETS ────────────────────────────────────────────
-if 'tier' in cols and 'entry_price' in cols:
-    s2_ep = conn.execute("""
-        SELECT entry_price, status, pnl FROM trades
-        WHERE status IN ('won','lost') AND tier = 5
-    """).fetchall()
-    if s2_ep:
-        print(f"\n  S2 BY ENTRY PRICE (sub-buckets)")
-        print("  " + "─"*55)
-        ep_buckets = {
-            "$0.35-0.38": (0.35, 0.38),
-            "$0.38-0.41": (0.38, 0.41),
-            "$0.41-0.44": (0.41, 0.44),
-            "$0.44-0.45": (0.44, 0.46),
-        }
-        for label, (lo, hi) in ep_buckets.items():
-            subset = [r for r in s2_ep if lo <= (r[0] or 0) < hi]
-            if not subset:
-                continue
-            w   = sum(1 for r in subset if r[1] == 'won')
-            l   = len(subset) - w
-            wr  = (w / len(subset) * 100) if subset else 0
-            pnl = sum(r[2] or 0 for r in subset)
-            flag = " ✅" if wr >= 41 else (" ⚠" if wr >= 35 else " ❌")
-            print(f"  {label}: {w:>3}W / {l:>3}L | WR {wr:5.1f}% | P&L ${pnl:+.2f}{flag}")
+# ── PER-STRATEGY DEEP ANALYSIS ────────────────────────────────────────────────
+# Shows the same breakdown for each strategy: Binance trend, entry price,
+# secs left, and coin performance.
+if use_strategy_col:
+    present_strats = [t for t in STRAT_ORDER if t in strats]
+    for strat_tag in present_strats:
+        label = STRAT_LABELS.get(strat_tag, strat_tag)
+        s_rows = conn.execute("""
+            SELECT status, pnl, entry_price, outcome, coin, ts, trend_dev_1h, secs_left
+            FROM trades
+            WHERE status IN ('won','lost') AND strategy=?
+        """, (strat_tag,)).fetchall()
+        if not s_rows:
+            continue
+
+        s_total = len(s_rows)
+        s_wins  = sum(1 for r in s_rows if r[0] == 'won')
+        s_wr    = (s_wins / s_total * 100) if s_total else 0
+        s_pnl   = sum(r[1] or 0 for r in s_rows)
+
+        print(f"\n  {'='*60}")
+        print(f"  {label}")
+        print(f"  {'='*60}")
+        print(f"  Trades: {s_total}  |  {s_wins}W / {s_total-s_wins}L  |  WR {s_wr:.1f}%  |  P&L ${s_pnl:+.2f}")
+
+        # By coin
+        c_data = {}
+        for r in s_rows:
+            c = r[4] or '?'
+            if c not in c_data: c_data[c] = {'w':0,'l':0,'pnl':0}
+            c_data[c]['w']   += 1 if r[0]=='won' else 0
+            c_data[c]['l']   += 1 if r[0]=='lost' else 0
+            c_data[c]['pnl'] += r[1] or 0
+        print(f"\n  By coin:")
+        for coin, s in sorted(c_data.items()):
+            n  = s['w'] + s['l']
+            wr = (s['w']/n*100) if n else 0
+            flag = " ✅" if wr > 15 else (" ⚠" if wr > 8 else " ❌")
+            print(f"    {coin:<4}: {s['w']:>3}W/{s['l']:>3}L  WR {wr:5.1f}%  P&L ${s['pnl']:+.2f}{flag}")
+
+        # By direction
+        up_s = [r for r in s_rows if (r[3] or '').upper() in ('UP','YES','HIGHER')]
+        dn_s = [r for r in s_rows if (r[3] or '').upper() not in ('UP','YES','HIGHER')]
+        up_w = sum(1 for r in up_s if r[0]=='won')
+        dn_w = sum(1 for r in dn_s if r[0]=='won')
+        up_wr_s = (up_w/len(up_s)*100) if up_s else 0
+        dn_wr_s = (dn_w/len(dn_s)*100) if dn_s else 0
+        print(f"\n  Direction:")
+        print(f"    UP  : {len(up_s):>3}t  {up_w:>3}W  WR {up_wr_s:5.1f}%")
+        print(f"    DOWN: {len(dn_s):>3}t  {dn_w:>3}W  WR {dn_wr_s:5.1f}%")
+
+        # By Binance 1h trend at entry
+        t_rows = [(r[0], r[1], r[6]) for r in s_rows if r[6] is not None]
+        if t_rows:
+            print(f"\n  By Binance 1h trend at entry (trend_dev_1h):")
+            trend_buckets = [
+                ("noise  <0.1%  ", 0,     0.001),
+                ("weak  0.1-0.3%", 0.001, 0.003),
+                ("med   0.3-1.0%", 0.003, 0.010),
+                ("strong  >1.0% ", 0.010, 99.0),
+            ]
+            for lbl, lo, hi in trend_buckets:
+                sub = [r for r in t_rows if lo <= abs(r[2]) < hi]
+                if not sub: continue
+                w   = sum(1 for r in sub if r[0]=='won')
+                l   = len(sub) - w
+                wr  = (w/len(sub)*100) if sub else 0
+                pnl = sum(r[1] or 0 for r in sub)
+                flag = " ✅" if wr > 15 else (" ⚠" if wr > 8 else " ❌")
+                print(f"    {lbl}: {w:>3}W/{l:>3}L  WR {wr:5.1f}%  P&L ${pnl:+.2f}{flag}")
+        else:
+            print(f"\n  Binance trend: no trend_dev_1h data for this strategy")
+
+        # By entry price
+        ep_rows = [(r[0], r[1], r[2]) for r in s_rows if r[2] is not None]
+        if ep_rows:
+            print(f"\n  By entry price:")
+            ep_buckets = [
+                ("<$0.005        ", 0,     0.005),
+                ("$0.005-$0.010  ", 0.005, 0.010),
+                ("$0.010-$0.015  ", 0.010, 0.015),
+                ("$0.015-$0.020  ", 0.015, 0.020),
+                ("$0.020-$0.025  ", 0.020, 0.025),
+                ("$0.025-$0.030  ", 0.025, 0.030),
+                (">$0.030        ", 0.030, 99.0),
+            ]
+            for lbl, lo, hi in ep_buckets:
+                sub = [r for r in ep_rows if lo <= r[2] < hi]
+                if not sub: continue
+                w   = sum(1 for r in sub if r[0]=='won')
+                l   = len(sub) - w
+                wr  = (w/len(sub)*100) if sub else 0
+                pnl = sum(r[1] or 0 for r in sub)
+                flag = " ✅" if wr > 15 else (" ⚠" if wr > 8 else " ❌")
+                print(f"    {lbl}: {w:>3}W/{l:>3}L  WR {wr:5.1f}%  P&L ${pnl:+.2f}{flag}")
+
+        # By secs left
+        sl_rows = [(r[0], r[1], r[7]) for r in s_rows if r[7] is not None]
+        if sl_rows:
+            print(f"\n  By secs left at entry:")
+            secs_buckets = [
+                (" 0-10s ", 0,   10),
+                ("10-20s ", 10,  20),
+                ("20-30s ", 20,  30),
+                ("30-45s ", 30,  45),
+                ("45-60s ", 45,  60),
+                (" >60s  ", 60,  99999),
+            ]
+            for lbl, lo, hi in secs_buckets:
+                sub = [r for r in sl_rows if lo <= r[2] < hi]
+                if not sub: continue
+                w   = sum(1 for r in sub if r[0]=='won')
+                l   = len(sub) - w
+                wr  = (w/len(sub)*100) if sub else 0
+                pnl = sum(r[1] or 0 for r in sub)
+                flag = " ✅" if wr > 15 else (" ⚠" if wr > 8 else " ❌")
+                print(f"    {lbl}: {w:>3}W/{l:>3}L  WR {wr:5.1f}%  P&L ${pnl:+.2f}{flag}")
 
 # ── BY ENTRY PRICE × COIN ────────────────────────────────────────────────────
 if 'entry_price' in cols:
