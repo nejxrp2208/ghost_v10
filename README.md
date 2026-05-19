@@ -31,6 +31,7 @@ DB tag: `strategy='s3'` — `ghost_analyst.py` shows S1 vs S3 comparison automat
 ghost_v10/
 ├── crypto_ghost_scanner.py    ← Scanner 1: main sniper (T2_MAX_ENTRY from .env)
 ├── crypto_ghost_scanner3.py   ← Scanner 3: precision sniper (hardcoded, parallel test)
+├── crypto_ghost_scanner4.py   ← Scanner 4: early 50/50 zone predator (CVD+HMA+OBI)
 ├── crypto_ghost_scanner2.py   ← Scanner 2: raw data collector (tier=6, strategy='raw')
 ├── crypto_ghost_resolver.py   ← Resolves trades (Chainlink → Polymarket)
 ├── crypto_ghost_redeemer.py   ← Claims winnings on-chain (Polygon)
@@ -39,7 +40,7 @@ ghost_v10/
 ├── marketghost_stats.py       ← Stats/analysis on collected data
 ├── ghost_analyst.py           ← Data analysis agent (includes S1 vs S3 comparison)
 ├── .env                       ← Config (keys, sizing, filters)
-├── crypto_ghost_PAPER.db      ← Paper trades DB (S1=lottery, S3=s3, S2=raw)
+├── crypto_ghost_PAPER.db      ← Paper trades DB (S1=lottery, S3=s3, S4=s4_reversal, S2=raw)
 └── scanner.db                 ← Real-time order book snapshots
 ```
 
@@ -70,6 +71,7 @@ pm2 logs marketghost          # live logs
 pm2 restart marketghost       # restart data collector
 pm2 restart scanner           # restart Scanner 1 (main sniper)
 pm2 restart scanner3          # restart Scanner 3 (precision sniper, parallel test)
+pm2 restart scanner4          # restart Scanner 4 (early 50/50 zone, CVD+HMA+OBI)
 pm2 restart scanner2          # restart Scanner 2 (raw data collector)
 pm2 restart resolver          # restart resolver (handles all scanners)
 pm2 restart redeemer          # restart redeemer
