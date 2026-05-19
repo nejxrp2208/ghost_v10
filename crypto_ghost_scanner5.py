@@ -1,25 +1,28 @@
 """
-Crypto Ghost Scanner 4 (S4) -- Market Open Predator
-====================================================
-Fork of Scanner 3. Completely different entry logic.
+Crypto Ghost Scanner 5 (S5) -- Data-Backed Precision Timer
+===========================================================
+Fork of Scanner 3. All overrides hardcoded from forensic analysis
+of 126 Scanner-1 trades + 2.4M scanner.db rows (2026-05-16 to 19).
 
-Enters UP/DOWN markets at $0.38-$0.62 at market open (4.0-5.5 min left),
-holds until resolution. Uses 3-pillar order flow confirmation:
+Key findings that drive S5 filters:
+  Dead zone:   secs 10-45s had 0/44 wins (0%) in S1 data -> skip
+  Best window: 0-10s = 10% WR | 45-60s = 6.5% WR
+  Direction:   BTC DOWN = 6.3% WR | ETH UP = 4.9% WR
+               BTC UP   = 2.7% WR (negative EV) -> skip
+               ETH DOWN = 0/0 in data            -> skip
+  Coins:       BTC + ETH only (no BNB/SOL/XRP — no data to validate)
 
-  Pillar 1 — Rolling CVD (5x1min Binance klines):
-             buy_vol - sell_vol sum must be positive AND improving.
-  Pillar 2 — ATR-relative squeeze: tick range < 0.6 * ATR(10) on 1m bars.
-             OBI on our token > 0.12 confirms accumulation.
-  Pillar 3 — HMA direction (period 9) must match entry side.
+S5 overrides vs S1:
+  T2_MAX_ENTRY       0.030 (same as S1 — allows 1-3c entries)
+  MIN_NO_PRICE       0.97  (same as S1)
+  MIN_TREND_STRENGTH 0.003 (kept from S3 — filters sideways noise)
+  + S3 exhaustion gate (kept)
+  + Dead zone filter: skip secs_left 10-45s (0/44 wins in data)
+  + Coin filter: BTC + ETH only
+  + Direction filter: BTC DOWN only | ETH UP only
 
-  Anomaly switch: OBI and CVD strongly conflicting -> skip (trap).
-  Spread filter: ask - bid must be <= $0.04.
-
-All parameters hardcoded. Telegram alerts on every fire.
-Scans ALL crypto coins (BTC/ETH/BNB/SOL/XRP).
-
-PM2: pm2 start crypto_ghost_scanner4.py --name scanner4 --interpreter python3
-DB tag: strategy='s4_reversal', tier=8
+PM2: pm2 start crypto_ghost_scanner5.py --name scanner5 --interpreter python3
+DB tag: strategy='s5_precision' | tier=9
 """
 
 import asyncio
@@ -106,28 +109,13 @@ T2_SIZE_PER_COIN = {
 
 # ── Entry price ceilings per tier ──
 T1_MAX_ENTRY = float(os.getenv("T1_MAX_ENTRY", "0.03"))
-T2_MAX_ENTRY = float(os.getenv("T2_MAX_ENTRY", "0.030"))  # unused by S4 entry logic
-S4_TIER      = 8      # S4 writes tier=8 to DB
+T2_MAX_ENTRY = 0.030  # S5: same ceiling as S1 — direction+timing filters do the work
+S5_TIER      = 9      # S5 writes tier=9 to DB
 T3_MAX_ENTRY = float(os.getenv("T3_MAX_ENTRY", "0.15"))
 T4_MAX_ENTRY = float(os.getenv("T4_MAX_ENTRY", "0.20"))
 
-# ── S4 HARDCODED ENTRY CONFIG (ignores .env) ──────────────────────────────────
-S4_ENTRY_MIN   = 0.38    # token price floor
-S4_ENTRY_MAX   = 0.62    # token price ceiling (wider at open, price ~$0.50)
-S4_MAX_SPREAD  = 0.04    # max CLOB bid-ask spread (audit: spread trap filter)
-S4_MIN_MINS    = 4.0     # enter only at market open (first ~90s of 5-min market)
-S4_MAX_MINS    = 5.5     # max minutes left
-S4_MIN_OBI     = 0.03    # OBI threshold (net buy/sell imbalance — low at 50/50 zone)
-S4_MIN_DEV_1H  = 0.0005  # min 1h Binance trend required (0.05%)
-S4_CVD_MOM_MIN = 3.0     # min |cvd_mom| to count as directional pressure
-S4_CVD_CANDLES = 5       # 1-min candles for rolling CVD
-S4_ATR_PERIOD  = 10      # ATR period (1-min candles)
-S4_ATR_MULT    = 0.6     # squeeze: tick_range < S4_ATR_MULT * ATR
-_CVD_TTL       = 15      # seconds between CVD fetches per coin
-_ATR_TTL       = 60      # seconds between ATR fetches per coin
-
 # ── Signal filters ──
-MIN_NO_PRICE  = 0.55   # S4: not used for entry; opposite token ~0.55-0.62 in 50/50 zone
+MIN_NO_PRICE  = 0.98   # S3 hardcoded: tighter certainty floor (ignores .env)
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY",  "3.0"))   # min $ at ask
 
 # ── Entry time windows (minutes before market close) ──
@@ -456,7 +444,7 @@ def log_trade(tier, coin, market_id, token_id, question, entry, size, order_id,
         INSERT INTO trades (ts,tier,coin,market_id,token_id,question,entry_price,size_usdc,order_id,outcome,trend_dev_1h,secs_left,strategy,brain_state,brain_score)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (datetime.now(timezone.utc).isoformat(), tier, coin,
-          market_id, token_id, question[:120], entry, size, order_id, outcome, trend_dev, secs_left, "s4_reversal",
+          market_id, token_id, question[:120], entry, size, order_id, outcome, trend_dev, secs_left, "s5_precision",
           brain_state, brain_score))
     conn.commit()
     conn.close()
@@ -775,43 +763,6 @@ class PriceTracker:
         _, p_new = hist[-1]
         return (p_new - p_old) / p_old if p_old else None
 
-    def get_hma_direction(self, coin: str, period: int = 9) -> Optional[str]:
-        """Hull MA direction from tick history. Returns 'UP', 'DOWN', or None."""
-        hist   = list(self._tick_history.get(coin, []))
-        prices = [p for _, p in hist]
-        if len(prices) < period * 2 + 2:
-            return None
-        half   = max(2, period // 2)
-        sqrt_p = max(2, int(period ** 0.5))
-
-        def wma(vals, k):
-            if len(vals) < k: return None
-            w = list(range(1, k + 1))
-            return sum(v * w_ for v, w_ in zip(vals[-k:], w)) / sum(w)
-
-        raw = []
-        for i in range(period - 1, len(prices)):
-            wh = wma(prices[:i+1], half)
-            wf = wma(prices[:i+1], period)
-            if wh is not None and wf is not None:
-                raw.append(2 * wh - wf)
-        if len(raw) < sqrt_p + 1:
-            return None
-        h_now  = wma(raw,      sqrt_p)
-        h_prev = wma(raw[:-1], sqrt_p)
-        if h_now is None or h_prev is None or h_now == h_prev:
-            return None
-        return 'UP' if h_now > h_prev else 'DOWN'
-
-    def get_price_squeeze(self, coin: str, lookback: int = 6) -> Optional[float]:
-        """Price range / mean over last N ticks. Lower = tighter squeeze."""
-        hist   = list(self._tick_history.get(coin, []))
-        prices = [p for _, p in hist[-lookback:]]
-        if len(prices) < lookback:
-            return None
-        mean_p = sum(prices) / len(prices)
-        return (max(prices) - min(prices)) / mean_p if mean_p > 0 else None
-
     def check_strike_crossing(self, coin: str, strike: float) -> bool:
         """Returns True if spot has crossed this strike (and not yet fired)."""
         price = self.prices.get(coin)
@@ -870,105 +821,6 @@ class PriceTracker:
                 print(f"[PriceTracker] WS error: {e} — reconnecting in {_backoff}s")
                 await asyncio.sleep(_backoff)
                 _backoff = min(_backoff * 2, 30)
-
-# ─── S4 ORDER FLOW HELPERS ────────────────────────────────────────────────────
-_cvd_cache: Dict[str, Any] = {}
-_atr_cache: Dict[str, Any] = {}
-
-
-async def get_rolling_cvd(session: aiohttp.ClientSession, coin: str
-                          ) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Rolling CVD from Binance 1-min klines.
-    kline[5]=total_vol, kline[9]=taker_buy_vol (aggressive buys).
-    Returns (cvd_sum, cvd_momentum).
-      cvd_sum > 0  = net buy pressure over S4_CVD_CANDLES candles
-      cvd_mom > 0  = pressure improving (recent half > older half)
-    Cached _CVD_TTL seconds.
-    """
-    now = time.time()
-    cached = _cvd_cache.get(coin)
-    if cached and now - cached[0] < _CVD_TTL:
-        return cached[1], cached[2]
-    symbol = f"{coin}USDT"
-    try:
-        async with session.get(
-            f"{BINANCE_REST}/klines",
-            params={"symbol": symbol, "interval": "1m", "limit": S4_CVD_CANDLES + 1},
-            timeout=aiohttp.ClientTimeout(total=8)
-        ) as r:
-            if r.status != 200: return None, None
-            data = await r.json()
-            if len(data) < S4_CVD_CANDLES: return None, None
-        deltas = []
-        for k in data[-S4_CVD_CANDLES:]:
-            buy_vol  = float(k[9])
-            sell_vol = float(k[5]) - buy_vol
-            deltas.append(buy_vol - sell_vol)
-        cvd_sum = sum(deltas)
-        half    = S4_CVD_CANDLES // 2
-        cvd_mom = sum(deltas[-half:]) - sum(deltas[:half])
-        _cvd_cache[coin] = (now, cvd_sum, cvd_mom)
-        return cvd_sum, cvd_mom
-    except Exception:
-        return None, None
-
-
-async def get_atr_pct(session: aiohttp.ClientSession, coin: str) -> Optional[float]:
-    """ATR(10) on 1-min klines as fraction of close price. Cached _ATR_TTL seconds."""
-    now = time.time()
-    cached = _atr_cache.get(coin)
-    if cached and now - cached[0] < _ATR_TTL:
-        return cached[1]
-    symbol = f"{coin}USDT"
-    try:
-        async with session.get(
-            f"{BINANCE_REST}/klines",
-            params={"symbol": symbol, "interval": "1m", "limit": S4_ATR_PERIOD + 2},
-            timeout=aiohttp.ClientTimeout(total=8)
-        ) as r:
-            if r.status != 200: return None
-            data = await r.json()
-            if len(data) < S4_ATR_PERIOD + 1: return None
-        trs = []
-        for i in range(1, len(data)):
-            h = float(data[i][2]); l = float(data[i][3])
-            pc = float(data[i-1][4])
-            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-        atr    = sum(trs[-S4_ATR_PERIOD:]) / S4_ATR_PERIOD
-        close_ = float(data[-1][4])
-        result = (atr / close_) if close_ > 0 else None
-        _atr_cache[coin] = (now, result)
-        return result
-    except Exception:
-        return None
-
-
-async def get_orderbook_with_obi(session: aiohttp.ClientSession, token_id: str
-                                 ) -> Tuple[Optional[float], Optional[float], float, Optional[float]]:
-    """Fetch CLOB orderbook. Returns (best_bid, best_ask, liq, obi).
-    OBI = (bid_vol - ask_vol) / total. Range -1.0 to +1.0."""
-    try:
-        async with session.get(
-            f"{CLOB_API}/book",
-            params={"token_id": token_id},
-            timeout=aiohttp.ClientTimeout(total=6)
-        ) as r:
-            if r.status != 200: return None, None, 0.0, None
-            data = await r.json()
-        bids = sorted(data.get("bids", []), key=lambda x: float(x.get("price", 0)), reverse=True)
-        asks = sorted(data.get("asks", []), key=lambda x: float(x.get("price", 1)))
-        bid  = float(bids[0]["price"]) if bids else 0.0
-        ask  = float(asks[0]["price"]) if asks else 0.0
-        liq  = float(asks[0]["size"])  if asks else 0.0
-        bid_vol = sum(float(b.get("size", 0)) for b in bids)
-        ask_vol = sum(float(a.get("size", 0)) for a in asks)
-        total   = bid_vol + ask_vol
-        obi     = (bid_vol - ask_vol) / total if total > 0 else None
-        return bid, ask, liq, obi
-    except Exception:
-        return None, None, 0.0, None
-
 
 # ─── STRIKE MARKET PRELOADER ──────────────────────────────────────────────────
 class StrikePreloader:
@@ -1774,16 +1626,15 @@ class CryptoGhostScanner:
         mode   = "** PAPER MODE — NO REAL MONEY **" if PAPER_TRADE else "!! LIVE MODE — REAL MONEY !!"
         print(f"""
 ╔══════════════════════════════════════════════════════╗
-║     CRYPTO GHOST SCANNER 4 -- EARLY ZONE PREDATOR    ║
+║     CRYPTO GHOST SCANNER 5 -- PRECISION TIMER        ║
 ║  {mode:<52s}║
 ╠══════════════════════════════════════════════════════╣
-║  S4 config (hardcoded):                              ║
-║    Entry zone: ${S4_ENTRY_MIN:.2f}-${S4_ENTRY_MAX:.2f}  Window: {S4_MIN_MINS}-{S4_MAX_MINS} min   ║
-║    Pillars: CVD(5x1m) + ATR-squeeze + HMA(9)         ║
-║    Spread filter: <${S4_MAX_SPREAD:.2f}  Tier: T{S4_TIER}            ║
+║  S5 filters (data-backed, hardcoded):                ║
+║    Coins: BTC DOWN + ETH UP only                     ║
+║    Time:  0-10s OR 45-60s (dead zone 10-45s skipped) ║
 ╠══════════════════════════════════════════════════════╣
 ║  Wallet: {wallet:<44s}║
-║  Max loss: ${MAX_DAILY_LOSS:.0f}/day                                ║
+║  Certainty floor: {MIN_NO_PRICE:.0%} | Max loss: ${MAX_DAILY_LOSS:.0f}/day      ║
 ║  DB: {os.path.basename(DB_PATH):<47s}║
 ╚══════════════════════════════════════════════════════╝
         """)
@@ -1873,7 +1724,7 @@ class CryptoGhostScanner:
                 brain   = read_brain_state(coin)
                 b_state = brain.get("state") if brain else None
                 b_score = brain.get("score") if brain else None
-                db_tier  = S4_TIER  # always T8
+                db_tier  = S5_TIER if tier == 2 else tier  # T9 in DB, T2 internally
                 log_trade(db_tier, coin, market.get("id",""),
                           token_id, question, ask, size, order_id, outcome, trend_dev, secs_left,
                           brain_state=b_state, brain_score=b_score)
@@ -1881,23 +1732,11 @@ class CryptoGhostScanner:
                 payout   = round(size / ask - size, 2)
                 ts       = datetime.now().strftime("%H:%M:%S")
                 mode_tag = "[PAPER]" if PAPER_TRADE else "[LIVE] "
-                tier_names = {1:"STRIKE",2:"HOURLY",3:"4HR",4:"DAILY",7:"S3-PRECISION",8:"S4-EARLY"}
+                tier_names = {1:"STRIKE",2:"HOURLY",3:"4HR",4:"DAILY",7:"S3-PRECISION"}
                 print(f"[{ts}] {mode_tag} T{db_tier} {tier_names.get(db_tier,'')} | "
-                      f"{coin} {outcome} @ ${ask:.3f} | Size:${size} -> +${payout:.2f} | '{question[:40]}'")
-                log_event("🎯", f"T{db_tier} S4 {coin} {outcome} BUY @ ${ask:.3f} | +${payout:.2f} | {question}")
+                      f"{coin} @ ${ask:.3f} | Size:${size} -> +${payout:.2f} | '{question[:40]}'")
+                log_event("📋", f"T{db_tier} {coin} BUY @ ${ask:.3f} | +${payout:.2f} | {question}")
                 write_stats_json()
-                # Telegram alert
-                try:
-                    from telegram_alerts import send_alert
-                    asyncio.create_task(send_alert(
-                        f"🎯 <b>S4 T8 FIRE</b>\n"
-                        f"<b>{coin}</b> {outcome} @ <b>${ask:.3f}</b>\n"
-                        f"Size: ${size} → payout +${payout:.2f}\n"
-                        f"Dev 1h: {(trend_dev or 0):+.2%} | secs: {int(secs_left or 0)}s\n"
-                        f"{'[PAPER]' if PAPER_TRADE else '[LIVE]'} | {question[:60]}"
-                    ))
-                except Exception:
-                    pass
                 return True
             else:
                 if not PAPER_TRADE:
@@ -1999,156 +1838,289 @@ class CryptoGhostScanner:
 
     async def scan_updown_markets(self, session: aiohttp.ClientSession,
                                   markets: List[dict]):
-        """S4 entry logic: 50/50 zone + 3-pillar order flow."""
-        fired   = 0
-        skip_np = 0; skip_win = 0; skip_cert = 0; signals = 0
+        fired     = 0
+        skip_ask  = 0; skip_liq = 0; skip_cert = 0; skip_win = 0; signals = 0
 
         async def check_market(m):
-            nonlocal fired, skip_np, skip_win, skip_cert, signals
+            """
+            S5 decision pipeline:
+              S5 coin gate → trend gate → S5 dead-zone filter →
+              exhaustion gate → orderbook → S5 direction gate →
+              ask/cert/liq gates → fire.
+            """
+            nonlocal fired, skip_ask, skip_liq, skip_cert, skip_win, signals
             q    = m.get("question", "")
             coin = get_coin(q)
             if not coin or "up or down" not in q.lower():
                 return
 
-            secs = m.get("_secs_left", 0.0)
-            mins = m.get("_mins_left", 0.0)
+            # ── S5: BTC + ETH only (validated coins, no BNB/SOL/XRP) ──────────
+            if coin not in ("BTC", "ETH"):
+                return
 
-            # ── TIME WINDOW: enter early (1.5–5.5 min left) ──────────────────
-            if not (S4_MIN_MINS * 60 <= secs <= S4_MAX_MINS * 60):
-                if secs > 0 and secs < 600:  # only log markets <10min to reduce noise
-                    ts_w = datetime.now().strftime("%H:%M:%S")
-                    print(f"[{ts_w}] S4 TIME_SKIP {coin} secs={secs:.0f} ({mins:.2f}min) need={S4_MIN_MINS}-{S4_MAX_MINS}min")
+            if coin in DISABLED_COINS:
+                return
+            if BLOCKED_HOURS and datetime.now(timezone.utc).hour in BLOCKED_HOURS:
+                skip_win += 1
+                return
+            tier = classify_tier(q)
+            if tier not in (2, 3, 4):
+                return
+            mins = m.get("_mins_left", 9999)
+            secs = m.get("_secs_left", 9999)
+            if not in_entry_window(tier, mins):
+                skip_win += 1
+                return
+            # v10.2 stale-ask snipe window — last 60s only
+            if tier == 2 and (secs > T2_MAX_SECS_LEFT or secs < T2_MIN_SECS_LEFT):
+                skip_win += 1
+                return
+            if tier == 2 and secs > T2_WINDOW_MIN * 60:
                 skip_win += 1
                 return
 
-            # ── PARSE TOKENS ─────────────────────────────────────────────────
-            tokens = m.get("tokens") or []
-            up_tok = down_tok = None
-            for tok in tokens:
-                if not isinstance(tok, dict): continue
-                out = (tok.get("outcome","") or "").upper()
-                tid = tok.get("token_id") or tok.get("id")
-                if not tid: continue
-                if out in ("UP","YES","HIGHER","ABOVE"):
-                    up_tok = tid
-                elif out in ("DOWN","NO","LOWER","BELOW"):
-                    down_tok = tid
-            if not up_tok or not down_tok:
-                skip_np += 1
-                return
-
-            # ── FETCH BOTH ORDERBOOKS (with OBI) ─────────────────────────────
-            up_bid, up_ask, up_liq, up_obi   = await get_orderbook_with_obi(session, up_tok)
-            dn_bid, dn_ask, dn_liq, dn_obi   = await get_orderbook_with_obi(session, down_tok)
-            if up_ask is None or dn_ask is None:
-                skip_np += 1
-                return
-
-            # ── FETCH ORDER FLOW SIGNALS (once per market, cached) ───────────
-            cvd_sum, cvd_mom = await get_rolling_cvd(session, coin)
-            atr_pct          = await get_atr_pct(session, coin)
-            dev              = self.tracker.get_deviation(coin, "1h")
-            hma_dir          = self.tracker.get_hma_direction(coin)
-            squeeze_pct      = self.tracker.get_price_squeeze(coin)
-
-            # ── CHECK EACH CANDIDATE SIDE ─────────────────────────────────────
-            candidates = []
-            if S4_ENTRY_MIN <= up_ask <= S4_ENTRY_MAX:
-                candidates.append(("UP",   up_tok,  up_ask,  up_bid,  up_obi))
-            if S4_ENTRY_MIN <= dn_ask <= S4_ENTRY_MAX:
-                candidates.append(("DOWN", down_tok, dn_ask, dn_bid,  dn_obi))
-
-            if not candidates:
+            # ── S5: DEAD ZONE FILTER ─────────────────────────────────────────
+            # Data: 0-10s = 10% WR | 10-45s = 0/44 wins | 45-60s = 6.5% WR
+            # The 10-45s zone is dead — skip it entirely.
+            if tier == 2 and 10 < secs < 45:
                 skip_win += 1
                 return
 
-            for (side, tok_id, ask, bid, obi) in candidates:
-                if tok_id in self.open_positions:
-                    continue
+            tokens = m.get("tokens", []) or []
+            if not tokens:
+                return
 
-                # Data: BTC DOWN = 40.6% WR at 0.475 avg entry → EV negative.
-                # BTC UP = 52.7%, ETH UP = 56.8%, ETH DOWN = 50.0% → all viable.
-                if coin == "BTC" and side == "DOWN":
-                    print(f"[S4] SKIP BTC DOWN — 40.6% WR < break-even at this entry price")
-                    continue
+            # ── Trend gate (cached prices, free, runs FIRST) ───────────────
+            MIN_TREND_STRENGTH = 0.003  # kept from S3 — filters sideways noise
+            dev = self.tracker.get_deviation(coin, "1h")
+            if dev is None:
+                skip_cert += 1
+                return
+            if abs(dev) < MIN_TREND_STRENGTH:
+                skip_cert += 1
+                return
 
-                spread = ask - (bid or 0.0)
-                ts_dbg = datetime.now().strftime("%H:%M:%S")
-                dbg = (f"[{ts_dbg}] S4 {coin} {side} ask={ask:.3f} spread={spread:.3f} "
-                       f"CVD={cvd_sum}/{cvd_mom} OBI={obi} HMA={hma_dir} "
-                       f"sqz={squeeze_pct} atr={atr_pct} dev={dev} mins={mins:.1f}")
+            # ── S3 Exhaustion gate: 1h trend vs last 3 Binance ticks ──────────
+            # If 1h says UP but recent ticks are falling (or vice versa),
+            # the trend is exhausting -- the stale ask is not mispriced.
+            short_mom = self.tracker.get_short_momentum(coin)
+            if short_mom is not None and abs(short_mom) > 0.0003:
+                if (dev > 0) != (short_mom > 0):
+                    skip_cert += 1
+                    return  # exhaustion: 1h direction contradicts recent ticks
 
-                # ── SPREAD FILTER ─────────────────────────────────────────────
-                if spread > S4_MAX_SPREAD:
-                    print(dbg + f" → SKIP spread>{S4_MAX_SPREAD}")
-                    continue
+            best_token_id = None
+            best_ask      = None
+            best_liq      = 0.0
+            tok_outcome   = "UP"
 
-                # ── PILLAR 1: Rolling CVD (mom only — more responsive at open) ──
-                if cvd_mom is None:
-                    print(dbg + " → SKIP cvd=None")
-                    continue
-                if side == "UP"   and cvd_mom < S4_CVD_MOM_MIN:
-                    print(dbg + f" → SKIP cvd_mom={cvd_mom:.2f} need>{S4_CVD_MOM_MIN}")
-                    continue
-                if side == "DOWN" and cvd_mom > -S4_CVD_MOM_MIN:
-                    print(dbg + f" → SKIP cvd_mom={cvd_mom:.2f} need<{-S4_CVD_MOM_MIN}")
-                    continue
+            if LAZY_ORDERBOOK:
+                # ── Predict cheap side from trend, fetch only that token ──
+                # Trend is the only thing telling us which side aligns. The
+                # trend filter would reject anything against trend anyway,
+                # so prefetching the wrong side is a wasted call.
+                want_up           = (dev > 0)
+                target_token_id   = None
+                target_outcome    = "UP" if want_up else "DOWN"
+                up_aliases   = ("UP", "YES", "HIGHER", "ABOVE")
+                down_aliases = ("DOWN", "NO", "LOWER", "BELOW")
+                for tok in tokens:
+                    if not isinstance(tok, dict):
+                        continue
+                    out = (tok.get("outcome", "") or "").upper()
+                    tid = tok.get("token_id") or tok.get("id")
+                    if not tid:
+                        continue
+                    if want_up and out in up_aliases:
+                        target_token_id = tid
+                        target_outcome  = out
+                        break
+                    if not want_up and out in down_aliases:
+                        target_token_id = tid
+                        target_outcome  = out
+                        break
+                # Fallback: outcome metadata missing → use first token
+                if not target_token_id:
+                    tok = tokens[0]
+                    target_token_id = tok.get("token_id") if isinstance(tok, dict) else str(tok)
+                    target_outcome  = (tok.get("outcome", "UP") or "UP").upper() if isinstance(tok, dict) else "UP"
 
-                # ── PILLAR 2: ATR-relative squeeze + OBI ─────────────────────
-                if squeeze_pct is None:
-                    print(dbg + " → SKIP squeeze=None")
-                    continue
-                in_squeeze = (
-                    squeeze_pct < S4_ATR_MULT * atr_pct
-                    if atr_pct else
-                    squeeze_pct < 0.0020
-                )
-                if not in_squeeze:
-                    print(dbg + f" → SKIP no_squeeze")
-                    continue
-                if obi is None:
-                    print(dbg + " → SKIP obi=None")
-                    continue
-                if side == "UP"   and obi < S4_MIN_OBI:
-                    print(dbg + f" → SKIP obi<{S4_MIN_OBI}")
-                    continue
-                if side == "DOWN" and obi > -S4_MIN_OBI:
-                    print(dbg + f" → SKIP obi>{-S4_MIN_OBI}")
-                    continue
+                if not target_token_id or target_token_id in self.open_positions:
+                    return
 
-                # ── ANOMALY SWITCH: OBI vs CVD conflict = trap ───────────────
-                if side == "UP"   and obi > 0.30 and cvd_sum < -3.0:
-                    print(dbg + " → SKIP anomaly")
-                    continue
-                if side == "DOWN" and obi < -0.30 and cvd_sum > 3.0:
-                    print(dbg + " → SKIP anomaly")
-                    continue
+                book = await get_orderbook(session, target_token_id)
+                if not book:
+                    return
+                a, liq_l = best_ask_info(book)
+                if a is None or a <= 0:
+                    return
+                best_token_id = target_token_id
+                best_ask      = a
+                best_liq      = liq_l
+                tok_outcome   = target_outcome
+            else:
+                # ── Legacy v7 path: fetch both orderbooks, pick cheaper ──
+                for tok in tokens:
+                    if isinstance(tok, dict):
+                        tid = tok.get("token_id") or tok.get("id")
+                        out = tok.get("outcome", "UP").upper()
+                    else:
+                        tid = str(tok); out = "UP"
+                    if not tid or tid in self.open_positions:
+                        continue
+                    book = await get_orderbook(session, tid)
+                    if not book:
+                        continue
+                    a, liq_l = best_ask_info(book)
+                    if a is None or a <= 0:
+                        continue
+                    if best_ask is None or a < best_ask:
+                        best_ask      = a
+                        best_liq      = liq_l
+                        best_token_id = tid
+                        tok_outcome   = out
+                if not best_token_id and tokens:
+                    tok = tokens[0]
+                    best_token_id = tok.get("token_id") if isinstance(tok, dict) else str(tok)
+                    tok_outcome   = tok.get("outcome", "UP").upper() if isinstance(tok, dict) else "UP"
+                    book = await get_orderbook(session, best_token_id)
+                    if book:
+                        best_ask, best_liq = best_ask_info(book)
 
-                # ── PILLAR 3: HMA direction (skip if not enough ticks yet) ──────
-                if hma_dir is not None and hma_dir != side:
-                    print(dbg + f" → SKIP hma={hma_dir}")
-                    continue
+            token_id  = best_token_id
+            ask       = best_ask
+            liq       = best_liq
+            buying_up = tok_outcome.upper() in ("UP","YES","HIGHER","ABOVE")
 
+            # Trend-direction agreement gate (must pass either path).
+            if buying_up and dev < 0:
+                skip_cert += 1
+                return
+            if not buying_up and dev > 0:
+                skip_cert += 1
+                return
 
-                # ── ALL PILLARS PASSED ────────────────────────────────────────
-                signals += 1
-                ts = datetime.now().strftime("%H:%M:%S")
-                print(f"[{ts}] S4 SIGNAL | {coin} {side} ask={ask:.3f} "
-                      f"spread={spread:.3f} CVD={cvd_sum:.1f}/{cvd_mom:+.1f} "
-                      f"OBI={obi:+.2f} HMA={hma_dir} dev={dev:+.3%} mins={mins:.1f}")
-                log_event("🎯", f"S4 Signal {coin} {side} ask={ask:.3f} "
-                                 f"CVD={cvd_sum:.1f} OBI={obi:+.2f} mins={mins:.1f}")
+            # ── S5: DIRECTION FILTER ─────────────────────────────────────────
+            # Data (126 trades): BTC DOWN=6.3% WR | ETH UP=4.9% WR
+            #                    BTC UP=2.7% WR (neg EV) | ETH DOWN=0% WR
+            # Only fire on the two validated directions.
+            if coin == "BTC" and buying_up:
+                print(f"         S5 SKIP: BTC UP — 2.7% WR < break-even, skip")
+                skip_cert += 1
+                return
+            if coin == "ETH" and not buying_up:
+                print(f"         S5 SKIP: ETH DOWN — 0% WR in data, skip")
+                skip_cert += 1
+                return
 
-                sig_key = f"{tok_id}:{side}"
-                if sig_key not in self._signaled:
-                    self._signaled.add(sig_key)
-                    if await self.fire_trade(S4_TIER, coin, tok_id, m, ask,
-                                             outcome=side, trend_dev=dev, secs_left=secs):
-                        fired += 1
-                        await asyncio.sleep(0.3)
+            # ── Bias-aware filters (data-backed, on actual cheap side) ──
+            if BIAS_FILTERS_ENABLED:
+                _coin_u = (coin or "").upper()
+                _h      = _et_hour()
+                _BASE_UP = {"BNB": 89, "ETH": 73, "BTC": 66}
+
+                if not buying_up and _coin_u in SKIP_DOWN_BIASED_COINS:
+                    base = _BASE_UP.get(_coin_u, "?")
+                    print(f"         SKIP: cheap-DOWN on {_coin_u} "
+                          f"(UP base rate {base}%, bad EV)")
+                    skip_cert += 1
+                    return
+                if buying_up and _h in DEAD_UP_HOURS_ET:
+                    print(f"         SKIP: {_h:02d}:00 ET dead-UP hour "
+                          f"(pooled UP rate <50%)")
+                    skip_cert += 1
+                    return
+                if not buying_up and _h in DEAD_DOWN_HOURS_ET:
+                    print(f"         SKIP: {_h:02d}:00 ET high-UP hour "
+                          f"(>75% UP, cheap-DOWN bad EV)")
+                    skip_cert += 1
+                    return
+
+            # ── Brain state filter ───────────────────────────────────────────
+            # DORMANT = 0/43 wins post-fix. Fail-open if brain file stale/missing.
+            if SKIP_BRAIN_STATES:
+                brain_now = read_brain_state(coin)
+                if brain_now and brain_now.get("state") in SKIP_BRAIN_STATES:
+                    print(f"         SKIP: Brain state {brain_now['state']} blocked "
+                          f"(score={brain_now.get('score')})")
+                    skip_cert += 1
+                    return
+
+            # ── Direction filter (MarketGhost hour bias) ─────────────────────
+            if DIRECTION_FILTER == "up_only" and not buying_up:
+                print(f"         SKIP: DIRECTION_FILTER=up_only — DOWN trade blocked")
+                skip_cert += 1
+                return
+            if DIRECTION_FILTER == "down_only" and buying_up:
+                print(f"         SKIP: DIRECTION_FILTER=down_only — UP trade blocked")
+                skip_cert += 1
+                return
+            if DIRECTION_FILTER == "auto":
+                up_pct, mg_samples = get_hour_bias(coin)
+                if mg_samples >= HOUR_BIAS_MIN_SAMPLES:
+                    dn_pct = 100 - up_pct
+                    if up_pct >= HOUR_BIAS_STRONG and not buying_up:
+                        print(f"         SKIP: MarketGhost hour bias {up_pct:.0f}% UP "
+                              f"({mg_samples} samples) — DOWN trade blocked")
+                        skip_cert += 1
+                        return
+                    if dn_pct >= HOUR_BIAS_STRONG and buying_up:
+                        print(f"         SKIP: MarketGhost hour bias {dn_pct:.0f}% DOWN "
+                              f"({mg_samples} samples) — UP trade blocked")
+                        skip_cert += 1
+                        return
+                    if up_pct >= HOUR_BIAS_STRONG and buying_up:
+                        print(f"         ★ Hour bias confirms: {up_pct:.0f}% UP "
+                              f"({mg_samples} samples) — UP trade aligned")
+                    elif dn_pct >= HOUR_BIAS_STRONG and not buying_up:
+                        print(f"         ★ Hour bias confirms: {dn_pct:.0f}% DOWN "
+                              f"({mg_samples} samples) — DOWN trade aligned")
+                    else:
+                        print(f"         Hour bias: {up_pct:.0f}% UP / {dn_pct:.0f}% DOWN "
+                              f"({mg_samples} samples) — neutral")
+                else:
+                    print(f"         Hour bias: insufficient data ({mg_samples} samples) — neutral")
+
+            # Trend filter already gated above. Just final invariants.
+            if not token_id or ask is None or ask <= 0:
+                return
+            if token_id in self.open_positions:
+                return
+
+            max_e      = self.get_max_entry(tier, tok_outcome)
+            no_implied = round(1 - ask, 4)
+
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"[{ts}] T{tier} {coin} | ask={ask:.3f} max={max_e:.2f} "
+                  f"certainty={no_implied:.0%} min={MIN_NO_PRICE:.0%} "
+                  f"liq=${liq:.1f} mins={mins:.1f} dev={dev:+.3%}")
+
+            if ask > max_e:
+                print(f"         SKIP: ask {ask:.3f} > max_entry {max_e:.2f}")
+                skip_ask += 1
+                return
+            if no_implied < MIN_NO_PRICE:
+                print(f"         SKIP: certainty {no_implied:.0%} < {MIN_NO_PRICE:.0%}")
+                skip_cert += 1
+                return
+            if liq < MIN_LIQUIDITY:
+                print(f"         SKIP: liquidity ${liq:.1f} < ${MIN_LIQUIDITY}")
+                skip_liq += 1
+                return
+
+            signals += 1
+            print(f"         SIGNAL PASSED — {tok_outcome} entry={ask:.3f} certainty={no_implied:.0%}")
+            sig_key = f"{token_id}:{tok_outcome}"
+            if sig_key not in self._signaled:
+                self._signaled.add(sig_key)
+                log_event("🎯", f"Signal T{tier} {coin} {tok_outcome} ask={ask:.3f} "
+                                 f"certainty={no_implied:.0%} mins={mins:.1f}")
+            if await self.fire_trade(tier, coin, token_id, m, ask, outcome=tok_outcome, trend_dev=dev, secs_left=secs):
+                fired += 1
+                await asyncio.sleep(0.3)
 
         await asyncio.gather(*[check_market(m) for m in markets])
-        return fired, 0, 0, skip_cert, skip_win, signals
+        return fired, skip_ask, skip_liq, skip_cert, skip_win, signals
 
     async def refresh_opens_periodically(self):
         async with aiohttp.ClientSession() as session:
