@@ -335,12 +335,13 @@ print(f"\n  BY STRATEGY")
 print("  " + "─"*55)
 
 STRAT_LABELS = {
-    'lottery':     'S1 Standard   (T2_MAX=0.030)',
-    's3':          'S3 Precision  (T2_MAX=0.010, exhaust gate)',
-    's4_reversal': 'S4 Early Zone (CVD+HMA+OBI, $0.38-$0.45)',
-    'raw':         'S2 Raw        (no filters, baseline)',
+    'lottery':      'S1 Standard   (T2_MAX=0.030)',
+    's3':           'S3 Precision  (T2_MAX=0.010, exhaust gate)',
+    's4_reversal':  'S4 Early Zone (CVD+HMA+OBI, $0.38-$0.45)',
+    's5_precision': 'S5 Timer      (BTC+ETH, skip dead zone 10-45s)',
+    'raw':          'S2 Raw        (no filters, baseline)',
 }
-STRAT_ORDER = ['lottery', 's3', 's4_reversal', 'raw']
+STRAT_ORDER = ['lottery', 's3', 's4_reversal', 's5_precision', 'raw']
 
 use_strategy_col = 'strategy' in cols
 if use_strategy_col:
