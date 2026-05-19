@@ -18,8 +18,8 @@ S5 overrides vs S1:
   MIN_TREND_STRENGTH 0.003 (kept from S3 — filters sideways noise)
   + S3 exhaustion gate (kept)
   + Dead zone filter: skip secs_left 10-45s (0/44 wins in data)
-  + Coin filter: BTC + ETH only
-  + Direction filter: BTC DOWN only | ETH UP only
+  + Coin filter: BTC + ETH only (no BNB/SOL/XRP — insufficient data)
+  Both UP and DOWN directions active for BTC and ETH.
 
 PM2: pm2 start crypto_ghost_scanner5.py --name scanner5 --interpreter python3
 DB tag: strategy='s5_precision' | tier=9
@@ -1630,7 +1630,7 @@ class CryptoGhostScanner:
 ║  {mode:<52s}║
 ╠══════════════════════════════════════════════════════╣
 ║  S5 filters (data-backed, hardcoded):                ║
-║    Coins: BTC DOWN + ETH UP only                     ║
+║    Coins: BTC + ETH only (both UP and DOWN)          ║
 ║    Time:  0-10s OR 45-60s (dead zone 10-45s skipped) ║
 ╠══════════════════════════════════════════════════════╣
 ║  Wallet: {wallet:<44s}║
@@ -1997,19 +1997,6 @@ class CryptoGhostScanner:
                 skip_cert += 1
                 return
             if not buying_up and dev > 0:
-                skip_cert += 1
-                return
-
-            # ── S5: DIRECTION FILTER ─────────────────────────────────────────
-            # Data (126 trades): BTC DOWN=6.3% WR | ETH UP=4.9% WR
-            #                    BTC UP=2.7% WR (neg EV) | ETH DOWN=0% WR
-            # Only fire on the two validated directions.
-            if coin == "BTC" and buying_up:
-                print(f"         S5 SKIP: BTC UP — 2.7% WR < break-even, skip")
-                skip_cert += 1
-                return
-            if coin == "ETH" and not buying_up:
-                print(f"         S5 SKIP: ETH DOWN — 0% WR in data, skip")
                 skip_cert += 1
                 return
 
