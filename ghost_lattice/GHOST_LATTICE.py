@@ -4589,6 +4589,20 @@ class CryptoGhostScanner:
                         order_id, token_id, coin,
                         tier=f"T{tier}", ask_price=ask, size_usdc=size
                     )
+                    self.guard.confirm_fill(
+                        order_id, filled=True, fill_price=fill_price
+                    )
+
+                # DB write BEFORE open_positions — if DB fails, no orphaned
+                # in-memory position that can never be cleaned up.
+                try:
+                    log_trade(tier, coin, market.get("id",""),
+                              token_id, question, ask, size, order_id, outcome,
+                              fill_price=fill_price, fill_size=fill_size,
+                              ghost_score=ghost_score)
+                except Exception as _db_err:
+                    print(f"  DB write failed for {coin} {outcome}: {_db_err}")
+                    return False
 
                 self.open_positions[token_id] = {
                     "tier": tier, "coin": coin, "question": question,
@@ -4605,10 +4619,6 @@ class CryptoGhostScanner:
                     LATENCY_TRACKER.record_execution(
                         tier, coin, token_id, _mv_age, _ord_ms, 0.0,
                         LATENCY_TRACKER.get_freshness_mult(coin, _lat_dir))
-                log_trade(tier, coin, market.get("id",""),
-                          token_id, question, ask, size, order_id, outcome,
-                          fill_price=fill_price, fill_size=fill_size,
-                          ghost_score=ghost_score)
                 self.trades_fired += 1
 
                 # Show fill accuracy: signal price vs actual fill
@@ -5488,6 +5498,8 @@ class CryptoGhostScanner:
         async with aiohttp.ClientSession() as session:
             while self.running:
                 await self.tracker.fetch_opens(session)
+                if self.guard and not PAPER_TRADE:
+                    self.guard.sweep_ghosts(self.client)
                 await asyncio.sleep(60)   # refresh every 60s (was 900) so opens stay current
 
     async def refresh_markets_periodically(self):
