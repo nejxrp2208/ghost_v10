@@ -10,10 +10,14 @@
 | `scanner3` | `crypto_ghost_scanner3.py` | Scanner 3: precision sniper (hardcoded filters, parallel S1 test) — `strategy='s3'` |
 | `scanner2` | `crypto_ghost_scanner2.py` | Scanner 2: raw data collector (tier=6) — `strategy='raw'` |
 | `scanner4` | `crypto_ghost_scanner4.py` | Scanner 4: early 50/50 zone predator (CVD+HMA+OBI, $0.38-$0.45) — `strategy='s4_reversal'` |
+| `scanner5` | `crypto_ghost_scanner5.py` | Scanner 5: precision timer (BTC+ETH only, skip dead zone 10-45s) — `strategy='s5_precision'` |
 | `resolver` | `crypto_ghost_resolver.py` | Resolves trades via Chainlink → Polymarket (shared, handles all scanners) |
 | `redeemer` | `crypto_ghost_redeemer.py` | Claims winnings on-chain (shared) |
 | `marketghost` | `marketghost.py` | Silent data collector (no trades) |
 | `ghostscanner-rt` | — | Real-time scanner variant |
+| `ghost-lattice` | `ghost_lattice/GHOST_LATTICE.py` | GHOST_LATTICE: unified ML scanner (T1=WRAITH, T2=SPECTER, ghost_brain) |
+| `ghost-lattice-resolver` | `ghost_lattice/GHOST_LATTICE_resolver.py` | GHOST_LATTICE resolver (separate from v10 resolver) |
+| `ghost-lattice-redeemer` | `ghost_lattice/GHOST_LATTICE_redeemer.py` | GHOST_LATTICE redeemer (separate from v10 redeemer) |
 
 **Scanner architecture:** Each scanner = one strategy = one PM2 process. All write to the same `crypto_ghost_PAPER.db`, distinguished by `strategy` column. Resolver handles all.
 
@@ -34,9 +38,24 @@
 - Spread filter: ask−bid ≤ $0.04
 - Telegram alert on every fire
 
+**Scanner 5 hardcoded config (fork of Scanner 3):**
+- BTC + ETH only (no BNB/SOL/XRP)
+- Dead zone filter: skip tier=2 trades with `10 < secs_left < 45` (0/44 wins historically)
+- Both UP and DOWN active
+- `S5_TIER = 9`, `strategy = 's5_precision'`
+
+**GHOST_LATTICE v10 — separate system in `ghost_lattice/` subfolder:**
+- Location: `/root/ghost_v10/ghost_lattice/`
+- Own `.env`: `/root/ghost_v10/ghost_lattice/.env` (separate from v10 .env)
+- Own DB: `ghost_lattice/GHOST_LATTICE_PAPER.db` (paper) / `GHOST_LATTICE.db` (live)
+- Dashboard (display-only, PM2 manages processes): `python3 ghost_lattice/GHOST_LATTICE_dashboard.py`
+- T1=WRAITH (contrarian), T2=SPECTER (oracle-lag), `ghost_brain.py` ML scoring (0-100)
+- Flat $6.66 sizing, CoinDirEngine (auto-blocks negative-EV pairs), HourBiasEngine, AdaptiveRisk
+
 **Tech:** Python async (`asyncio` + `aiohttp`), SQLite, Polygon/Chainlink, Polymarket CLOB + Gamma APIs.
 
-**DBs:** `crypto_ghost_PAPER.db` (trades), `scanner.db` (book/summary), `marketghost.db` (market snapshots).
+**DBs (v10):** `crypto_ghost_PAPER.db` (trades), `scanner.db` (book/summary), `marketghost.db` (market snapshots).
+**DBs (GHOST_LATTICE):** `ghost_lattice/GHOST_LATTICE_PAPER.db` (paper trades), `ghost_lattice/GHOST_LATTICE.db` (live trades).
 
 ---
 
@@ -57,16 +76,31 @@ VPS: `root@70.34.204.152` · `/root/ghost_v10` · Ubuntu 24.04 · Stockholm
 ### PM2 Process Names
 
 ```bash
+# ── GhostScanner v10 ──────────────────────────────────────────
 pm2 restart marketghost      # data collector
 pm2 restart scanner          # Scanner 1: cheap longshot (strategy='lottery')
 pm2 restart scanner3         # Scanner 3: precision sniper (strategy='s3', parallel test)
 pm2 restart scanner4         # Scanner 4: early 50/50 zone predator (strategy='s4_reversal')
+pm2 restart scanner5         # Scanner 5: BTC+ETH, dead zone filter (strategy='s5_precision')
 pm2 restart scanner2         # Scanner 2: raw data collector (strategy='raw')
-pm2 restart resolver         # trade resolver (shared — handles all scanners)
+pm2 restart resolver         # trade resolver (shared — handles all v10 scanners)
 pm2 restart redeemer         # on-chain redeemer (shared)
 pm2 restart ghostscanner-rt  # real-time scanner
 pm2 restart all              # everything at once
+
+# ── GHOST_LATTICE v10 ─────────────────────────────────────────
+pm2 restart ghost-lattice            # main scanner (T1+T2, ghost_brain ML)
+pm2 restart ghost-lattice-resolver   # GHOST_LATTICE resolver
+pm2 restart ghost-lattice-redeemer   # GHOST_LATTICE redeemer
 ```
+
+### GHOST_LATTICE Dashboard
+
+```bash
+cd /root/ghost_v10 && source venv/bin/activate && python3 ghost_lattice/GHOST_LATTICE_dashboard.py
+```
+
+Dashboard je display-only — PM2 upravlja procese. Ne zažene dvojnikov.
 
 ---
 
