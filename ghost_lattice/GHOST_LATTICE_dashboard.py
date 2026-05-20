@@ -901,7 +901,7 @@ async def main():
     )
     layout["top"].split_row(
         Layout(name="stats",     ratio=2),
-        Layout(name="positions", ratio=4),
+        Layout(name="positions", ratio=5),
         Layout(name="odds",      ratio=3),
     )
     layout["bottom"].split_row(
