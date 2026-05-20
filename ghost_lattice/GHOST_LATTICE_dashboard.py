@@ -605,11 +605,11 @@ def render_scanner_stats():
     def _sec(label):
         return (Text(""), Text.from_markup(f"[dim bold]{label}[/]"), Text(""), Text(""))
 
-    t = Table.grid(padding=(0,1))
+    t = Table.grid(padding=(0,1), expand=True)
     t.add_column(width=10, no_wrap=True)
     t.add_column(width=18, no_wrap=True)
     t.add_column(width=9,  no_wrap=True)
-    t.add_column(width=18, no_wrap=True, overflow="crop")
+    t.add_column(ratio=1, no_wrap=True, overflow="crop")
 
     # ── Sparklines ────────────────────────────────────────────────
     for coin, hk, color, fmt in COINS:
@@ -901,8 +901,8 @@ async def main():
     )
     layout["top"].split_row(
         Layout(name="stats",     ratio=2),
-        Layout(name="positions", ratio=3),
-        Layout(name="odds",      ratio=4),
+        Layout(name="positions", ratio=4),
+        Layout(name="odds",      ratio=3),
     )
     layout["bottom"].split_row(
         Layout(name="trades",   ratio=2),
