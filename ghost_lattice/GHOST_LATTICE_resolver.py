@@ -854,22 +854,7 @@ async def verify_against_pm_gamma(session, trade_id: int, token_id: str,
               f"{PM_VERIFY_RETRY} attempts (PM still pending)")
         # Don't leave the user in silence — send the local Chainlink call
         # marked as unverified so they at least know the trade closed.
-        if TELEGRAM_ENABLED:
-            tg_icon = "[WIN]" if local_status == "won" else "[LOSS]"
-            tag = {"chainlink":"[CL]","coinbase":"[CB]","binance_fallback":"[BIN]"}.get(src_tag, "[?]")
-            price_line = ""
-            if p_start and p_end:
-                pc = ((p_end - p_start)/p_start)*100
-                price_line = f"\n{p_start:.2f} -> {p_end:.2f} ({pc:+.3f}%)"
-            try:
-                await _tg_send(
-                    f"{tg_icon} <b>T{tier} {coin} {side}</b> "
-                    f"{local_status.upper()} <code>${local_pnl:+.2f}</code> {tag} [UNVERIFIED]\n"
-                    f"PM gamma didn't respond -- local call may be wrong.\n"
-                    f"{(question or '')[:80]}{price_line}"
-                )
-            except Exception:
-                pass
+        # PM verify timed out — already resolved by Chainlink, no extra alert needed.
         return
 
     if pm_status == local_status:
@@ -886,22 +871,6 @@ async def verify_against_pm_gamma(session, trade_id: int, token_id: str,
                   f"matches local -- confirmed (settled={pm_settled})")
         except Exception as e:
             print(f"[PM-VERIFY] DB stamp failed: {e}")
-        # Send Telegram with PM-verified result (matched local)
-        if TELEGRAM_ENABLED:
-            tg_icon = "[WIN]" if local_status == "won" else "[LOSS]"
-            tag = {"chainlink":"[CL]","coinbase":"[CB]","binance_fallback":"[BIN]"}.get(src_tag, "[?]")
-            price_line = ""
-            if p_start and p_end:
-                pc = ((p_end - p_start)/p_start)*100
-                price_line = f"\n{p_start:.2f} -> {p_end:.2f} ({pc:+.3f}%)"
-            try:
-                await _tg_send(
-                    f"{tg_icon} <b>T{tier} {coin} {side}</b> "
-                    f"{local_status.upper()} <code>${local_pnl:+.2f}</code> {tag} [PM-OK]\n"
-                    f"{(question or '')[:80]}{price_line}"
-                )
-            except Exception:
-                pass
         return
 
     # ── OVERRIDE — PM disagrees with local resolution ──
@@ -1178,12 +1147,15 @@ async def main():
                         if not _is_dup:
                             log_event(icon, f"T{tier} {coin} {status} ${pnl:+.2f} {src_tag}")
 
-                        send_now = ((resolution_source == "pm") or not PM_VERIFY) and not _is_dup
-                        if send_now and TELEGRAM_ENABLED:
+                        if not _is_dup and TELEGRAM_ENABLED:
                             verb   = "WON" if status == "won" else "LOST"
                             emoji  = "✅" if status == "won" else "❌"
-                            msg    = (f"{emoji} T{tier} {coin} {verb} ${pnl:+.2f} "
-                                      f"@ ${entry:.3f} | {tg_price} {src_tag}")
+                            msg    = (
+                                f"👻 <b>GHOST LATTICE</b> | {emoji} <b>T{tier} {coin} {verb}</b>\n"
+                                f"PnL <code>${pnl:+.2f}</code>  "
+                                f"Entry <code>${entry:.3f}</code>  {src_tag}\n"
+                                f"{tg_price}"
+                            )
                             asyncio.create_task(_tg_send(msg))
 
                         await asyncio.sleep(0.2)
