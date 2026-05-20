@@ -4635,7 +4635,7 @@ class CryptoGhostScanner:
                 if TELEGRAM_ENABLED:
                     try:
                         asyncio.create_task(_tg_send(
-                            f"🎯 <b>FIRE T{tier} {coin} {outcome}</b> {mode_tag.strip()}\n"
+                            f"👻 <b>GHOST LATTICE</b> | 🎯 <b>FIRE T{tier} {coin} {outcome}</b> {mode_tag.strip()}\n"
                             f"Entry <code>${ask:.3f}</code>  "
                             f"Size <code>${size}</code>  "
                             f"Payout <code>+${payout:.2f}</code>\n"
