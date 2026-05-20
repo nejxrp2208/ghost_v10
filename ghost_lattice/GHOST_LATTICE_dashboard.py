@@ -885,7 +885,7 @@ def log_activity(msg):
 #   MAIN
 # ══════════════════════════════════════════════════════════════════
 async def main():
-    _spawn_agents()
+    # _spawn_agents()  # PM2 manages processes — dashboard is display-only
 
     log_activity(f"{PROJECT_NAME} // {PROJECT_CODENAME} — online")
     log_activity(f"Mode: {'PAPER' if PAPER_TRADE else 'LIVE'} | Filter: VEL={VEL_MIN} MOM={MOM_MIN}")
