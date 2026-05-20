@@ -1557,12 +1557,12 @@ class PriceTracker:
                 await asyncio.sleep(5)
 
     def check_ws_quality(self, coin: str, window_secs: float = 15.0,
-                         min_ticks: int = 3, max_jump: float = 0.05) -> bool:
+                         min_ticks: int = 3, max_jump_pct: float = 0.005) -> bool:
         """Punisher L1 warmup gate: verify live tick quality before trusting direction.
 
         Inspects the last `window_secs` of tick_history for `coin` and requires:
           - At least `min_ticks` ticks received in that window  (data is arriving)
-          - No single tick-to-tick jump > `max_jump` dollars     (no stale snapshots)
+          - No single tick-to-tick jump > `max_jump_pct` (0.5%) (no stale snapshots)
 
         Returns True  = quality OK, safe to trade this window.
         Returns False = skip — warmup data is thin or spiked.
@@ -1583,7 +1583,7 @@ class PriceTracker:
             return False  # truly too few ticks ever — data not flowing yet
         prices = [p for _, p in recent]
         for i in range(1, len(prices)):
-            if abs(prices[i] - prices[i - 1]) > max_jump:
+            if prices[i - 1] > 0 and abs(prices[i] - prices[i - 1]) / prices[i - 1] > max_jump_pct:
                 return False  # spike detected in window
         return True
 
@@ -2415,15 +2415,17 @@ class HourBiasEngine:
         """
 
         def _query_db(path, timeout=5):
-            """Return (old_rows, recent_rows) from a trades DB."""
+            """Return (old_rows, recent_rows) from a trades DB — non-overlapping ranges."""
             try:
                 con = _sq.connect(path, timeout=timeout)
                 con.execute("PRAGMA journal_mode=WAL")
                 # detect coin column
                 cols = [r[1] for r in con.execute("PRAGMA table_info(trades)").fetchall()]
-                sql  = TRADES_SQL_NEW if "coin" in cols else TRADES_SQL_OLD
-                old_rows    = con.execute(sql, (_lookback_ts,)).fetchall()
-                recent_rows = con.execute(sql, (_recent_ts,)).fetchall()
+                _sql = TRADES_SQL_NEW if "coin" in cols else TRADES_SQL_OLD
+                # Non-overlapping: old = [lookback, recent), recent = [recent, now)
+                _old_sql    = _sql.replace("ts >= ?", "ts >= ? AND ts < ?")
+                old_rows    = con.execute(_old_sql, (_lookback_ts, _recent_ts)).fetchall()
+                recent_rows = con.execute(_sql, (_recent_ts,)).fetchall()
                 con.close()
                 return old_rows, recent_rows
             except Exception as e:
@@ -2433,8 +2435,7 @@ class HourBiasEngine:
         # ── 1. Live DB ────────────────────────────────────────────────────────
         old_r, rec_r = _query_db(DB_PATH)
         _add_rows(old_r, weight=1.0)
-        # recent rows get extra weight on top of the base 1.0 already added
-        _add_rows(rec_r, weight=HOUR_BIAS_RECENT_WEIGHT - 1.0)
+        _add_rows(rec_r, weight=HOUR_BIAS_RECENT_WEIGHT)
 
         # ── 2. Paper DB ───────────────────────────────────────────────────────
         # Only merge paper data in paper mode — phantom REST fills corrupt live bias
@@ -2443,7 +2444,7 @@ class HourBiasEngine:
             if _os.path.exists(_paper_path):
                 old_r, rec_r = _query_db(_paper_path)
                 _add_rows(old_r, weight=1.0)
-                _add_rows(rec_r, weight=HOUR_BIAS_RECENT_WEIGHT - 1.0)
+                _add_rows(rec_r, weight=HOUR_BIAS_RECENT_WEIGHT)
 
         # ── 3. Frank DB (market resolutions) ─────────────────────────────────
         _frank_path = _os.path.join(_os.path.dirname(DB_PATH), "frank.db")
@@ -5271,10 +5272,7 @@ class CryptoGhostScanner:
             elif HOUR_REDUCE_FACTOR != 1.0 and _hw in HOUR_REDUCE_HOURS_ET:
                 confidence = confidence * HOUR_REDUCE_FACTOR
 
-            # oracle-lag-sniper all tiers: confidence gate bypassed.
-            # Model underscores price_score (= 0 near ceiling) and mismatch component
-            # (Gaussian underestimates true WR on stale MM asks). Disabled across all tiers.
-            if False and confidence < _adap_eff_conf():
+            if confidence < _adap_eff_conf():
                 skip_cert += 1
                 return
 
@@ -5337,7 +5335,7 @@ class CryptoGhostScanner:
             # confirmed active velocity — price must still be moving fast,
             # not just have moved. Prevents low-velocity stale signals from
             # bypassing TOP_N even when the statistical mismatch is large.
-            arb_override   = False  # ARB_ENABLED=false
+            arb_override = ARB_ENABLED and ELITE_COOLDOWN_BYPASS and arb_score >= ARB_OVERRIDE_SCORE
 
             # ── Tick freshness boost ─────────────────────────────────────────
             # Fresh Binance move (<3s) = oracle lag almost certainly still open.
@@ -5352,8 +5350,28 @@ class CryptoGhostScanner:
             # Soft multiplier above only re-orders signals; stale signals still fire.
             # This hard gate KILLS signals where the oracle lag window has expired.
             # Research: window ≈55s; production move_age P50=88s → firing post-window.
+            if LATENCY_TRACK_ENABLED:
+                _move_age = LATENCY_TRACKER.get_move_age_secs(coin, _direction)
+                if _move_age > KILL_FRESHNESS_SECS:
+                    skip_cert += 1
+                    return
             # Mark this (coin,tier,direction) as recently fired for conflict filter
             _recent_fires[_fire_key] = time.monotonic()
+
+            # ── Dual-fire check ──────────────────────────────────────────────────
+            # When we already hold the opposite leg AND this side is ≤
+            # DUAL_FIRE_MAX_ENTRY: one side must settle at $1 → guaranteed net profit.
+            # Bypasses kill_check in fire_trade — direction gates are irrelevant.
+            _is_dual_fire = False
+            if DUAL_FIRE_ENABLED and ask <= DUAL_FIRE_MAX_ENTRY:
+                _opp_tid = next(
+                    (tok.get("token_id") or tok.get("id")
+                     for tok in tokens if isinstance(tok, dict)
+                     and (tok.get("token_id") or tok.get("id")) != token_id),
+                    None
+                )
+                if _opp_tid and _opp_tid in self.open_positions:
+                    _is_dual_fire = True
 
             return {
                 "tier":           tier,
@@ -5372,6 +5390,7 @@ class CryptoGhostScanner:
                 "confidence":     confidence,
                 "dyn_size":       dyn_size,
                 "seg_mult":       1.0,
+                "dual_fire":      _is_dual_fire,
                 # Arb engine metrics (PATH B)
                 "fair_p":         fair_p,
                 "mismatch":       mismatch,
@@ -5458,7 +5477,8 @@ class CryptoGhostScanner:
                     sig["market"], sig["ask"],
                     outcome=sig["outcome"], session=session,
                     size=sig.get("dyn_size"),
-                    ghost_score=sig.get("ghost_score", 0)):
+                    ghost_score=sig.get("ghost_score", 0),
+                    dual_fire=sig.get("dual_fire", False)):
                 fired += 1
                 await asyncio.sleep(0.3)
 

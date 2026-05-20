@@ -311,31 +311,26 @@ def score_coin(coin: str, candles: List[dict], book: dict,
     total    = 0
     result   = {}
 
-    # ── 1. CANDLE DIRECTION + ACCELERATION (0-25) ─────────────────────────────
-    # Direction: are last 3 candles all same color?
-    # Acceleration: is each candle body getting BIGGER? (momentum building)
-    last3  = candles[-3:]
-    bodies = [abs(c["close"] - c["open"]) for c in last3]
-    dirs   = [1 if c["close"] > c["open"] else -1 if c["close"] < c["open"] else 0
-              for c in last3]
+    # ── 1. ORACLE LAG MAGNITUDE (0-25) ───────────────────────────────────────
+    # How large was the most recent 1m candle relative to this coin's ATR?
+    # A big recent candle = Binance moved fast = Polymarket oracle lag is likely open.
+    # This replaces trend-continuation scoring — we don't care if price KEEPS moving,
+    # only that it ALREADY moved enough to create a stale-ask opportunity.
+    last_c = candles[-1]
+    last_body_pct = (abs(last_c["close"] - last_c["open"]) / last_c["open"] * 100
+                     if last_c["open"] > 0 else 0.0)
+    lag_ratio = last_body_pct / base_pct if base_pct > 0 else 0.0
 
-    all_same   = all(d == dirs[-1] for d in dirs) and dirs[-1] != 0
-    last2_same = dirs[-1] == dirs[-2] and dirs[-1] != 0
-    accelerating = (len(bodies) >= 3 and
-                    bodies[-1] > bodies[-2] > bodies[-3] * 0.8)
+    if lag_ratio >= 3.0:    candle_score = 25
+    elif lag_ratio >= 2.0:  candle_score = 18
+    elif lag_ratio >= 1.5:  candle_score = 14
+    elif lag_ratio >= 1.0:  candle_score = 8
+    elif lag_ratio >= 0.5:  candle_score = 3
+    else:                   candle_score = 0
 
-    if all_same and accelerating:
-        candle_score = 25
-    elif all_same:
-        candle_score = 18
-    elif last2_same and accelerating:
-        candle_score = 14
-    elif last2_same:
-        candle_score = 8
-    else:
-        candle_score = 0
-
-    candle_dir   = "UP" if dirs[-1] > 0 else "DOWN" if dirs[-1] < 0 else "NEUTRAL"
+    candle_dir   = ("UP"   if last_c["close"] > last_c["open"] else
+                    "DOWN" if last_c["close"] < last_c["open"] else "NEUTRAL")
+    accelerating = lag_ratio >= 2.0  # strong recent move = high-confidence lag
     total       += candle_score
     result["s_candle"]     = candle_score
     result["candle_dir"]   = candle_dir
