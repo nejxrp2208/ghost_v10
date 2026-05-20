@@ -549,7 +549,7 @@ def render_open_positions():
               show_header=True, header_style="bold white",
               expand=True, padding=(0,1))
     t.add_column("ID",    width=5,  style="dim")
-    t.add_column("Market",min_width=36, overflow="ellipsis")
+    t.add_column("Market",min_width=28, max_width=36, overflow="ellipsis")
     t.add_column("Tier",  width=10)
     t.add_column("Side",  width=5)
     t.add_column("$",     width=6,  justify="right")
