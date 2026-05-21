@@ -4509,7 +4509,8 @@ class CryptoGhostScanner:
                     token_id=token_id,
                     amount=size,          # USDC to spend
                     side=BUY,
-                    order_type=OrderType.FOK
+                    order_type=OrderType.FOK,
+                    price=ask
                 )
                 # Let the v2 client auto-detect neg_risk per token via its
                 # internal get_neg_risk() API call (result is cached).
@@ -4556,7 +4557,8 @@ class CryptoGhostScanner:
                     try:
                         _r2_args   = MarketOrderArgs(
                             token_id=token_id, amount=size,
-                            side=BUY, order_type=OrderType.FOK)
+                            side=BUY, order_type=OrderType.FOK,
+                            price=ask)
                         _r2_signed = self.client.create_market_order(_r2_args)
                         _r2_resp   = self.client.post_order(_r2_signed, OrderType.FOK)
                         if _r2_resp:
