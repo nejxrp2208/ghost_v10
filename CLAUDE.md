@@ -18,6 +18,9 @@
 | `ghost-lattice` | `ghost_lattice/GHOST_LATTICE.py` | GHOST_LATTICE: unified ML scanner (T1=WRAITH, T2=SPECTER, ghost_brain) |
 | `ghost-lattice-resolver` | `ghost_lattice/GHOST_LATTICE_resolver.py` | GHOST_LATTICE resolver (separate from v10 resolver) |
 | `ghost-lattice-redeemer` | `ghost_lattice/GHOST_LATTICE_redeemer.py` | GHOST_LATTICE redeemer (separate from v10 redeemer) |
+| `zugu-scanner` | `zugu_bot/zugu_scanner.py` | ZUGU: FOLLOW LEADER strategy (50/50 zone, last 5-15s, BTC+ETH) |
+| `zugu-resolver` | `zugu_bot/zugu_resolver.py` | ZUGU resolver (separate subsystem) |
+| `zugu-redeemer` | `zugu_bot/zugu_redeemer.py` | ZUGU redeemer (separate subsystem) |
 
 **Scanner architecture:** Each scanner = one strategy = one PM2 process. All write to the same `crypto_ghost_PAPER.db`, distinguished by `strategy` column. Resolver handles all.
 
@@ -51,6 +54,16 @@
 - Dashboard (display-only, PM2 manages processes): `python3 ghost_lattice/GHOST_LATTICE_dashboard.py`
 - T1=WRAITH (contrarian), T2=SPECTER (oracle-lag), `ghost_brain.py` ML scoring (0-100)
 - Flat $6.66 sizing, CoinDirEngine (auto-blocks negative-EV pairs), HourBiasEngine, AdaptiveRisk
+
+**ZUGU v4 — separate system in `zugu_bot/` subfolder:**
+- Location: `/root/ghost_v10/zugu_bot/`
+- Own `.env`: `/root/ghost_v10/zugu_bot/.env` (separate from v10 and ghost_lattice)
+- Own DB: `zugu_bot/zugu_PAPER.db` (paper) / `zugu.db` (live)
+- Strategy: **FOLLOW LEADER** — last 5-15s of 5min candle, if Binance leads PTB by >=0.01%, buy that side
+- Entry zone: $0.30 - $0.75 (50/50 zone, NOT cheap longshot)
+- Assets: BTC + ETH only, 5 shares fixed, max 2 open trades
+- Backtest: 86.9% WR, +30.7c PnL/trade (small sample, validate with paper first)
+- `FL_PAPER_ONLY=true` — strategy only fires in paper mode by default
 
 **Tech:** Python async (`asyncio` + `aiohttp`), SQLite, Polygon/Chainlink, Polymarket CLOB + Gamma APIs.
 
@@ -92,6 +105,22 @@ pm2 restart all              # everything at once
 pm2 restart ghost-lattice            # main scanner (T1+T2, ghost_brain ML)
 pm2 restart ghost-lattice-resolver   # GHOST_LATTICE resolver
 pm2 restart ghost-lattice-redeemer   # GHOST_LATTICE redeemer
+
+# ── ZUGU v4 ───────────────────────────────────────────────────
+pm2 restart zugu-scanner             # FOLLOW LEADER (50/50 zone, 5-15s window)
+pm2 restart zugu-resolver            # ZUGU resolver
+pm2 restart zugu-redeemer            # ZUGU redeemer
+```
+
+### First-time deploy (zugu_bot)
+
+```bash
+cd /root/ghost_v10 && git pull
+pip install -r zugu_bot/requirements.txt
+# Edit zugu_bot/.env to fill PRIVATE_KEY + CLOB credentials (for live mode)
+pm2 start zugu_bot/zugu_scanner.py  --name zugu-scanner  --interpreter python3
+pm2 start zugu_bot/zugu_resolver.py --name zugu-resolver --interpreter python3
+pm2 start zugu_bot/zugu_redeemer.py --name zugu-redeemer --interpreter python3
 ```
 
 ### GHOST_LATTICE Dashboard
