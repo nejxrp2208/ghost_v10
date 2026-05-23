@@ -479,8 +479,8 @@ def render_statistics():
 
     # ── TIER SNAPSHOT ─────────────────────────────────────────────
     t.add_row(Text.from_markup(f"[{_TH['sec']}]TIERS[/]"), Text(""))
-    tier_names = {1: "T1·WRAITH", 2: "T2·PHANTOM"}
-    tier_cols  = {1: _TH["tier"][1], 2: _TH["tier"][2]}
+    tier_names = {1: "T1·WRAITH", 2: "T2·PHANTOM", 3: "T3·DOUBLE"}
+    tier_cols  = {1: _TH["tier"][1], 2: _TH["tier"][2], 3: _TH["tier"][3]}
     tier_rows  = get_tier_stats()
     for row in tier_rows:
         if len(row) < 4: continue
@@ -558,7 +558,7 @@ def render_open_positions():
     t.add_column("Time",  width=8,  style="dim")
 
     tier_cols  = _TH["tier"]
-    tier_names = {1:"WRAITH", 2:"PHANTOM"}
+    tier_names = {1:"WRAITH", 2:"PHANTOM", 3:"DOUBLE"}
     for rid, tier, coin, q, entry, size, ts, outcome in rows:
         col  = tier_cols.get(tier, "white")
         tn   = tier_names.get(tier, f"T{tier}")
@@ -790,7 +790,7 @@ def render_last_trades():
     t.add_column("Result", width=19)
 
     tier_cols  = _TH["tier"]
-    tier_names = {1:"WRAITH", 2:"PHANTOM"}
+    tier_names = {1:"WRAITH", 2:"PHANTOM", 3:"DOUBLE"}
 
     for row in rows:
         rid, ts, tier, coin, q, size, pnl, status, outcome, entry = row

@@ -183,6 +183,21 @@ T2_5M_WINDOW_SEC = float(os.getenv("T2_5M_WINDOW_SEC", "45"))    # 5m: fire only
 DUAL_FIRE_ENABLED   = os.getenv("DUAL_FIRE_ENABLED",   "true").lower() == "true"
 DUAL_FIRE_MAX_ENTRY = float(os.getenv("DUAL_FIRE_MAX_ENTRY", "0.02"))
 
+# ── T3 DOUBLE — insurance hedge on already-open positions ──────────────────
+# Separate from DUAL_FIRE: hardcoded bypass of all soft gates (SKIP_DOWN,
+# HourBias, CoinDir, confidence, freshness, cooldown) — fires SOLELY when:
+#   1. We already hold one leg of a market (UP or DOWN), AND
+#   2. The opposite leg's ask is within [MIN, MAX] range, AND
+#   3. Book has enough liquidity to fill T3_DOUBLE_SIZE_USDC.
+# Strategy: when DOWN side drops to cheap range, add $1.50 insurance even
+# if SKIP_DOWN_BIASED_COINS would normally block it. Reduces downside if
+# the original leg loses. NOT a guaranteed-profit play (math depends on
+# original position size). Tier=3 → DB column 'tier'=3, dashboard shows DOUBLE.
+T3_DOUBLE_ENABLED   = os.getenv("T3_DOUBLE_ENABLED",   "true").lower() == "true"
+T3_DOUBLE_MIN_ENTRY = float(os.getenv("T3_DOUBLE_MIN_ENTRY", "0.05"))
+T3_DOUBLE_MAX_ENTRY = float(os.getenv("T3_DOUBLE_MAX_ENTRY", "0.08"))
+T3_DOUBLE_SIZE_USDC = float(os.getenv("T3_DOUBLE_SIZE_USDC", "1.50"))
+
 # Balance-scaled sizing: when BET_PCT > 0, sizes auto-scale with live wallet balance.
 # base = balance * BET_PCT * per_coin_ratio   (per_coin_ratio = T2_SIZE_PER_COIN[coin] / T2_SIZE)
 # 0.0 = disabled, use fixed T2_SIZE_* dollar amounts. MAX_BET_SIZE hard-caps each trade.
@@ -4630,7 +4645,7 @@ class CryptoGhostScanner:
                 payout    = round(fill_size / fill_price - fill_size, 2) if fill_price > 0 else 0
                 ts        = datetime.now().strftime("%H:%M:%S")
                 mode_tag  = "[PAPER]" if PAPER_TRADE else "[LIVE] "
-                tier_names = {1:"WRAITH",2:"SPECTER"}
+                tier_names = {1:"WRAITH",2:"SPECTER",3:"DOUBLE"}
                 # Latency breakdown: sign time + network round-trip (Punisher L43)
                 _sign_ms = round((locals().get("_t_send", _t_fire)
                                   - locals().get("_t_sign", _t_fire)) * 1000, 1)
@@ -5496,6 +5511,95 @@ class CryptoGhostScanner:
 
         return fired, skip_ask, skip_liq, skip_cert, skip_win, signals, skip_silent, skip_vel, skip_book, skip_ws_qual
 
+    async def _check_t3_double(self, session: aiohttp.ClientSession,
+                                markets: List[dict]) -> int:
+        """T3 DOUBLE — insurance hedge on already-open positions.
+
+        Bypasses ALL soft gates (SKIP_DOWN_BIASED_COINS, HourBias, CoinDir,
+        confidence, freshness, cooldown). Fires ONLY when:
+          1. self.open_positions has a non-T3 leg of this market (avoid hedging a hedge)
+          2. Opposite token's ask ∈ [T3_DOUBLE_MIN_ENTRY, T3_DOUBLE_MAX_ENTRY]
+          3. Book liquidity ≥ T3_DOUBLE_SIZE_USDC
+          4. Opposite token not already in open_positions or _pending
+          5. CLOB not in maintenance (_CLOB_DOWN check inside fire_trade)
+
+        Returns: number of T3D positions fired this cycle.
+        """
+        if not T3_DOUBLE_ENABLED or not self.open_positions or not markets:
+            return 0
+        if (len(self.open_positions) + len(self._pending)) >= MAX_OPEN_POSITIONS:
+            return 0
+
+        # Build market lookup: token_id → (market, opposite_token_id)
+        # Skip markets that don't have at least 2 token sides.
+        _market_by_tid: Dict[str, Tuple[dict, str]] = {}
+        for m in markets:
+            tokens = m.get("tokens", []) or []
+            tids = []
+            for tok in tokens:
+                if isinstance(tok, dict):
+                    tid = tok.get("token_id") or tok.get("id")
+                    if tid:
+                        tids.append(str(tid))
+            if len(tids) >= 2:
+                # Map each token to its market and opposite token
+                _market_by_tid[tids[0]] = (m, tids[1])
+                _market_by_tid[tids[1]] = (m, tids[0])
+
+        fired_count = 0
+        for token_id, pos in list(self.open_positions.items()):
+            # Skip if this position is itself a T3 (don't hedge a hedge)
+            if pos.get("tier") == 3:
+                continue
+
+            lookup = _market_by_tid.get(str(token_id))
+            if not lookup:
+                continue   # market not in current scan window
+            market, opp_tid = lookup
+
+            # Skip if opposite leg already held or being filled
+            if opp_tid in self.open_positions or opp_tid in self._pending:
+                continue
+
+            # Determine opposite outcome
+            orig_outcome = (pos.get("outcome") or "UP").upper()
+            opp_outcome  = "DOWN" if orig_outcome in ("UP","YES","HIGHER","ABOVE") else "UP"
+
+            # Fetch opposite leg orderbook (fresh)
+            book = await get_orderbook(session, opp_tid, max_age_ms=500)
+            if not book:
+                continue
+
+            ask, liq = best_ask_info(book, max_price=T3_DOUBLE_MAX_ENTRY)
+            if ask is None:
+                continue
+            # Strict range check
+            if ask < T3_DOUBLE_MIN_ENTRY or ask > T3_DOUBLE_MAX_ENTRY:
+                continue
+            # Liquidity must cover the bet
+            if liq < T3_DOUBLE_SIZE_USDC:
+                continue
+
+            # Fire — dual_fire=True bypasses kill_check() in fire_trade
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"[{ts}] [T3-DOUBLE] Triggering hedge: {pos.get('coin','?')} "
+                  f"orig={orig_outcome} -> opp={opp_outcome} @${ask:.3f} "
+                  f"size=${T3_DOUBLE_SIZE_USDC:.2f}")
+
+            ok = await self.fire_trade(
+                tier=3, coin=pos.get("coin","?"), token_id=opp_tid,
+                market=market, ask=ask, outcome=opp_outcome,
+                session=session, size=T3_DOUBLE_SIZE_USDC,
+                dual_fire=True, ghost_score=0,
+            )
+            if ok:
+                fired_count += 1
+                log_event("🛡️", f"T3-DOUBLE hedge {pos.get('coin','?')} "
+                                  f"{opp_outcome} @${ask:.3f}")
+                await asyncio.sleep(0.3)   # small gap between fires
+
+        return fired_count
+
     async def refresh_opens_periodically(self):
         async with aiohttp.ClientSession() as session:
             while self.running:
@@ -5714,6 +5818,21 @@ class CryptoGhostScanner:
                     signals      += _sig
                     skip_vel     += _sv
                     skip_ws_qual += _swq
+
+                    # \u2500\u2500 T3 DOUBLE check: hedge already-open positions \u2500\u2500\u2500\u2500\u2500
+                    # Runs AFTER main scan so any new positions fired this
+                    # cycle are visible to the hedge logic. Wrapped in
+                    # try/except so a failure here never breaks main loop.
+                    if T3_DOUBLE_ENABLED:
+                        try:
+                            t3d_fired = await asyncio.wait_for(
+                                self._check_t3_double(session, markets),
+                                timeout=10.0)
+                            fired += t3d_fired
+                        except asyncio.TimeoutError:
+                            log_event("\u26a0\ufe0f", "t3_double timeout")
+                        except Exception as e:
+                            log_event("\u26a0\ufe0f", f"t3_double error: {e}")
 
                 except asyncio.TimeoutError:
                     log_event("\u26a0\ufe0f", "scan_updown_markets timeout")
