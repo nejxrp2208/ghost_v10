@@ -114,6 +114,23 @@ WHALE_SIGNAL_TTL      = float(os.getenv("WHALE_SIGNAL_TTL", "120"))
 WHALE_PRIORITY_BOOST  = float(os.getenv("WHALE_PRIORITY_BOOST", "1.20"))
 # Confidence boost when whale direction matches ours
 WHALE_CONF_BOOST      = float(os.getenv("WHALE_CONF_BOOST", "0.03"))
+
+# ── Preferred coin priority boost ────────────────────────────────────────────
+# Lifts BTC/ETH priority_score to compete with SOL/XRP signal volume.
+# Format: "BTC:1.20,ETH:1.15" → {"BTC": 1.20, "ETH": 1.15}. Empty = no boost.
+_PREFERRED_RAW = os.getenv("PREFERRED_COINS_BOOST", "").strip()
+PREFERRED_COINS_BOOST: dict = {}
+for _pc in _PREFERRED_RAW.split(","):
+    _pc = _pc.strip()
+    if ":" in _pc:
+        _coin_part, _mult_part = _pc.split(":", 1)
+        try:
+            PREFERRED_COINS_BOOST[_coin_part.strip().upper()] = float(_mult_part.strip())
+        except ValueError:
+            pass
+if PREFERRED_COINS_BOOST:
+    print(f"[ENV] PREFERRED_COINS_BOOST = {PREFERRED_COINS_BOOST}")
+
 # In-memory cache: condition_id -> {"direction": "up"/"down"/"both", "ts": float, "wallet": str}
 _whale_signals: dict = {}
 CLOB_API          = "https://clob.polymarket.com"
@@ -290,6 +307,26 @@ TREND_VOLATILITY_MAX = float(os.getenv("TREND_VOLATILITY_MAX","0.003"))     # fr
 # If 15m dev opposes 5m dev AND |15m dev| >= this threshold, skip the signal.
 # Lower = more signals killed (stricter). Raise to 0.003 to relax on choppy days.
 DEV_15M_THRESH       = float(os.getenv("DEV_15M_THRESH", "0.0010"))  # 0.1% hardcoded → now configurable
+
+# ── OBV volume confirmation (Punisher indicator) ─────────────────────────────
+# Uses Binance @ticker "v" field (24h rolling vol) already on existing WS.
+# Computes per-tick volume delta and OBV slope: +1 = all up-tick volume,
+# −1 = all down-tick volume. _obv_align = slope if buying_up else −slope.
+#   > +0.30 → soft boost confidence by OBV_CONF_BOOST.
+#   < OBV_KILL_THRESH (default −0.60) → hard kill (volume against bet).
+OBV_CONFIRM_ENABLED  = os.getenv("OBV_CONFIRM_ENABLED", "true").strip().lower() in ("true","1","yes")
+OBV_CONF_BOOST       = float(os.getenv("OBV_CONF_BOOST",   "0.03"))
+OBV_KILL_THRESH      = float(os.getenv("OBV_KILL_THRESH",  "-0.60"))
+
+# ── RSI-14 exhaustion confirmation (Punisher indicator) ──────────────────────
+# Uses Binance 1m kline REST inside existing fetch_opens() loop (no new conn).
+# Contrarian: RSI > overbought + we bet DOWN (or RSI < oversold + we bet UP)
+# = exhaustion confirmation → soft boost by RSI_CONF_BOOST. No hard kill.
+RSI_ENABLED          = os.getenv("RSI_ENABLED",  "true").strip().lower() in ("true","1","yes")
+RSI_PERIOD           = int(os.getenv("RSI_PERIOD",       "14"))
+RSI_OVERBOUGHT       = float(os.getenv("RSI_OVERBOUGHT", "65"))
+RSI_OVERSOLD         = float(os.getenv("RSI_OVERSOLD",   "35"))
+RSI_CONF_BOOST       = float(os.getenv("RSI_CONF_BOOST", "0.03"))
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Trade confidence scoring ──────────────────────────────────────────────────
@@ -1218,6 +1255,12 @@ class PriceTracker:
         # Stores (monotonic_time, price) tuples; maxlen=150 covers ~2.5 min of ticks.
         _tracked = ("BTC", "ETH", "BNB", "SOL", "XRP")
         self.tick_history: Dict[str, deque] = {c: deque(maxlen=150) for c in _tracked}
+        # OBV — per-tick volume from Binance @ticker "v" field (24h rolling).
+        # Stores (monotonic_time, price, tick_vol) tuples for slope computation.
+        self.volume_history: Dict[str, deque] = {c: deque(maxlen=150) for c in _tracked}
+        self._prev_volume: Dict[str, float] = {}
+        # RSI — last N one-minute close prices, refreshed by fetch_opens().
+        self.closes_1m: Dict[str, List[float]] = {}
         # Punisher WS quality patches (L3/L4) — reset on each reconnect
         self._ws_skip_first: set = set()      # L4: coins whose first post-connect tick has been skipped
 
@@ -1282,6 +1325,14 @@ class PriceTracker:
                             self.highs_1d[coin] = float(data[0][2])
                             self.lows_1d[coin]  = float(data[0][3])
 
+                # 1m candles — last 15 closes for RSI-14
+                async with session.get(url, params={"symbol": sym, "interval": "1m", "limit": 15},
+                                       timeout=aiohttp.ClientTimeout(total=5)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        if data:
+                            self.closes_1m[coin] = [float(d[4]) for d in data]
+
             except Exception as e:
                 print(f"[PriceTracker] Open fetch error for {coin}: {e}")
 
@@ -1340,6 +1391,55 @@ class PriceTracker:
         if not changes:
             return None
         return sum(changes) / len(changes)
+
+    def get_obv_slope(self, coin: str, n: int = 10) -> Optional[float]:
+        """OBV direction from last n ticks. Returns slope in [-1.0, +1.0].
+        +1.0 = all per-tick volume occurred on up-ticks (bullish pressure).
+        -1.0 = all per-tick volume occurred on down-ticks (bearish pressure).
+        Returns None when insufficient history or near-zero volume.
+
+        Caller maps to bet direction:
+          _obv_align = slope if buying_up else -slope
+          Positive _obv_align = volume confirms our bet direction.
+        """
+        hist = list(self.volume_history.get(coin, []))
+        if len(hist) < max(2, n):
+            return None
+        recent = hist[-n:]
+        up_vol   = sum(recent[i][2] for i in range(1, len(recent))
+                       if recent[i][1] >= recent[i-1][1])
+        down_vol = sum(recent[i][2] for i in range(1, len(recent))
+                       if recent[i][1] <  recent[i-1][1])
+        total = up_vol + down_vol
+        if total < 0.01:
+            return None
+        return round((up_vol - down_vol) / total, 4)
+
+    def get_rsi(self, coin: str, period: int = 14) -> Optional[float]:
+        """RSI-period from last period+1 one-minute close prices.
+        Simple-average RSI (Wilder first-bar formula):
+          gains  = [max(0, close[i] - close[i-1]) for i in 1..period]
+          losses = [max(0, close[i-1] - close[i]) for i in 1..period]
+          RS     = avg_gain / avg_loss
+          RSI    = 100 - (100 / (1 + RS))
+
+        Contrarian use:
+          RSI > overbought (65): ran hard up → confirms DOWN bet
+          RSI < oversold   (35): fell hard   → confirms UP bet
+        Returns None when closes_1m has fewer than period+1 entries (warmup).
+        """
+        closes = self.closes_1m.get(coin, [])
+        if len(closes) < period + 1:
+            return None
+        recent = closes[-(period + 1):]
+        gains  = [max(0.0, recent[i] - recent[i-1]) for i in range(1, len(recent))]
+        losses = [max(0.0, recent[i-1] - recent[i]) for i in range(1, len(recent))]
+        avg_gain = sum(gains)  / period
+        avg_loss = sum(losses) / period
+        if avg_loss < 1e-10:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return round(100.0 - (100.0 / (1.0 + rs)), 2)
 
     def get_deviation_t2(self, coin: str, market_start_ts: float) -> Optional[float]:
         """Deviation of current price vs Binance price AT the market's start time.
@@ -1561,6 +1661,17 @@ class PriceTracker:
                                             if coin in self.tick_history:
                                                 self.tick_history[coin].append(
                                                     (time.monotonic(), _p))
+                                            # OBV — per-tick volume delta from 24h rolling
+                                            try:
+                                                _v = float(ticker.get("v", 0))
+                                                if _v > 0 and coin in self.volume_history:
+                                                    _prev_v = self._prev_volume.get(coin, _v)
+                                                    _tick_vol = max(0.0, _v - _prev_v)
+                                                    self._prev_volume[coin] = _v
+                                                    self.volume_history[coin].append(
+                                                        (time.monotonic(), _p, _tick_vol))
+                                            except (TypeError, ValueError):
+                                                pass
                                 except Exception:
                                     pass
                             elif msg.type in (aiohttp.WSMsgType.CLOSED,
@@ -3573,7 +3684,7 @@ async def direct_scan_updown(session: aiohttp.ClientSession) -> Dict[str, dict]:
             mins   = (end_dt.timestamp() - now) / 60
             if mins < 0 or mins > 1500:  # within 25 hours
                 continue
-            mid = m.get("id", "") or slug
+            mid = m.get("conditionId", "") or m.get("id", "") or slug
             if mid in found:
                 continue
             tokens = m.get("tokens", []) or []
@@ -3831,7 +3942,7 @@ async def _discover_crypto_markets(session: aiohttp.ClientSession) -> Dict[str, 
                         continue
                     token_markets[primary_token] = {
                         "question":   q,
-                        "id":         m.get("id", "") or m.get("conditionId", ""),
+                        "id":         m.get("conditionId", "") or m.get("id", ""),
                         "tokens":     tokens,
                         "endDateIso": end,
                     }
@@ -5063,12 +5174,17 @@ class CryptoGhostScanner:
             # T1 (contrarian) uses a relaxed momentum threshold (half of T2).
             # T2 (5-min oracle-lag) uses the full strict filter.
             _vel = _mom = _vol = None
+            _obv = _rsi = None   # OBV + RSI Punisher indicators (computed below)
             _trend_applies = TREND_ENHANCED and tier in (1, 2)
             if _trend_applies:
                 _n   = TREND_N_TICKS
                 _vel = self.tracker.get_velocity(coin, _n)
                 _mom = self.tracker.get_momentum(coin, _n)
                 _vol = self.tracker.get_volatility(coin, _n)
+                if OBV_CONFIRM_ENABLED:
+                    _obv = self.tracker.get_obv_slope(coin, _n)
+                if RSI_ENABLED:
+                    _rsi = self.tracker.get_rsi(coin, RSI_PERIOD)
 
                 # Tier-specific momentum threshold: T3 is more relaxed
                 _mom_min = TREND_MOMENTUM_MIN if tier == 2 else TREND_MOMENTUM_MIN * 0.5
@@ -5340,7 +5456,7 @@ class CryptoGhostScanner:
             # If a discovery wallet recently traded this market in the same
             # direction, boost confidence (+WHALE_CONF_BOOST) and priority.
             # "both" directions (whale hedging) = no directional preference.
-            _cid = m.get("id", "") or m.get("conditionId", "")
+            _cid = m.get("conditionId", "") or m.get("id", "")
             _whale_hit = _whale_signals.get(_cid)
             if _whale_hit:
                 _whale_dir = _whale_hit.get("direction", "both")
@@ -5352,6 +5468,26 @@ class CryptoGhostScanner:
                 # Direction mismatch: mild confidence reduction (whale went other way)
                 else:
                     confidence = max(confidence - 0.02, 0.0)
+
+            # ── OBV volume confirmation (Punisher indicator) ─────────────────
+            # _obv_align: +1 = per-tick volume confirms our bet, −1 = opposes.
+            # > +0.30 → soft confidence boost. < OBV_KILL_THRESH → hard kill.
+            if OBV_CONFIRM_ENABLED and _obv is not None:
+                _obv_align = _obv if buying_up else -_obv
+                if _obv_align > 0.30:
+                    confidence = min(confidence + OBV_CONF_BOOST, 1.0)
+                elif _obv_align < OBV_KILL_THRESH:
+                    skip_cert += 1
+                    return  # volume strongly against bet — skip
+
+            # ── RSI-14 direction confirmation (1m candles, Punisher) ─────────
+            # Contrarian: overbought RSI confirms DOWN bet, oversold confirms UP.
+            # Soft-only boost (no hard kill — RSI alone is noisy).
+            if RSI_ENABLED and _rsi is not None:
+                _rsi_confirm = ((_rsi > RSI_OVERBOUGHT and not buying_up) or
+                                (_rsi < RSI_OVERSOLD   and     buying_up))
+                if _rsi_confirm:
+                    confidence = min(confidence + RSI_CONF_BOOST, 1.0)
 
             # Arb-amplified priority: arb_score [0,1] adds up to +100% boost
             _whale_priority_mult = (WHALE_PRIORITY_BOOST
@@ -5372,6 +5508,12 @@ class CryptoGhostScanner:
             _freshness = (LATENCY_TRACKER.get_freshness_mult(coin, _direction)
                           if LATENCY_TRACK_ENABLED else 1.0)
             priority_score *= _freshness
+
+            # ── Preferred-coin priority boost ────────────────────────────────
+            # Lifts BTC/ETH over SOL/XRP-heavy noise. No effect if dict empty.
+            _coin_boost = PREFERRED_COINS_BOOST.get(coin.upper(), 1.0)
+            if _coin_boost != 1.0:
+                priority_score *= _coin_boost
 
             # ── Hard freshness gate ──────────────────────────────────────────────
             # Soft multiplier above only re-orders signals; stale signals still fire.
