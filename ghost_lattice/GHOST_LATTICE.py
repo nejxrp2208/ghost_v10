@@ -4737,6 +4737,7 @@ class CryptoGhostScanner:
                     "entry": ask,        "size":       size,
                     "fill_price": fill_price, "fill_size": fill_size,
                     "order_id": order_id, "ts": time.time(),
+                    "outcome": outcome,   # CRITICAL: T3 DOUBLE reads this to compute opposite leg
                 }
                 PERF_ANALYTICS.record_fill(token_id, fill_price, fill_size, ask)
                 if LATENCY_TRACK_ENABLED:
@@ -5703,9 +5704,27 @@ class CryptoGhostScanner:
             if opp_tid in self.open_positions or opp_tid in self._pending:
                 continue
 
-            # Determine opposite outcome
-            orig_outcome = (pos.get("outcome") or "UP").upper()
-            opp_outcome  = "DOWN" if orig_outcome in ("UP","YES","HIGHER","ABOVE") else "UP"
+            # Determine opp_outcome from opp_tid's actual token metadata.
+            # Authoritative — earlier path inverted pos.outcome with a "UP"
+            # fallback, which made every T3 fire DOWN when pos.outcome was
+            # missing/None (open_positions doesn't always carry outcome).
+            _up_aliases   = ("UP","YES","HIGHER","ABOVE")
+            _down_aliases = ("DOWN","NO","LOWER","BELOW")
+            opp_outcome = None
+            for _tok in (market.get("tokens") or []):
+                if not isinstance(_tok, dict):
+                    continue
+                if str(_tok.get("token_id") or _tok.get("id")) != str(opp_tid):
+                    continue
+                _o = (_tok.get("outcome") or "").upper()
+                if _o in _up_aliases:
+                    opp_outcome = "UP"
+                elif _o in _down_aliases:
+                    opp_outcome = "DOWN"
+                break
+            if opp_outcome is None:
+                continue   # token outcome metadata missing — don't guess
+            orig_outcome = (pos.get("outcome") or "?").upper()
 
             # Fetch opposite leg orderbook (fresh)
             book = await get_orderbook(session, opp_tid, max_age_ms=500)
