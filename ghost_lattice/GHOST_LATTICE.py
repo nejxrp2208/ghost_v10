@@ -6018,7 +6018,8 @@ class CryptoGhostScanner:
                     f"[{datetime.now().strftime('%H:%M:%S')}] Scan {self.scan_count}"
                     f" | Fired:{fired} | Skip ask:{skip_ask} cert:{skip_cert}"
                     f" liq:{skip_liq} win:{skip_win} vel:{skip_vel}"
-                    f" wsq:{skip_ws_qual} | Sig:{signals}"
+                    f" wsq:{skip_ws_qual} silent:{skip_silent} book:{skip_book}"
+                    f" | Sig:{signals}"
                     f" | {elapsed * 1000:.0f}ms{_balance_str}{_risk_str}"
                 )
                 print(f"         {prices_str}")
