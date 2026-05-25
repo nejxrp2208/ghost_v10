@@ -4901,7 +4901,14 @@ class CryptoGhostScanner:
                                   markets: List[dict]):
         fired     = 0
         skip_ask  = 0; skip_liq = 0; skip_cert = 0; skip_win = 0; signals = 0; skip_silent = 0; skip_vel = 0; skip_book = 0; skip_ws_qual = 0
+        skip_cert_tags: Dict[str, int] = {}   # per-tag cert-kill breakdown
         _recent_fires: dict = {}  # (coin,tier,direction) -> monotonic_ts
+
+        def _cert(tag: str):
+            """Increment skip_cert and record which gate killed the signal."""
+            nonlocal skip_cert
+            skip_cert += 1
+            skip_cert_tags[tag] = skip_cert_tags.get(tag, 0) + 1
 
         async def check_market(m):
             """
@@ -5014,10 +5021,10 @@ class CryptoGhostScanner:
             # 5-minute market flag — detected from title time range ≤ 5 min
             _is_5m = (tier == 2 and _mkt_dur_mins is not None and _mkt_dur_mins <= 5.5)
             if dev is None:
-                skip_cert += 1
+                _cert("dev_none")
                 return
             if abs(dev) < MIN_TREND_STRENGTH:
-                skip_cert += 1
+                _cert("dev_weak")
                 return
 
             # ── 15-minute trend confirmation (Punisher filter) ────────────────
@@ -5031,7 +5038,7 @@ class CryptoGhostScanner:
                     _15m_up = _dev_15m > 0
                     _5m_up  = dev > 0
                     if _15m_up != _5m_up:   # 15m opposes 5m direction
-                        skip_cert += 1
+                        _cert("15m_oppose")
                         return
 
             # Compute entry ceiling and intended size BEFORE orderbook fetch so
@@ -5211,21 +5218,21 @@ class CryptoGhostScanner:
 
                     # Momentum: are enough recent ticks aligned? (T3 threshold halved)
                     if abs(_mom) < _mom_min:
-                        skip_cert += 1
+                        _cert("mom_low")
                         return  # choppy / oscillating — not a clean trend
                     # T2 only: momentum direction must agree.
                     # T1 contrarian: momentum direction exempt (wider window, dev is primary signal).
                     if tier == 2:
                         if (buying_up and _mom < 0) or (not buying_up and _mom > 0):
-                            skip_cert += 1
+                            _cert("mom_dir")
                             return  # net tick direction contradicts our bet
 
                     # Volatility: market alive but not spiking?
                     if _vol < TREND_VOLATILITY_MIN:
-                        skip_cert += 1
+                        _cert("vol_low")
                         return  # flat/dead market
                     if _vol > TREND_VOLATILITY_MAX:
-                        skip_cert += 1
+                        _cert("vol_high")
                         return  # extreme spike noise
             # T4 daily: trend filter bypassed — edge is 24h open deviation only
             # ────────────────────────────────────────────────────────────────────
@@ -5233,32 +5240,32 @@ class CryptoGhostScanner:
             # ── Whole-coin skip (independent of BIAS_FILTERS) ──
             _coin_u = (coin or "").upper()
             if _coin_u in SKIP_COINS:
-                skip_cert += 1
+                _cert("skip_coin")
                 return  # silent — counted in scan summary
 
             # ── Per-coin daily trade cap — stop hammering same coin all day ──
             if MAX_TRADES_PER_COIN_DAY > 0:
                 _daily_coin = get_daily_coin_trades(_coin_u)
                 if _daily_coin >= MAX_TRADES_PER_COIN_DAY:
-                    skip_cert += 1
+                    _cert("daily_cap")
                     return  # silent — daily cap hit for this coin
 
             # ── Bias-aware filters (data-backed, on actual cheap side) ──
             if BIAS_FILTERS_ENABLED:
                 _h       = _et_hour()
                 if COIN_DIR.is_blocked(_coin_u, buying_up, tier):
-                    skip_cert += 1
+                    _cert("coin_dir")
                     return  # silent — CoinDirEngine auto-blocked this coin+direction
                 if buying_up and _h in DEAD_UP_HOURS_ET:
-                    skip_cert += 1
+                    _cert("dead_up")
                     return  # silent
                 if not buying_up and _h in DEAD_DOWN_HOURS_ET:
-                    skip_cert += 1
+                    _cert("dead_dn")
                     return  # silent
                 # ── Ghost Memory hour bias gate (v2: coin-aware) ───────────
                 _utc_h = datetime.now(timezone.utc).hour
                 if HOUR_BIAS.should_skip(buying_up, _utc_h, _coin_u):
-                    skip_cert += 1
+                    _cert("hour_bias")
                     return  # silent
 
             # Trend filter already gated above. Just final invariants.
@@ -5294,7 +5301,7 @@ class CryptoGhostScanner:
                 return
             # 5m certainty gate — active (hourly MIN_NO_PRICE gate is disabled)
             if _is_5m and no_implied < T2_5M_MIN_NO:
-                skip_cert += 1
+                _cert("5m_no")
                 return
             # Cumulative depth check: liq = sum of USDC at ask levels ≤ max_e.
             # Must cover the full intended bet size to avoid partial fills.
@@ -5316,7 +5323,7 @@ class CryptoGhostScanner:
             # T2 data: XRP disc≈0.433 (pass), BTC disc≈0.109 (borderline, now cut at 0.10).
             disc_score = abs(dev) / ask if ask > 0 else 0.0
             if ORACLE_DISC_ENABLED and tier == 2 and disc_score < ORACLE_DISC_MIN_RATIO:
-                skip_cert += 1
+                _cert("oracle_disc")
                 return
 
             # ── Oracle arbitrage score (PATH B) — runs FIRST so fair_p ──────────
@@ -5360,7 +5367,7 @@ class CryptoGhostScanner:
             # filter 4 — bad price zone: handled upstream by T*_MAX_ENTRY checks
             # filter 5 — late noise: hard floor across all tiers (T2 also has T2_MIN_SECS_LEFT)
             if secs < KILL_SECS_MIN:
-                skip_cert += 1
+                _cert("secs_min")
                 return
             # filter 6 — conflict: same coin+tier+direction fired recently
             # Akey et al: elite signals (arb_score >= ARB_OVERRIDE_SCORE) bypass cooldown.
@@ -5369,7 +5376,7 @@ class CryptoGhostScanner:
             _fire_age = time.monotonic() - _recent_fires.get(_fire_key, 0.0)
             _elite_bypass = ELITE_COOLDOWN_BYPASS and arb_score >= ARB_OVERRIDE_SCORE
             if _fire_age < KILL_COOLDOWN_SECS and not _elite_bypass:
-                skip_cert += 1
+                _cert("cooldown")
                 return
 
             # filter 7 — depth imbalance: skip if book is strongly against our direction
@@ -5380,19 +5387,19 @@ class CryptoGhostScanner:
                 # For DOWN bets: flip sign so same threshold applies in both directions
                 _dir_imb = _imb if buying_up else -_imb
                 if _dir_imb < KILL_DEPTH_IMBALANCE:
-                    skip_cert += 1
+                    _cert("depth_imb")
                     return
 
             # filter 8 — dev ceiling: underlying moved too much → oracle likely updated
             # Backtest: BTC_move >= 0.07% → 0% WR even in best entry range (0.05-0.08).
             if KILL_DEV_MAX > 0 and abs(dev) > KILL_DEV_MAX:
-                skip_cert += 1
+                _cert("dev_max")
                 return
 
             # filter 9 — velocity ceiling: BTC moving too fast = market makers repriced
             # Micro-lag arb edge lives at LOW velocity (oracle just starting to lag).
             if KILL_VELOCITY_MAX > 0 and _vel is not None and abs(_vel) > KILL_VELOCITY_MAX:
-                skip_cert += 1
+                _cert("vel_max")
                 return
 
             # ── Confidence score (6-component) ────────────────────────────────
@@ -5417,7 +5424,7 @@ class CryptoGhostScanner:
                 confidence = confidence * HOUR_REDUCE_FACTOR
 
             if confidence < _adap_eff_conf():
-                skip_cert += 1
+                _cert("conf")
                 return
 
             # ── Dynamic position sizing ────────────────────────────────────────
@@ -5478,7 +5485,7 @@ class CryptoGhostScanner:
                 if _obv_align > 0.30:
                     confidence = min(confidence + OBV_CONF_BOOST, 1.0)
                 elif _obv_align < OBV_KILL_THRESH:
-                    skip_cert += 1
+                    _cert("obv_kill")
                     return  # volume strongly against bet — skip
 
             # ── RSI-14 direction confirmation (1m candles, Punisher) ─────────
@@ -5523,7 +5530,7 @@ class CryptoGhostScanner:
             if LATENCY_TRACK_ENABLED:
                 _move_age = LATENCY_TRACKER.get_move_age_secs(coin, _direction)
                 if _move_age > KILL_FRESHNESS_SECS:
-                    skip_cert += 1
+                    _cert("freshness")
                     return
             # Mark this (coin,tier,direction) as recently fired for conflict filter
             _recent_fires[_fire_key] = time.monotonic()
@@ -5652,7 +5659,7 @@ class CryptoGhostScanner:
                 fired += 1
                 await asyncio.sleep(0.3)
 
-        return fired, skip_ask, skip_liq, skip_cert, skip_win, signals, skip_silent, skip_vel, skip_book, skip_ws_qual
+        return fired, skip_ask, skip_liq, skip_cert, skip_win, signals, skip_silent, skip_vel, skip_book, skip_ws_qual, skip_cert_tags
 
     async def _check_t3_double(self, session: aiohttp.ClientSession,
                                 markets: List[dict]) -> int:
@@ -5965,8 +5972,13 @@ class CryptoGhostScanner:
 
                     result = await asyncio.wait_for(
                         self.scan_updown_markets(session, markets), timeout=30.0)
+                    _cert_tags: Dict[str, int] = {}
                     if isinstance(result, tuple):
-                        t234_fired, _sa, _sl, _sc, _sw, _sig, _ss, _sv, _sb, _swq = result
+                        # Backwards compatible: accept 10-tuple (legacy) or 11-tuple (with cert tags).
+                        if len(result) >= 11:
+                            t234_fired, _sa, _sl, _sc, _sw, _sig, _ss, _sv, _sb, _swq, _cert_tags = result[:11]
+                        else:
+                            t234_fired, _sa, _sl, _sc, _sw, _sig, _ss, _sv, _sb, _swq = result
                     else:
                         t234_fired = result or 0
                         _sa = _sl = _sc = _sw = _sig = _ss = _sv = _sb = _swq = 0
@@ -5977,7 +5989,9 @@ class CryptoGhostScanner:
                     skip_cert    += _sc
                     skip_win     += _sw
                     signals      += _sig
+                    skip_silent  += _ss
                     skip_vel     += _sv
+                    skip_book    += _sb
                     skip_ws_qual += _swq
 
                     # \u2500\u2500 T3 DOUBLE check: hedge already-open positions \u2500\u2500\u2500\u2500\u2500
@@ -6014,9 +6028,15 @@ class CryptoGhostScanner:
                     elif self.consecutive_losses >= LOSS_STREAK_REDUCE:
                         _risk_str = (f"  \u26a0{self.consecutive_losses}L"
                                      f"@{LOSS_SIZE_FACTOR:.0%}")
+                # Build cert breakdown only if there were cert kills this scan.
+                _cert_str = ""
+                if _cert_tags:
+                    _parts = [f"{k}:{v}" for k, v in sorted(
+                        _cert_tags.items(), key=lambda kv: kv[1], reverse=True)]
+                    _cert_str = f"({','.join(_parts)})"
                 print(
                     f"[{datetime.now().strftime('%H:%M:%S')}] Scan {self.scan_count}"
-                    f" | Fired:{fired} | Skip ask:{skip_ask} cert:{skip_cert}"
+                    f" | Fired:{fired} | Skip ask:{skip_ask} cert:{skip_cert}{_cert_str}"
                     f" liq:{skip_liq} win:{skip_win} vel:{skip_vel}"
                     f" wsq:{skip_ws_qual} silent:{skip_silent} book:{skip_book}"
                     f" | Sig:{signals}"
