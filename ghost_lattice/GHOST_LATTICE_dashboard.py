@@ -876,7 +876,11 @@ async def main():
 
     prev_open = prev_wins = 0
 
-    with Live(layout, console=console, refresh_per_second=1, screen=False):
+    # screen=True uses the alt-screen buffer (like vim/htop), which is much
+    # more reliable over SSH — inline rendering with screen=False gets out of
+    # sync on slow connections and looks like a freeze. Refresh slowed to 2s
+    # to lighten DB-read contention against the scanner.
+    with Live(layout, console=console, refresh_per_second=0.5, screen=True):
         while True:
             try:
                 now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
