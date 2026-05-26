@@ -566,7 +566,7 @@ def render_open_positions():
                   Text.from_markup("[bold red]DOWN[/]")   if side == "DOWN" else
                   Text.from_markup("[dim]?[/]"))
         t.add_row(str(rid),
-                  Text(str(q)[:42], overflow="ellipsis"),
+                  Text(str(q)[:60], overflow="ellipsis"),
                   Text.from_markup(f"[{col}]T{tier}·{tn} {coin}[/]"),
                   side_t, f"${size:.2f}", f"${entry:.3f}", pay, tstr)
 
@@ -855,7 +855,7 @@ async def main():
     )
     layout["top"].split_row(
         Layout(name="stats",     ratio=2),
-        Layout(name="positions", ratio=3),
+        Layout(name="positions", ratio=4),
         Layout(name="odds",      ratio=3),
     )
     layout["bottom"].split_row(
