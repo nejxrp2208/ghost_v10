@@ -622,6 +622,6 @@ async def run():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(run())
     except KeyboardInterrupt:
         print("\n[STOPPED] Redeemer stopped.")
