@@ -331,6 +331,7 @@ def db_connect():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")   # concurrent reader + writer safe
     conn.execute("PRAGMA busy_timeout=15000") # wait up to 15s instead of failing
+    conn.execute("PRAGMA wal_autocheckpoint=100")  # prevent WAL bloat
     return conn
 
 def ensure_schema():
@@ -783,38 +784,47 @@ def close_trade(trade_id, status, pnl, p_start, p_end,
     clobbered if it set it earlier.
     """
     code = RESOLUTION_CODE.get(source, 1)
-    try:
-        conn = db_connect()
-        conn.execute("""
-            UPDATE trades
-            SET status = ?,
-                pnl = ?,
-                closed_at = ?,
-                price_start = ?,
-                price_end = ?,
-                resolution_verified = ?,
-                condition_id = CASE
-                    WHEN (condition_id IS NULL OR condition_id = '')
-                    THEN ?
-                    ELSE condition_id
-                END
-            WHERE id = ?
-        """, (
-            status, pnl,
-            datetime.now(timezone.utc).isoformat(),
-            p_start, p_end,
-            code,
-            condition_id,
-            trade_id
-        ))
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        print(f"[WARN] DB write failed: {e}")
-        return False
+    params = (
+        status, pnl,
+        datetime.now(timezone.utc).isoformat(),
+        p_start, p_end,
+        code,
+        condition_id,
+        trade_id
+    )
+    for attempt in range(3):
+        conn = None
+        try:
+            conn = db_connect()
+            conn.execute("""
+                UPDATE trades
+                SET status = ?,
+                    pnl = ?,
+                    closed_at = ?,
+                    price_start = ?,
+                    price_end = ?,
+                    resolution_verified = ?,
+                    condition_id = CASE
+                        WHEN (condition_id IS NULL OR condition_id = '')
+                        THEN ?
+                        ELSE condition_id
+                    END
+                WHERE id = ?
+            """, params)
+            conn.commit()
+            return True
+        except Exception as e:
+            if attempt < 2:
+                import time as _t; _t.sleep(0.5 * (attempt + 1))
+            else:
+                print(f"[DB-CRITICAL] close_trade failed 3x for #{trade_id} {status}: {e}")
+                return False
 
 
+        finally:
+            if conn:
+                try: conn.close()
+                except Exception: pass
 async def verify_against_pm_gamma(session, trade_id: int, token_id: str,
                                    market_id: str, local_status: str,
                                    local_pnl: float, size: float,
@@ -854,23 +864,63 @@ async def verify_against_pm_gamma(session, trade_id: int, token_id: str,
               f"{PM_VERIFY_RETRY} attempts (PM still pending)")
         # Don't leave the user in silence — send the local Chainlink call
         # marked as unverified so they at least know the trade closed.
-        # PM verify timed out — already resolved by Chainlink, no extra alert needed.
+        if TELEGRAM_ENABLED:
+            tg_icon = "[WIN]" if local_status == "won" else "[LOSS]"
+            tag = {"chainlink":"[CL]","coinbase":"[CB]","binance_fallback":"[BIN]"}.get(src_tag, "[?]")
+            price_line = ""
+            if p_start and p_end:
+                pc = ((p_end - p_start)/p_start)*100
+                price_line = f"\n{p_start:.2f} -> {p_end:.2f} ({pc:+.3f}%)"
+            try:
+                await _tg_send(
+                    f"{tg_icon} <b>T{tier} {coin} {side}</b> "
+                    f"{local_status.upper()} <code>${local_pnl:+.2f}</code> {tag} [UNVERIFIED]\n"
+                    f"PM gamma didn't respond -- local call may be wrong.\n"
+                    f"{(question or '')[:80]}{price_line}"
+                )
+            except Exception:
+                pass
         return
 
     if pm_status == local_status:
         # Match — just stamp the verification code so audits can see it
-        try:
-            conn = db_connect()
-            conn.execute("""
-                UPDATE trades SET resolution_verified = ?
-                WHERE id = ? AND status = ?
-            """, (RESOLUTION_CODE["pm_gamma_confirm"], trade_id, local_status))
-            conn.commit()
-            conn.close()
-            print(f"[PM-VERIFY] [OK] #{trade_id} {coin} {side} PM={pm_status} "
-                  f"matches local -- confirmed (settled={pm_settled})")
-        except Exception as e:
-            print(f"[PM-VERIFY] DB stamp failed: {e}")
+        for attempt in range(3):
+            conn = None
+            try:
+                conn = db_connect()
+                conn.execute("""
+                    UPDATE trades SET resolution_verified = ?
+                    WHERE id = ? AND status = ?
+                """, (RESOLUTION_CODE["pm_gamma_confirm"], trade_id, local_status))
+                conn.commit()
+                print(f"[PM-VERIFY] [OK] #{trade_id} {coin} {side} PM={pm_status} "
+                      f"matches local -- confirmed (settled={pm_settled})")
+                break
+            except Exception as e:
+                if attempt < 2:
+                    import time as _t; _t.sleep(0.5 * (attempt + 1))
+                else:
+                    print(f"[PM-VERIFY] DB stamp failed 3x #{trade_id}: {e}")
+        # Send Telegram with PM-verified result (matched local)
+            finally:
+                if conn:
+                    try: conn.close()
+                    except Exception: pass
+        if TELEGRAM_ENABLED:
+            tg_icon = "[WIN]" if local_status == "won" else "[LOSS]"
+            tag = {"chainlink":"[CL]","coinbase":"[CB]","binance_fallback":"[BIN]"}.get(src_tag, "[?]")
+            price_line = ""
+            if p_start and p_end:
+                pc = ((p_end - p_start)/p_start)*100
+                price_line = f"\n{p_start:.2f} -> {p_end:.2f} ({pc:+.3f}%)"
+            try:
+                await _tg_send(
+                    f"{tg_icon} <b>T{tier} {coin} {side}</b> "
+                    f"{local_status.upper()} <code>${local_pnl:+.2f}</code> {tag} [PM-OK]\n"
+                    f"{(question or '')[:80]}{price_line}"
+                )
+            except Exception:
+                pass
         return
 
     # ── OVERRIDE — PM disagrees with local resolution ──
@@ -884,22 +934,31 @@ async def verify_against_pm_gamma(session, trade_id: int, token_id: str,
     print(f"[PM-VERIFY] *** OVERRIDE #{trade_id} {coin} {side}: "
           f"local={local_status} ${local_pnl:+.2f} → PM={pm_status} ${new_pnl:+.2f} "
           f"(delta ${delta:+.2f}, settled={pm_settled})")
-    try:
-        conn = db_connect()
-        conn.execute("""
-            UPDATE trades
-            SET status = ?, pnl = ?,
-                resolution_verified = ?
-            WHERE id = ?
-        """, (pm_status, new_pnl,
-              RESOLUTION_CODE["pm_gamma_override"], trade_id))
-        conn.commit()
-        conn.close()
-        log_event(new_icon, f"PM override #{trade_id} {coin}: {local_status}→{pm_status} "
-                            f"${delta:+.2f}")
-    except Exception as e:
-        print(f"[PM-VERIFY] DB override failed: {e}")
+    for attempt in range(3):
+        conn = None
+        try:
+            conn = db_connect()
+            conn.execute("""
+                UPDATE trades
+                SET status = ?, pnl = ?,
+                    resolution_verified = ?
+                WHERE id = ?
+            """, (pm_status, new_pnl,
+                  RESOLUTION_CODE["pm_gamma_override"], trade_id))
+            conn.commit()
+            log_event(new_icon, f"PM override #{trade_id} {coin}: {local_status}→{pm_status} "
+                                f"${delta:+.2f}")
+            break
+        except Exception as e:
+            if attempt < 2:
+                import time as _t; _t.sleep(0.5 * (attempt + 1))
+            else:
+                print(f"[PM-VERIFY] DB override failed 3x #{trade_id}: {e}")
     # Send Telegram with PM's corrected outcome
+        finally:
+            if conn:
+                try: conn.close()
+                except Exception: pass
     if TELEGRAM_ENABLED:
         try:
             await _tg_send(
@@ -971,6 +1030,112 @@ async def _sync_balance_after_win(trade_id: int, coin: str, tier: int,
         print(f"[{ts}] [WARN] Post-win balance sync error: {e}")
 
 
+# ── WS fast-resolution — shared state ────────────────────────────────────────
+# token_id → True (won) / False (lost), set by ws_resolution_watch().
+# Poll loop checks this first; if present it bypasses RESOLUTION_GRACE_SECS
+# and jumps straight to PM gamma verify (which will now return a real result).
+_ws_settled: dict = {}
+_WS_RESOLVE_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+
+async def ws_resolution_watch():
+    """Subscribe to open-position token IDs on the CLOB WS.
+    When any token's best-bid jumps to >=0.95 (won) or best-ask collapses
+    to <=0.02 with no bids (lost), flag it in _ws_settled so the poll loop
+    resolves immediately without waiting full RESOLUTION_GRACE_SECS.
+    Falls back silently if WS drops — polling handles everything as before.
+    """
+    import json as _json
+    while True:
+        try:
+            async with aiohttp.ClientSession() as _sess:
+                async with _sess.ws_connect(
+                        _WS_RESOLVE_URL, heartbeat=20,
+                        timeout=aiohttp.ClientTimeout(total=None)) as ws:
+                    print("[WS-RES] connected — fast settlement watcher active")
+                    _subscribed: set = set()
+
+                    while True:
+                        # Refresh open token IDs from DB every 15s
+                        try:
+                            _c = db_connect()
+                            _rows = _c.execute(
+                                "SELECT token_id FROM trades "
+                                "WHERE status='open' AND token_id != ''"
+                            ).fetchall()
+                            _c.close()
+                            _live = {r[0] for r in _rows if r[0]}
+                        except Exception:
+                            _live = set()
+
+                        # Subscribe to any new token IDs not yet watched
+                        _new = _live - _subscribed
+                        if _new:
+                            await ws.send_json({"type": "market",
+                                                "assets_ids": list(_new)})
+                            _subscribed.update(_new)
+                            print(f"[WS-RES] watching {len(_subscribed)} token(s)")
+
+                        # Read next WS message; 15s timeout triggers subscription refresh
+                        try:
+                            msg = await asyncio.wait_for(ws.receive(), timeout=15)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        if msg.type in (aiohttp.WSMsgType.CLOSED,
+                                        aiohttp.WSMsgType.ERROR):
+                            break
+
+                        try:
+                            data = _json.loads(msg.data)
+                        except Exception:
+                            continue
+
+                        events = data if isinstance(data, list) else [data]
+                        for ev in events:
+                            if not isinstance(ev, dict):
+                                continue
+                            ev_type = (ev.get("event_type") or
+                                       ev.get("type") or "").lower()
+                            if ev_type != "book":
+                                continue
+                            tid = str(ev.get("asset_id") or
+                                      ev.get("token_id") or "")
+                            if not tid or tid not in _live or tid in _ws_settled:
+                                continue
+
+                            bids = ev.get("bids") or []
+                            asks = ev.get("asks") or []
+
+                            def _best(side, fn):
+                                try:
+                                    vals = [float(x["price"]
+                                            if isinstance(x, dict) else x)
+                                            for x in side]
+                                    return fn(vals) if vals else None
+                                except Exception:
+                                    return None
+
+                            best_bid = _best(bids, max)
+                            best_ask = _best(asks, min)
+                            _ts = datetime.now().strftime("%H:%M:%S")
+
+                            if best_bid is not None and best_bid >= 0.95:
+                                print(f"[{_ts}] [WS-RES] WIN  {tid[:16]}... "
+                                      f"bid={best_bid:.3f} — grace bypassed")
+                                _ws_settled[tid] = True
+
+                            elif (best_ask is not None and best_ask <= 0.02
+                                  and not bids):
+                                print(f"[{_ts}] [WS-RES] LOSS {tid[:16]}... "
+                                      f"ask={best_ask:.3f} — grace bypassed")
+                                _ws_settled[tid] = False
+
+        except Exception as e:
+            print(f"[WS-RES] disconnected: {e} — retry in 10s")
+            await asyncio.sleep(10)
+
+
 async def main():
     tg     = "ON" if TELEGRAM_ENABLED else "off"
     verify = "ON" if PM_VERIFY else "off"
@@ -989,6 +1154,10 @@ async def main():
     await asyncio.to_thread(CHAINLINK._connect)
 
     ensure_schema()
+
+    # Launch WS fast-resolution watcher as background task.
+    # Runs independently — if it crashes the poll loop continues unaffected.
+    _ws_task = asyncio.create_task(ws_resolution_watch())
 
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -1040,6 +1209,12 @@ async def main():
                                 continue
                             secs_after = (now_utc - end_utc).total_seconds()
 
+                        # ── WS fast-path: bypass grace if WS already flagged settled ──
+                        if token_id and token_id in _ws_settled:
+                            secs_after = max(secs_after, float(RESOLUTION_GRACE_SECS))
+                            print(f"[{ts}] [WS-RES] fast-path triggered for "
+                                  f"T{tier} {coin} #{trade_id} — skipping grace")
+
                         # v12.2: wait RESOLUTION_GRACE_SECS after close so UMA
                         # fully settles before reading outcomePrices from gamma.
                         if secs_after < RESOLUTION_GRACE_SECS:
@@ -1060,14 +1235,11 @@ async def main():
                         resolution_source = None
 
                         pm_status, _pm_settled = await resolve_via_polymarket(
-                            session, token_id, market_id
-                        )
+                            session, token_id, market_id)
+
                         if pm_status in ("won", "lost"):
                             status = pm_status
                             resolution_source = "pm"
-                            # Best-effort Chainlink read for diagnostic price
-                            # logging only. Failing this is fine — settlement
-                            # already reflects PM truth.
                             try:
                                 p_start, p_end = await get_chainlink_prices(
                                     coin, start_utc, end_utc)
@@ -1075,87 +1247,83 @@ async def main():
                                 p_start = p_end = None
 
                         if status == "pending":
-                            # <60s past close, or all 3 sources unreachable — retry.
                             print(f"[{ts}] [--] T{tier} {coin} #{trade_id} {side} | "
                                   f"closed {secs_after:.0f}s ago, waiting for price")
                             continue
+
                         if status not in ("won", "lost"):
                             continue
 
                         if status == "won":
-                            pnl = round(size / entry - size, 2)
+                            pnl  = round(size / entry - size, 2)
                             icon = "[WIN]"
                         else:
-                            pnl = -size
+                            pnl  = -size
                             icon = "[LOSS]"
 
-                        # Best-effort condition_id backfill — only for live, only if missing.
-                        cid = existing_cid or ""
+                        cid = existing_cid
                         if not PAPER_TRADE and not cid:
                             try:
-                                cid = await fetch_condition_id(session, token_id, market_id)
+                                cid = await fetch_condition_id(
+                                    session, token_id, market_id)
                             except Exception:
                                 cid = ""
 
-                        wrote_ok = close_trade(trade_id, status, pnl, p_start, p_end,
-                                               cid, source=resolution_source or "")
+                        wrote_ok = close_trade(
+                            trade_id, status, pnl,
+                            p_start, p_end, cid,
+                            resolution_source)
                         if not wrote_ok:
-                            # DB locked by redeemer — skip logging, retry next poll
-                            print(f"[{ts}] [WARN] DB write failed for #{trade_id}, "
-                                  f"will retry next poll")
+                            print(f"[{ts}] [WARN] DB write failed for #{trade_id}"
+                                  f", will retry next poll")
                             continue
 
-                        # After a win, schedule a background balance sync ~90s later.
-                        # The bet cost is deducted instantly; the CLOB payout takes
-                        # 1-3 min. This nudges the CLOB to re-read on-chain pUSD
-                        # so the dashboard shows the credit without waiting for the
-                        # next auto-refresh cycle.
-                        if status == "won" and not PAPER_TRADE:
-                            asyncio.create_task(_sync_balance_after_win(
-                                trade_id, coin, tier, pnl, size, entry))
+                        # Clean up WS fast-path entry now that trade is resolved
+                        _ws_settled.pop(token_id, None)
 
-                        # v12: CLOB-only — every settlement is already PM truth,
-                        # so the verify-after-the-fact background task is
-                        # redundant and disabled. (Code retained in file for
-                        # callers that may invoke it directly.)
+                        if status == "won" and not PAPER_TRADE:
+                            asyncio.create_task(
+                                _sync_balance_after_win(
+                                    trade_id, coin, tier, pnl, size, entry))
 
                         if p_start and p_end:
-                            price_change = ((p_end - p_start) / p_start) * 100
-                            price_str = f"${p_start:.2f} → ${p_end:.2f} ({price_change:+.3f}%)"
-                            tg_price  = f"{p_start:.2f} → {p_end:.2f} ({price_change:+.3f}%)"
+                            price_change = (p_end - p_start) / p_start * 100
+                            price_str = (f"${p_start:.2f} → ${p_end:.2f} "
+                                         f"({price_change:+.3f}%)")
+                            tg_price  = (f"{p_start:.2f} → {p_end:.2f} "
+                                         f"({price_change:+.3f}%)")
                         else:
                             price_change = 0.0
-                            price_str = "(price n/a)"
-                            tg_price  = ""
-                        src_tag = {
-                            "pm":               "[PM]",
-                            "chainlink":        "[CL]",
-                            "coinbase":         "[CB]",
-                            "binance_fallback": "[BIN]",
-                        }.get(resolution_source, "[?]")
+                            price_str    = "(price n/a)"
+                            tg_price     = ""
+
+                        src_tag = {"pm": "[PM]", "chainlink": "[CL]",
+                                   "coinbase": "[CB]",
+                                   "binance_fallback": "[BIN]"}.get(
+                            resolution_source, "[?]")
+
                         print(f"[{ts}] {icon} T{tier} {coin} #{trade_id} {side} | "
                               f"{status.upper()} ${pnl:+.2f} {src_tag} | {price_str}")
+
                         if cid:
                             print(f"          condition_id = {cid[:18]}...")
 
-                        # Dedup: only log + Telegram the FIRST occurrence of each
-                        # token_id per poll cycle. Duplicates (same market fired
-                        # multiple times) are closed in DB but silently suppressed
-                        # in the activity panel.
                         _is_dup = token_id in _seen_tokens
                         _seen_tokens.add(token_id)
-                        if not _is_dup:
-                            log_event(icon, f"T{tier} {coin} {status} ${pnl:+.2f} {src_tag}")
 
-                        if not _is_dup and TELEGRAM_ENABLED:
+                        if not _is_dup:
+                            log_event(icon,
+                                      f"T{tier} {coin} {status} ${pnl:+.2f} {src_tag}")
+
+                        # Send telegram now if PM settled it directly (authoritative),
+                        # or if PM_VERIFY is disabled. Never send for duplicate tokens.
+                        send_now = (resolution_source == "pm"
+                                    or not PM_VERIFY) and not _is_dup
+                        if send_now and TELEGRAM_ENABLED:
                             verb   = "WON" if status == "won" else "LOST"
                             emoji  = "✅" if status == "won" else "❌"
-                            msg    = (
-                                f"👻 <b>GHOST LATTICE</b> | {emoji} <b>T{tier} {coin} {verb}</b>\n"
-                                f"PnL <code>${pnl:+.2f}</code>  "
-                                f"Entry <code>${entry:.3f}</code>  {src_tag}\n"
-                                f"{tg_price}"
-                            )
+                            msg    = (f"{emoji} T{tier} {coin} {verb} ${pnl:+.2f} "
+                                      f"@ ${entry:.3f} | {tg_price} {src_tag}")
                             asyncio.create_task(_tg_send(msg))
 
                         await asyncio.sleep(0.2)
@@ -1164,7 +1332,6 @@ async def main():
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] [ERR] resolver loop: {e}")
 
             await asyncio.sleep(POLL_INTERVAL)
-
 
 
 if __name__ == "__main__":

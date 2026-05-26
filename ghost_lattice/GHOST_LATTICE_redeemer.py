@@ -136,6 +136,7 @@ def _db_connect():
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=15000")
+    conn.execute("PRAGMA wal_autocheckpoint=100")  # prevent WAL bloat
     return conn
 
 def ensure_schema():
@@ -171,36 +172,47 @@ def log_event(icon, msg):
 def mark_redeemed(condition_id: str, tx_hash: str):
     """Mark position as redeemed in both trades table AND redeemed_conditions table.
     The redeemed_conditions table is the persistent dedup store — it never misses
-    even when no matching trade row exists (e.g. positions redeemed from old dbs)."""
+    even when no matching trade row exists (e.g. positions redeemed from old dbs).
+    Retries 3x with backoff — on-chain tx already submitted, MUST write to DB."""
+    import time as _t
     now = datetime.now(timezone.utc).isoformat()
-    try:
-        conn = _db_connect()
-        # Update trades if a matching row exists
-        conn.execute(
-            "UPDATE trades SET redeemed=1, redeemed_at=?, redeem_tx_hash=?, condition_id=? "
-            "WHERE (condition_id=? OR token_id LIKE ?) AND status='won' AND COALESCE(redeemed,0)=0",
-            (now, tx_hash, condition_id, condition_id, f"%{condition_id[-20:]}%")
-        )
-        # Always write to redeemed_conditions — this is the restart-safe dedup store
+    for attempt in range(3):
+        conn = None
         try:
+            conn = _db_connect()
+            # Update trades if a matching row exists
             conn.execute(
-                "CREATE TABLE IF NOT EXISTS redeemed_conditions "
-                "(condition_id TEXT PRIMARY KEY, status TEXT, attempt_count INTEGER, "
-                "last_attempt TEXT, tx_hash TEXT, cash_pnl REAL)"
+                "UPDATE trades SET redeemed=1, redeemed_at=?, redeem_tx_hash=?, condition_id=? "
+                "WHERE (condition_id=? OR token_id LIKE ?) AND status='won' AND COALESCE(redeemed,0)=0",
+                (now, tx_hash, condition_id, condition_id, f"%{condition_id[-20:]}%")
             )
-        except Exception:
-            pass
-        conn.execute(
-            "INSERT OR REPLACE INTO redeemed_conditions "
-            "(condition_id, status, attempt_count, last_attempt, tx_hash, cash_pnl) "
-            "VALUES (?, 'redeemed', 1, ?, ?, 0)",
-            (condition_id, now, tx_hash)
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"[WARN] mark_redeemed: {e}")
+            # Always write to redeemed_conditions — this is the restart-safe dedup store
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS redeemed_conditions "
+                    "(condition_id TEXT PRIMARY KEY, status TEXT, attempt_count INTEGER, "
+                    "last_attempt TEXT, tx_hash TEXT, cash_pnl REAL)"
+                )
+            except Exception:
+                pass
+            conn.execute(
+                "INSERT OR REPLACE INTO redeemed_conditions "
+                "(condition_id, status, attempt_count, last_attempt, tx_hash, cash_pnl) "
+                "VALUES (?, 'redeemed', 1, ?, ?, 0)",
+                (condition_id, now, tx_hash)
+            )
+            conn.commit()
+            return  # success
+        except Exception as e:
+            if attempt < 2:
+                _t.sleep(0.5 * (attempt + 1))
+            else:
+                print(f"[DB-CRITICAL] mark_redeemed failed 3x for {condition_id[:20]}: {e}")
 
+        finally:
+            if conn:
+                try: conn.close()
+                except Exception: pass
 def get_unredeemed_condition_ids() -> set:
     """Return all condition_ids already redeemed — checks both tables so
     no position is ever double-redeemed across restarts."""
@@ -608,9 +620,8 @@ async def run():
                 print(f"[Redeemer] Error in main loop: {e}")
                 await asyncio.sleep(POLL_INTERVAL)
 
-
 if __name__ == "__main__":
     try:
-        asyncio.run(run())
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("\n[STOPPED] Redeemer stopped.")

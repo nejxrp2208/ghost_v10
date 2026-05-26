@@ -20,6 +20,24 @@ Edge: Chainlink updates every ~5 min. Binance is real-time.
 Config: .env (root) | DB: GHOST_LATTICE.db | Bot: GHOST_LATTICE_dashboard.py
 """
 
+# ── Singleton guard (L82) — prevents duplicate processes from dual-launch ──
+import os as _os, sys as _sys
+_PID_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".scanner.pid")
+def _singleton():
+    if _os.path.exists(_PID_FILE):
+        try:
+            _old = int(open(_PID_FILE).read().strip())
+            _os.kill(_old, 0)
+            print(f"[SINGLETON] Scanner already running (PID {_old}). Exiting.")
+            _sys.exit(0)
+        except (OSError, ProcessLookupError, ValueError):
+            pass
+    open(_PID_FILE, "w").write(str(_os.getpid()))
+    import atexit as _at
+    _at.register(lambda: _os.unlink(_PID_FILE) if _os.path.exists(_PID_FILE) else None)
+_singleton()
+# ── End singleton guard ────────────────────────────────────────────────────
+
 import asyncio
 import aiohttp
 import json
@@ -47,6 +65,12 @@ except ImportError:
 # ─── WINDOWS FIX ──────────────────────────────────────────────────────────────
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+# ─── IN-PROCESS FIRE LOCK (Windows-safe, replaces fcntl) ──────────────────────
+# Tracks token_ids currently being fired in THIS process.
+# Prevents duplicate coroutines from passing the dedup check simultaneously.
+# Cross-process protection is handled by the DB UNIQUE INDEX below (idx_one_open_per_token).
+_FIRING_TOKENS: set = set()
 
 # ─── LOAD .ENV ────────────────────────────────────────────────────────────────
 try:
@@ -111,37 +135,29 @@ WHALE_WALLETS: list = [
 # How many seconds a whale trade stays "fresh" for signal boosting
 WHALE_SIGNAL_TTL      = float(os.getenv("WHALE_SIGNAL_TTL", "120"))
 # Priority boost multiplier when a whale recently traded this market (same direction)
-WHALE_PRIORITY_BOOST  = float(os.getenv("WHALE_PRIORITY_BOOST", "1.20"))
+# Raised to 1.80 — whale confirmation is now the sole ranking differentiator (coin boost removed 2026-05-22)
+WHALE_PRIORITY_BOOST  = float(os.getenv("WHALE_PRIORITY_BOOST", "1.80"))
 # Confidence boost when whale direction matches ours
 WHALE_CONF_BOOST      = float(os.getenv("WHALE_CONF_BOOST", "0.03"))
-
-# ── Preferred coin priority boost ────────────────────────────────────────────
-# Lifts BTC/ETH priority_score to compete with SOL/XRP signal volume.
-# Format: "BTC:1.20,ETH:1.15" → {"BTC": 1.20, "ETH": 1.15}. Empty = no boost.
-_PREFERRED_RAW = os.getenv("PREFERRED_COINS_BOOST", "").strip()
-PREFERRED_COINS_BOOST: dict = {}
-for _pc in _PREFERRED_RAW.split(","):
-    _pc = _pc.strip()
-    if ":" in _pc:
-        _coin_part, _mult_part = _pc.split(":", 1)
-        try:
-            PREFERRED_COINS_BOOST[_coin_part.strip().upper()] = float(_mult_part.strip())
-        except ValueError:
-            pass
-if PREFERRED_COINS_BOOST:
-    print(f"[ENV] PREFERRED_COINS_BOOST = {PREFERRED_COINS_BOOST}")
-
+# PREFERRED_COINS_BOOST deleted 2026-05-22 — whale boost carries ranking; coin type should not bias entry
 # In-memory cache: condition_id -> {"direction": "up"/"down"/"both", "ts": float, "wallet": str}
 _whale_signals: dict = {}
 CLOB_API          = "https://clob.polymarket.com"
 # Skip first 1000 old markets in CLOB API (they are old resolved sports markets)
 # Recent April 2026 crypto markets start appearing after offset 1000
 CLOB_START_CURSOR = "MTAwMA=="
-BINANCE_REST    = "https://api.binance.com/api/v3"   # .com = 10-20ms vs .us 150-400ms
-BINANCE_WS_URL  = (
-    "wss://stream.binance.com:9443/stream?streams="  # .com: lower latency, stable WS
+BINANCE_REST    = os.getenv(
+    "BINANCE_REST",
+    "https://api.binance.com/api/v3",          # default: .com (10-20ms latency)
+    # US users blocked by geo: set BINANCE_REST=https://api.binance.us/api/v3 in .env
+    # or use a VPN (recommended — preserves oracle-lag edge)
+)
+BINANCE_WS_URL  = os.getenv(
+    "BINANCE_WS_URL",
+    "wss://stream.binance.com:9443/stream?streams="   # default: .com (lower latency)
     "btcusdt@ticker/ethusdt@ticker/bnbusdt@ticker"
-    "/xrpusdt@ticker/solusdt@ticker"  # XRP + SOL live feed added
+    "/xrpusdt@ticker/solusdt@ticker",
+    # US users blocked by geo: set BINANCE_WS_URL=wss://stream.binance.us:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/bnbusdt@ticker/xrpusdt@ticker/solusdt@ticker
 )
 
 # ── Trade sizing per tier ──
@@ -158,10 +174,8 @@ T2_SIZE_PER_COIN = {
     "ETH": float(os.getenv("T2_SIZE_ETH", "3.0")),  # flat $3 — uniform sizing for dual-fire data collection
 }
 
-# ── Hour-of-day T2 size multiplier (Ghost Bot forensics, 2026-05-10) ─────────
-# Scale actual dollar bet size during statistically strong ET hours.
-# Uses the same ET scale as HOUR_BOOST_HOURS_ET. OFF by default until
-# we have 30+ live T2 fires to validate our own hour distribution.
+# ── Hour-of-day size multiplier (Ghost Bot forensics, 2026-05-10) ────────────
+# Hour boost removed 2026-05-22 — simplicity pass. Flat sizing only.
 # Example .env entries: T2_SIZE_HOUR_MULT_23=1.5  T2_SIZE_HOUR_MULT_21=1.3
 # Ghost Bot finding: UTC hour 8 = 85% of their PnL. Our best = 23/21/17 ET.
 T2_SIZE_HOUR_MULTS: dict = {}
@@ -200,21 +214,6 @@ T2_5M_WINDOW_SEC = float(os.getenv("T2_5M_WINDOW_SEC", "45"))    # 5m: fire only
 DUAL_FIRE_ENABLED   = os.getenv("DUAL_FIRE_ENABLED",   "true").lower() == "true"
 DUAL_FIRE_MAX_ENTRY = float(os.getenv("DUAL_FIRE_MAX_ENTRY", "0.02"))
 
-# ── T3 DOUBLE — insurance hedge on already-open positions ──────────────────
-# Separate from DUAL_FIRE: hardcoded bypass of all soft gates (SKIP_DOWN,
-# HourBias, CoinDir, confidence, freshness, cooldown) — fires SOLELY when:
-#   1. We already hold one leg of a market (UP or DOWN), AND
-#   2. The opposite leg's ask is within [MIN, MAX] range, AND
-#   3. Book has enough liquidity to fill T3_DOUBLE_SIZE_USDC.
-# Strategy: when DOWN side drops to cheap range, add $1.50 insurance even
-# if SKIP_DOWN_BIASED_COINS would normally block it. Reduces downside if
-# the original leg loses. NOT a guaranteed-profit play (math depends on
-# original position size). Tier=3 → DB column 'tier'=3, dashboard shows DOUBLE.
-T3_DOUBLE_ENABLED   = os.getenv("T3_DOUBLE_ENABLED",   "true").lower() == "true"
-T3_DOUBLE_MIN_ENTRY = float(os.getenv("T3_DOUBLE_MIN_ENTRY", "0.05"))
-T3_DOUBLE_MAX_ENTRY = float(os.getenv("T3_DOUBLE_MAX_ENTRY", "0.08"))
-T3_DOUBLE_SIZE_USDC = float(os.getenv("T3_DOUBLE_SIZE_USDC", "1.50"))
-
 # Balance-scaled sizing: when BET_PCT > 0, sizes auto-scale with live wallet balance.
 # base = balance * BET_PCT * per_coin_ratio   (per_coin_ratio = T2_SIZE_PER_COIN[coin] / T2_SIZE)
 # 0.0 = disabled, use fixed T2_SIZE_* dollar amounts. MAX_BET_SIZE hard-caps each trade.
@@ -234,9 +233,10 @@ T2_WINDOW_MIN = int(os.getenv("T2_WINDOW_MIN", "30"))    # Hourly: final 20 min
 # v10.2 STALE-ASK SNIPE WINDOW
 # Data from 71-trade backup: WR 53% at 0-30s left, 22% at 30-60s,
 # 0-20% beyond. Firing only in the last 60 seconds doubles your edge.
-T2_MAX_SECS_LEFT = int(os.getenv("T2_MAX_SECS_LEFT", "90"))   # widened 60→90s: more entries = more dual-fire setups
+T2_MAX_SECS_LEFT = int(os.getenv("T2_MAX_SECS_LEFT", "90"))
 T2_MIN_SECS_LEFT = int(os.getenv("T2_MIN_SECS_LEFT", "5"))    # don't fire if less than 5s (won't fill)
-T1_MIN_SECS_LEFT = int(os.getenv("T1_MIN_SECS_LEFT", "180"))  # 4hr contrarian: fire ≥3 min before close
+T1_MIN_SECS_LEFT    = int(os.getenv("T1_MIN_SECS_LEFT",    "180"))  # 15-min/hourly contrarian: fire ≥5 min before close
+T1_5M_MIN_SECS_LEFT = int(os.getenv("T1_5M_MIN_SECS_LEFT", "30"))   # 5-min T1 (dual-tier): fire when ≥30s remain
 T2_CANDLE_SECS       = int(os.getenv("T2_CANDLE_SECS",       "900"))   # 15-min market total duration (seconds)
 CANDLE_PROGRESS_MAX  = float(os.getenv("CANDLE_PROGRESS_MAX",  "0.60")) # hard reject above 60% through candle
 CANDLE_SWEET_LO      = float(os.getenv("CANDLE_SWEET_LO",      "0.20")) # bell-curve sweet spot start (data: 20%)
@@ -252,7 +252,7 @@ GHOST_BRAIN_ENABLED   = os.getenv("GHOST_BRAIN_ENABLED",   "false").lower() == "
 GHOST_BRAIN_MIN_SCORE = int(os.getenv("GHOST_BRAIN_MIN_SCORE", "25"))
 
 # ── Price deviation required for Up/Down markets ──
-T2_MIN_DEV = float(os.getenv("T2_MIN_DEV", "0.001"))   # hourly oracle-lag
+T2_MIN_DEV = float(os.getenv("T2_MIN_DEV", "0.003"))   # pbot oracle-lag: 0.3% min Binance deviation required
 T1_MIN_DEV = float(os.getenv("T1_MIN_DEV", "0.001"))   # 4hr contrarian
 
 # ── Oracle discrepancy gate (T2) ──────────────────────────────────────────────
@@ -303,30 +303,27 @@ TREND_VELOCITY_MIN   = float(os.getenv("TREND_VELOCITY_MIN",  "0.000003"))  # fr
 TREND_MOMENTUM_MIN   = float(os.getenv("TREND_MOMENTUM_MIN",  "0.4"))       # -1..+1
 TREND_VOLATILITY_MIN = float(os.getenv("TREND_VOLATILITY_MIN","0.000005"))  # frac/tick
 TREND_VOLATILITY_MAX = float(os.getenv("TREND_VOLATILITY_MAX","0.003"))     # frac/tick
-# 15-minute Punisher filter — T2 only.
-# If 15m dev opposes 5m dev AND |15m dev| >= this threshold, skip the signal.
-# Lower = more signals killed (stricter). Raise to 0.003 to relax on choppy days.
-DEV_15M_THRESH       = float(os.getenv("DEV_15M_THRESH", "0.0010"))  # 0.1% hardcoded → now configurable
-
-# ── OBV volume confirmation (Punisher indicator) ─────────────────────────────
-# Uses Binance @ticker "v" field (24h rolling vol) already on existing WS.
-# Computes per-tick volume delta and OBV slope: +1 = all up-tick volume,
-# −1 = all down-tick volume. _obv_align = slope if buying_up else −slope.
-#   > +0.30 → soft boost confidence by OBV_CONF_BOOST.
-#   < OBV_KILL_THRESH (default −0.60) → hard kill (volume against bet).
+# OBV volume confirmation — uses per-tick volume delta from Binance @ticker "v" field.
+# _obv_align = get_obv_slope() mapped to our bet direction (+1 = volume confirms our bet).
+# OBV_KILL_THRESH: if _obv_align < thresh, skip signal (volume strongly against us).
+# OBV_CONF_BOOST: if _obv_align > 0.30, add to confidence (volume confirms bet).
 OBV_CONFIRM_ENABLED  = os.getenv("OBV_CONFIRM_ENABLED", "true").strip().lower() in ("true","1","yes")
-OBV_CONF_BOOST       = float(os.getenv("OBV_CONF_BOOST",   "0.03"))
-OBV_KILL_THRESH      = float(os.getenv("OBV_KILL_THRESH",  "-0.60"))
-
-# ── RSI-14 exhaustion confirmation (Punisher indicator) ──────────────────────
-# Uses Binance 1m kline REST inside existing fetch_opens() loop (no new conn).
-# Contrarian: RSI > overbought + we bet DOWN (or RSI < oversold + we bet UP)
-# = exhaustion confirmation → soft boost by RSI_CONF_BOOST. No hard kill.
-RSI_ENABLED          = os.getenv("RSI_ENABLED",  "true").strip().lower() in ("true","1","yes")
-RSI_PERIOD           = int(os.getenv("RSI_PERIOD",       "14"))
-RSI_OVERBOUGHT       = float(os.getenv("RSI_OVERBOUGHT", "65"))
-RSI_OVERSOLD         = float(os.getenv("RSI_OVERSOLD",   "35"))
-RSI_CONF_BOOST       = float(os.getenv("RSI_CONF_BOOST", "0.03"))
+OBV_CONF_BOOST       = float(os.getenv("OBV_CONF_BOOST",   "0.03"))   # +conf when OBV aligns
+OBV_KILL_THRESH      = float(os.getenv("OBV_KILL_THRESH",  "-0.60"))  # skip if OBV strongly opposing
+# RSI-14 on 1-minute Binance candles (Punisher indicator #3).
+# Contrarian: dev UP → we bet DOWN → RSI>OVERBOUGHT confirms exhaustion.
+#             dev DOWN → we bet UP  → RSI<OVERSOLD confirms exhaustion.
+# RSI_CONF_BOOST: add to confidence when RSI confirms our reversal bet.
+# No hard kill — RSI alone is noisy; treat as soft confirmation layer.
+RSI_ENABLED          = os.getenv("RSI_ENABLED", "true").strip().lower() in ("true","1","yes")
+RSI_PERIOD           = int(os.getenv("RSI_PERIOD",      "14"))
+RSI_OVERBOUGHT       = float(os.getenv("RSI_OVERBOUGHT", "65"))   # > this → confirms DOWN bet
+RSI_OVERSOLD         = float(os.getenv("RSI_OVERSOLD",   "35"))   # < this → confirms UP bet
+RSI_CONF_BOOST       = float(os.getenv("RSI_CONF_BOOST", "0.03")) # +conf when RSI confirms bet
+# 15-minute Punisher filter — ALL markets (unified T1, 2026-05-22).
+# Block if 15m and 5m move IN THE SAME direction — sustained trend = bad fade.
+# Lower = more signals killed (stricter). Raise to 0.003 to relax on choppy days.
+DEV_15M_THRESH       = float(os.getenv("DEV_15M_THRESH", "0.0010"))  # 0.1% — configurable
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Trade confidence scoring ──────────────────────────────────────────────────
@@ -634,47 +631,9 @@ SKIP_COINS = set(
     if c.strip()
 )
 
-# Hour-of-day gate. Hours listed here are skipped for cheap-UP entries
-# (in pooled data they have <50% UP-win rate). 11 AM ET only wins 40%
-# UP — flip the strategy in those hours, or skip outright.
-DEAD_UP_HOURS_ET = set(
-    int(h.strip()) for h in
-    os.getenv("DEAD_UP_HOURS_ET", "").split(",")  # cleared for data collection (was 11,1)
-    if h.strip().isdigit()
-)
-DEAD_DOWN_HOURS_ET = set(
-    int(h.strip()) for h in
-    os.getenv("DEAD_DOWN_HOURS_ET", "").split(",")  # cleared for data collection (was 4,5,19)
-    if h.strip().isdigit()
-)
 BIAS_FILTERS_ENABLED = os.getenv("BIAS_FILTERS", "true").strip().lower() in ("true","1","yes")
 
-# ── MarketGhost hour-of-day directional bias (v8 parity, 2026-05-13) ─────────
-# Mirrors v8's "Direction filter: Auto (MarketGhost hour bias)".
-# Reads live DB trade history, computes per-UTC-hour WR for UP vs DOWN.
-# If one direction has WR >= HOUR_BIAS_MIN_WR with >= HOUR_BIAS_MIN_SAMPLES,
-# the opposite direction is blocked at that hour.  Refreshes every 30 min.
-HOUR_BIAS_ENABLED       = os.getenv("HOUR_BIAS_ENABLED",       "true").strip().lower() in ("true","1","yes")
-HOUR_BIAS_MIN_WR        = float(os.getenv("HOUR_BIAS_MIN_WR",        "0.58"))
-HOUR_BIAS_MIN_SAMPLES   = int(os.getenv("HOUR_BIAS_MIN_SAMPLES",     "5"))
-HOUR_BIAS_REFRESH_MIN   = int(os.getenv("HOUR_BIAS_REFRESH_MIN",     "10"))
-HOUR_BIAS_LOOKBACK_DAYS = int(os.getenv("HOUR_BIAS_LOOKBACK_DAYS",   "30"))
-HOUR_BIAS_RECENT_DAYS   = int(os.getenv("HOUR_BIAS_RECENT_DAYS",     "7"))
-HOUR_BIAS_RECENT_WEIGHT = float(os.getenv("HOUR_BIAS_RECENT_WEIGHT", "2.0"))
-
-# ── CoinDirEngine — dynamic coin+direction auto-blocker ──────────────────────
-# Reads live DB every COIN_DIR_REFRESH_SECS seconds. Computes EV/trade per
-# coin+direction pair over the last COIN_DIR_LOOKBACK settled trades.
-# Auto-blocks pairs whose EV/trade falls below COIN_DIR_EV_THRESH (-0.30).
-# Replaces the static SKIP_DOWN_BIASED_COINS env var. Pre-seeds from it on startup.
-COIN_DIR_REFRESH_SECS   = int(os.getenv("COIN_DIR_REFRESH_SECS",   "60"))
-COIN_DIR_LOOKBACK       = int(os.getenv("COIN_DIR_LOOKBACK",       "200"))  # wider window: more T2 samples
-COIN_DIR_MIN_TRADES     = int(os.getenv("COIN_DIR_MIN_TRADES",     "10"))   # T1 min samples to block
-COIN_DIR_MIN_TRADES_T2  = int(os.getenv("COIN_DIR_MIN_TRADES_T2",  "20"))   # T2: needs 20 samples before blocking
-COIN_DIR_EV_THRESH      = float(os.getenv("COIN_DIR_EV_THRESH",    "-0.50"))
-# Bull regime: when True, CoinDir never blocks UP signals (DOWN still filtered by EV).
-# Enable during sustained bull markets — UP oracle-lag signals have proven edge.
-BULL_REGIME             = os.getenv("BULL_REGIME", "false").lower() == "true"
+# CoinDirEngine deleted 2026-05-22 — static filters (SKIP_COINS, SKIP_DOWN_BIASED_COINS) handle direction blocking
 
 # ── Coinbase oracle agreement gate (2026-05-09) ──────────────────────────────
 # Pre-fire cross-exchange check: Coinbase's 5m candle direction must not oppose
@@ -685,22 +644,6 @@ BULL_REGIME             = os.getenv("BULL_REGIME", "false").lower() == "true"
 CB_ORACLE_GATE    = os.getenv("CB_ORACLE_GATE", "false").strip().lower() in ("true","1","yes")  # disabled: disagreement trades win 57% — gate was blocking winners
 CB_ORACLE_TIE_PCT = float(os.getenv("CB_ORACLE_TIE_PCT", "0.02"))  # 0.02% floor
 
-# Hour confidence weighting -- boost proven hours, dampen losing hours.
-# Backtest (133 live trades): 23 ET = 33.3% WR +$21.57 EV/trade; 21 ET = strong;
-# 17 ET = positive. 14 ET = -$34 total; 16 ET = negative; 20 ET = 0% WR 5 losses.
-HOUR_BOOST_HOURS_ET = set(
-    int(h.strip()) for h in
-    os.getenv("HOUR_BOOST_HOURS_ET", "23,21,17").split(",")
-    if h.strip().isdigit()
-)
-HOUR_BOOST_FACTOR   = float(os.getenv("HOUR_BOOST_FACTOR",  "1.10"))  # e.g. 1.10 = +10% conf
-
-HOUR_REDUCE_HOURS_ET = set(
-    int(h.strip()) for h in
-    os.getenv("HOUR_REDUCE_HOURS_ET", "14,16,20").split(",")
-    if h.strip().isdigit()
-)
-HOUR_REDUCE_FACTOR  = float(os.getenv("HOUR_REDUCE_FACTOR", "0.85"))  # e.g. 0.85 = -15% conf
 
 # v9 Engine Change 1: Lazy orderbook fetch (filters → predict side → 1 fetch).
 # Strategy-neutral in 95%+ of cases per analysis. Default ON.
@@ -725,8 +668,9 @@ def _db(timeout: float = 5.0) -> sqlite3.Connection:
     """
     conn = sqlite3.connect(DB_PATH, timeout=timeout)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")   # wait up to 5s before raising OperationalError
+    conn.execute("PRAGMA busy_timeout=15000")  # wait up to 15s before raising OperationalError
     conn.execute("PRAGMA synchronous=NORMAL")   # safe + fast under WAL
+    conn.execute("PRAGMA wal_autocheckpoint=100")  # checkpoint every 100 pages (~400KB) to prevent WAL bloat
     return conn
 
 def init_db():
@@ -748,6 +692,14 @@ def init_db():
             pnl         REAL DEFAULT 0,
             closed_at   TEXT
         )
+    """)
+    # ── Dedup guard: at most ONE open row per token_id (atomic, cross-process) ──
+    # INSERT OR IGNORE in log_trade() silently drops any duplicate open insert.
+    # This is the final safety net — survives restarts, race conditions, and
+    # multiple scanner processes. Added 2026-05-26 to fix recurring duplicate bug.
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_per_token
+        ON trades(token_id) WHERE status='open'
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS events (
@@ -1064,21 +1016,44 @@ def _read_ghost_brain(coin: str):
 
 
 def log_trade(tier, coin, market_id, token_id, question, entry, size, order_id,
-              outcome="UP", fill_price=None, fill_size=None, ghost_score=None):
+              outcome="UP", fill_price=None, fill_size=None, ghost_score=None, _ts=None):
     """Record a new trade. fill_price/fill_size are the actual execution values
-    parsed from the order response; they may differ from the signal ask/size."""
-    conn = _db(timeout=10)
-    conn.execute("""
-        INSERT INTO trades
-            (ts, tier, coin, market_id, token_id, question,
-             entry_price, size_usdc, order_id, outcome, fill_price, fill_size,
-             ghost_score)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (datetime.now(timezone.utc).isoformat(), tier, coin,
-          market_id, token_id, question[:120], entry, size, order_id, outcome,
-          fill_price, fill_size, ghost_score))
-    conn.commit()
-    conn.close()
+    parsed from the order response; they may differ from the signal ask/size.
+    Retries 3x with backoff — trade already placed on Polymarket, MUST write to DB.
+    """
+    params = (_ts or datetime.now(timezone.utc).isoformat(), tier, coin,
+              market_id, token_id, question[:120], entry, size, order_id, outcome,
+              fill_price, fill_size, ghost_score)
+    for attempt in range(3):
+        conn = None
+        try:
+            conn = _db(timeout=15)
+            _cur = conn.execute("""
+                INSERT OR IGNORE INTO trades
+                    (ts, tier, coin, market_id, token_id, question,
+                     entry_price, size_usdc, order_id, outcome, fill_price, fill_size,
+                     ghost_score)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, params)
+            conn.commit()
+            if _cur.rowcount == 0:
+                # DB unique index blocked a duplicate open — already have an open row
+                # for this token_id. This is NOT an error; silently discard.
+                _tok = str(params[4])[:16] if params[4] else "?"
+                print(f"[DB-DEDUP] Duplicate open blocked at DB level: "
+                      f"{coin} {outcome} token={_tok}")
+                return
+            return  # success
+        except Exception as db_err:
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))  # 0.5s, 1.0s backoff
+            else:
+                print(f"[DB-GHOST] CRITICAL: log_trade failed 3x for {coin} {outcome} "
+                      f"order={order_id} — {db_err}")
+        finally:
+            if conn:
+                try: conn.close()
+                except Exception: pass
 
 def get_open_count():
     conn = _db()
@@ -1178,8 +1153,12 @@ def classify_tier(question: str) -> Optional[int]:
                                   "4-hour", "four hour"]):
             return 1
 
-        # T2: SHORT TIME-RANGE (≤10 min gap = 5-min stale-ask)
-        # T1: MEDIUM TIME-RANGE (10-90 min gap = 15-min/hourly contrarian)
+        # ONE TIER (unified WRAITH contrarian — 2026-05-22):
+        # 5-min markets collapsed into T1. Both use identical contrarian logic,
+        # same entry ceiling (T1_MAX_ENTRY), same priority pool.
+        # 5-min T1 fires when ≥T1_5M_MIN_SECS_LEFT remain (default 30s).
+        # When 5-min and 15-min share the same expiry, 15-min wins priority ranking
+        # because its reference price is set earlier → larger deviation signal.
         m2 = re.findall(r'(\d{1,2}):(\d{2})([ap]m)', q)
         if len(m2) >= 2:
             def _mins(h, mn, ap):
@@ -1189,13 +1168,19 @@ def classify_tier(question: str) -> Optional[int]:
                 return h * 60 + mn
             diff = (_mins(*m2[-1]) - _mins(*m2[0])) % (24 * 60)
             if diff <= 10:
-                return 2
+                return 2   # 5-min markets → T2 (pbot oracle-lag, WITH Binance)
             elif diff <= 90:
-                return 1
+                return 1   # 15-min markets → T1 (WRAITH contrarian, AGAINST Binance)
 
-        # T1: hourly keywords
+        # T1: hourly keywords (e.g. "[hour]", ":00pm")
         if any(x in q for x in ["[hour]", "[1hr]", "[1h]", ":00pm", ":00am",
                                   "- hour", "hourly"]):
+            return 1
+
+        # T1: single-time hourly markets "...May 23, 11AM ET" / "...1PM ET"
+        # These have no HH:MM-HH:MM range so the regex above finds < 2 matches.
+        import re as _re
+        if len(m2) < 2 and _re.search(r",\s*\d{1,2}[ap]m\s+et", q):
             return 1
 
     return None  # Not a recognised crypto tier
@@ -1247,6 +1232,8 @@ class PriceTracker:
         self.opens_1h: Dict[str, float] = {}         # Hourly open prices
         self.opens_4h: Dict[str, float] = {}         # 4hr open prices
         self.opens_1d: Dict[str, float] = {}         # Daily open prices
+        # 1m close history for RSI-14. Stores last 15 close prices oldest→newest.
+        self.closes_1m: Dict[str, List[float]] = {}
         self.running = True
         self._ws_connected = False
         # Zombie WS detection: timestamp of last REAL price message (not heartbeat).
@@ -1255,12 +1242,10 @@ class PriceTracker:
         # Stores (monotonic_time, price) tuples; maxlen=150 covers ~2.5 min of ticks.
         _tracked = ("BTC", "ETH", "BNB", "SOL", "XRP")
         self.tick_history: Dict[str, deque] = {c: deque(maxlen=150) for c in _tracked}
-        # OBV — per-tick volume from Binance @ticker "v" field (24h rolling).
-        # Stores (monotonic_time, price, tick_vol) tuples for slope computation.
+        # OBV: per-tick volume history. Stores (monotonic_time, price, tick_vol) tuples.
+        # tick_vol = delta of Binance @ticker "v" (24h rolling vol) between consecutive ticks.
         self.volume_history: Dict[str, deque] = {c: deque(maxlen=150) for c in _tracked}
-        self._prev_volume: Dict[str, float] = {}
-        # RSI — last N one-minute close prices, refreshed by fetch_opens().
-        self.closes_1m: Dict[str, List[float]] = {}
+        self._prev_volume: Dict[str, float] = {}   # last seen "v" per coin for delta calc
         # Punisher WS quality patches (L3/L4) — reset on each reconnect
         self._ws_skip_first: set = set()      # L4: coins whose first post-connect tick has been skipped
 
@@ -1326,6 +1311,7 @@ class PriceTracker:
                             self.lows_1d[coin]  = float(data[0][3])
 
                 # 1m candles — last 15 closes for RSI-14
+                # Binance returns oldest-first; we want close prices (index 4).
                 async with session.get(url, params={"symbol": sym, "interval": "1m", "limit": 15},
                                        timeout=aiohttp.ClientTimeout(total=5)) as r:
                     if r.status == 200:
@@ -1393,14 +1379,20 @@ class PriceTracker:
         return sum(changes) / len(changes)
 
     def get_obv_slope(self, coin: str, n: int = 10) -> Optional[float]:
-        """OBV direction from last n ticks. Returns slope in [-1.0, +1.0].
-        +1.0 = all per-tick volume occurred on up-ticks (bullish pressure).
-        -1.0 = all per-tick volume occurred on down-ticks (bearish pressure).
-        Returns None when insufficient history or near-zero volume.
+        """Volume-weighted directional score over last n ticks (OBV proxy).
 
-        Caller maps to bet direction:
-          _obv_align = slope if buying_up else -slope
+        For each consecutive tick pair: volume attributed to direction of price move.
+        Score = (up_vol - down_vol) / total_vol, range -1..+1.
+          +1 = all traded volume on up-ticks (strong buy pressure)
+          -1 = all traded volume on down-ticks (strong sell pressure)
+           0 = balanced / random walk
+
+        For T1 WRAITH (contrarian): bot bets AGAINST the deviation.
+          Caller computes _obv_align = slope if buying_up else -slope.
           Positive _obv_align = volume confirms our bet direction.
+
+        Returns None if volume_history too short or no meaningful volume yet
+        (warmup period or 24h ticker rollover resets the delta to near zero).
         """
         hist = list(self.volume_history.get(coin, []))
         if len(hist) < max(2, n):
@@ -1411,33 +1403,35 @@ class PriceTracker:
         down_vol = sum(recent[i][2] for i in range(1, len(recent))
                        if recent[i][1] <  recent[i-1][1])
         total = up_vol + down_vol
-        if total < 0.01:
+        if total < 0.01:    # no meaningful volume yet (warmup / rollover)
             return None
         return round((up_vol - down_vol) / total, 4)
 
     def get_rsi(self, coin: str, period: int = 14) -> Optional[float]:
-        """RSI-period from last period+1 one-minute close prices.
-        Simple-average RSI (Wilder first-bar formula):
-          gains  = [max(0, close[i] - close[i-1]) for i in 1..period]
-          losses = [max(0, close[i-1] - close[i]) for i in 1..period]
-          RS     = avg_gain / avg_loss
-          RSI    = 100 - (100 / (1 + RS))
+        """RSI-14 from last `period+1` 1-minute close prices.
 
-        Contrarian use:
-          RSI > overbought (65): ran hard up → confirms DOWN bet
-          RSI < oversold   (35): fell hard   → confirms UP bet
-        Returns None when closes_1m has fewer than period+1 entries (warmup).
+        Uses simple-average RSI (Wilder's first-bar formula):
+          avg_gain = mean of up-moves over period bars
+          avg_loss = mean of down-moves over period bars
+          RS = avg_gain / avg_loss
+          RSI = 100 - (100 / (1 + RS))
+
+        Interpretation for T1 WRAITH (contrarian, bets AGAINST deviation):
+          RSI > RSI_OVERBOUGHT (e.g. 65): price ran hard → overbought → confirms DOWN bet
+          RSI < RSI_OVERSOLD   (e.g. 35): price fell hard → oversold  → confirms UP bet
+
+        Returns None if closes_1m has fewer than period+1 entries (warmup).
         """
         closes = self.closes_1m.get(coin, [])
         if len(closes) < period + 1:
             return None
-        recent = closes[-(period + 1):]
+        recent = closes[-(period + 1):]          # period+1 prices → period change bars
         gains  = [max(0.0, recent[i] - recent[i-1]) for i in range(1, len(recent))]
         losses = [max(0.0, recent[i-1] - recent[i]) for i in range(1, len(recent))]
-        avg_gain = sum(gains)  / period
+        avg_gain = sum(gains) / period
         avg_loss = sum(losses) / period
         if avg_loss < 1e-10:
-            return 100.0
+            return 100.0          # no down-moves at all → fully overbought
         rs = avg_gain / avg_loss
         return round(100.0 - (100.0 / (1.0 + rs)), 2)
 
@@ -1661,17 +1655,14 @@ class PriceTracker:
                                             if coin in self.tick_history:
                                                 self.tick_history[coin].append(
                                                     (time.monotonic(), _p))
-                                            # OBV — per-tick volume delta from 24h rolling
-                                            try:
-                                                _v = float(ticker.get("v", 0))
-                                                if _v > 0 and coin in self.volume_history:
-                                                    _prev_v = self._prev_volume.get(coin, _v)
-                                                    _tick_vol = max(0.0, _v - _prev_v)
-                                                    self._prev_volume[coin] = _v
-                                                    self.volume_history[coin].append(
-                                                        (time.monotonic(), _p, _tick_vol))
-                                            except (TypeError, ValueError):
-                                                pass
+                                            # OBV: parse 24h rolling volume, compute per-tick delta
+                                            _v = float(ticker.get("v", 0))
+                                            if _v > 0 and coin in self.volume_history:
+                                                _prev_v = self._prev_volume.get(coin, _v)
+                                                _tick_vol = max(0.0, _v - _prev_v)
+                                                self._prev_volume[coin] = _v
+                                                self.volume_history[coin].append(
+                                                    (time.monotonic(), _p, _tick_vol))
                                 except Exception:
                                     pass
                             elif msg.type in (aiohttp.WSMsgType.CLOSED,
@@ -1688,7 +1679,11 @@ class PriceTracker:
 
         Inspects the last `window_secs` of tick_history for `coin` and requires:
           - At least `min_ticks` ticks received in that window  (data is arriving)
-          - No single tick-to-tick jump > `max_jump_pct` (0.5%) (no stale snapshots)
+          - No single tick-to-tick jump > `max_jump_pct` (0.5%)  (no stale snapshots)
+
+        Uses PERCENTAGE-based jump detection so BTC ($76k) and ETH ($2k) are not
+        blocked by a fixed dollar threshold. The old 5¢ absolute check caused ALL
+        BTC/ETH markets to fail WS quality every scan (BTC moves $1-5 per tick).
 
         Returns True  = quality OK, safe to trade this window.
         Returns False = skip — warmup data is thin or spiked.
@@ -1709,8 +1704,9 @@ class PriceTracker:
             return False  # truly too few ticks ever — data not flowing yet
         prices = [p for _, p in recent]
         for i in range(1, len(prices)):
-            if prices[i - 1] > 0 and abs(prices[i] - prices[i - 1]) / prices[i - 1] > max_jump_pct:
-                return False  # spike detected in window
+            ref = prices[i - 1]
+            if ref > 0 and abs(prices[i] - ref) / ref > max_jump_pct:
+                return False  # spike detected: >0.5% tick-to-tick jump (WS reconnect)
         return True
 
 # ─── STRIKE MARKET PRELOADER ──────────────────────────────────────────────────
@@ -2436,413 +2432,9 @@ def get_dynamic_size(base_size: float, confidence: float, arb_score: float) -> f
     return max(result, 1.0)   # Polymarket minimum order floor
 
 
-class HourBiasEngine:
-    """
-    Ghost Memory — adaptive hour-of-day directional bias engine.
-
-    Improvements over v1:
-      • Rolling lookback window (HOUR_BIAS_LOOKBACK_DAYS, default 30d) instead
-        of hardcoded '2026-05-01' — adapts to any run length automatically.
-      • Recency weighting: trades in the last HOUR_BIAS_RECENT_DAYS (default 7)
-        count HOUR_BIAS_RECENT_WEIGHT × (default 2×) more than older trades.
-      • Per-(coin, hour) tracking in _coin_bias alongside global _bias.
-        should_skip() checks coin-specific bias first; falls back to global if
-        the coin bucket lacks enough samples.
-      • Lower MIN_SAMPLES default (5) and REFRESH_MIN (10) so learning starts
-        faster and adapts quicker to intraday shifts.
-    """
-    def __init__(self):
-        # global: bias[utc_hour] = {"up_n": float, "up_w": float, "dn_n": float, "dn_w": float}
-        self._bias: dict = {}
-        # per-coin: _coin_bias[(coin_upper, utc_hour)] = same dict
-        self._coin_bias: dict = {}
-        # day-of-week: _dow_bias[(dow, utc_hour)] = same dict
-        # dow: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
-        self._dow_bias: dict = {}
-        self._last_refresh: float = 0.0
-        self._lock = asyncio.Lock()
-
-    def _compute(self):
-        """Synchronous DB read — called in a thread via asyncio.to_thread.
-        Merges three data sources with recency weighting.
-        """
-        import sqlite3 as _sq
-        import os as _os
-        from datetime import datetime as _dt, timedelta as _td
-
-        _now = _dt.utcnow()
-        _lookback_ts  = (_now - _td(days=HOUR_BIAS_LOOKBACK_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
-        _recent_ts    = (_now - _td(days=HOUR_BIAS_RECENT_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
-
-        bias      = {}   # global hour bucket
-        coin_bias = {}   # (coin, hour) bucket
-        dow_bias  = {}   # (dow, hour) bucket
-
-        def _empty():
-            return {"up_n": 0.0, "up_w": 0.0, "dn_n": 0.0, "dn_w": 0.0}
-
-        def _add_rows(rows, weight=1.0):
-            """rows: (utc_hour, outcome, status, coin, ts)"""
-            for utc_hour, outcome, status, coin_raw, ts_raw in rows:
-                coin_key = (coin_raw or "").upper()
-                is_up = (outcome or "").upper() in ("UP", "YES", "HIGHER", "ABOVE")
-                won   = status == "won"
-
-                # global bucket
-                b = bias.setdefault(utc_hour, _empty())
-                if is_up:
-                    b["up_n"] += weight
-                    if won: b["up_w"] += weight
-                else:
-                    b["dn_n"] += weight
-                    if won: b["dn_w"] += weight
-
-                # per-coin bucket (only when coin is known)
-                if coin_key:
-                    cb = coin_bias.setdefault((coin_key, utc_hour), _empty())
-                    if is_up:
-                        cb["up_n"] += weight
-                        if won: cb["up_w"] += weight
-                    else:
-                        cb["dn_n"] += weight
-                        if won: cb["dn_w"] += weight
-
-                # day-of-week bucket
-                try:
-                    _dt_obj = _dt.fromisoformat((ts_raw or "").replace("+00:00", ""))
-                    _dow    = _dt_obj.weekday()  # 0=Mon … 6=Sun
-                    db = dow_bias.setdefault((_dow, utc_hour), _empty())
-                    if is_up:
-                        db["up_n"] += weight
-                        if won: db["up_w"] += weight
-                    else:
-                        db["dn_n"] += weight
-                        if won: db["dn_w"] += weight
-                except Exception:
-                    pass
-
-        # coin column may be absent in older DBs — COALESCE to ''
-        TRADES_SQL_OLD = """
-            SELECT CAST(strftime('%H', ts) AS INTEGER),
-                   outcome, status, '' AS coin, ts
-            FROM trades
-            WHERE ts >= ?
-              AND status IN ('won','lost')
-              AND outcome IS NOT NULL
-        """
-        TRADES_SQL_NEW = """
-            SELECT CAST(strftime('%H', ts) AS INTEGER),
-                   outcome, status,
-                   COALESCE(coin, '') AS coin, ts
-            FROM trades
-            WHERE ts >= ?
-              AND status IN ('won','lost')
-              AND outcome IS NOT NULL
-        """
-
-        def _query_db(path, timeout=5):
-            """Return (old_rows, recent_rows) from a trades DB — non-overlapping ranges."""
-            try:
-                con = _sq.connect(path, timeout=timeout)
-                con.execute("PRAGMA journal_mode=WAL")
-                # detect coin column
-                cols = [r[1] for r in con.execute("PRAGMA table_info(trades)").fetchall()]
-                _sql = TRADES_SQL_NEW if "coin" in cols else TRADES_SQL_OLD
-                # Non-overlapping: old = [lookback, recent), recent = [recent, now)
-                _old_sql    = _sql.replace("ts >= ?", "ts >= ? AND ts < ?")
-                old_rows    = con.execute(_old_sql, (_lookback_ts, _recent_ts)).fetchall()
-                recent_rows = con.execute(_sql, (_recent_ts,)).fetchall()
-                con.close()
-                return old_rows, recent_rows
-            except Exception as e:
-                print(f"[GhostMemory] DB error ({path}): {e}")
-                return [], []
-
-        # ── 1. Live DB ────────────────────────────────────────────────────────
-        old_r, rec_r = _query_db(DB_PATH)
-        _add_rows(old_r, weight=1.0)
-        _add_rows(rec_r, weight=HOUR_BIAS_RECENT_WEIGHT)
-
-        # ── 2. Paper DB ───────────────────────────────────────────────────────
-        # Only merge paper data in paper mode — phantom REST fills corrupt live bias
-        if PAPER_TRADE:
-            _paper_path = _os.path.join(_os.path.dirname(DB_PATH), "crypto_ghost_PAPER.db")
-            if _os.path.exists(_paper_path):
-                old_r, rec_r = _query_db(_paper_path)
-                _add_rows(old_r, weight=1.0)
-                _add_rows(rec_r, weight=HOUR_BIAS_RECENT_WEIGHT)
-
-        # ── 3. Frank DB (market resolutions) ─────────────────────────────────
-        _frank_path = _os.path.join(_os.path.dirname(DB_PATH), "frank.db")
-        if _os.path.exists(_frank_path):
-            try:
-                con3 = _sq.connect(_frank_path, timeout=10)
-                frank_rows = con3.execute("""
-                    SELECT CAST(strftime('%H', start_utc) AS INTEGER),
-                           winner, start_utc
-                    FROM resolutions
-                    WHERE start_utc >= ?
-                      AND winner IN ('UP','DOWN')
-                """, (_lookback_ts,)).fetchall()
-                con3.close()
-                for utc_hour, winner, start_utc in frank_rows:
-                    w = HOUR_BIAS_RECENT_WEIGHT if start_utc >= _recent_ts else 1.0
-                    b = bias.setdefault(utc_hour, _empty())
-                    b["up_n"] += w; b["dn_n"] += w
-                    if winner == "UP":
-                        b["up_w"] += w
-                    else:
-                        b["dn_w"] += w
-                    # day-of-week bucket for frank rows
-                    try:
-                        _dt_obj = _dt.fromisoformat((start_utc or "").replace("+00:00", ""))
-                        _dow    = _dt_obj.weekday()
-                        db = dow_bias.setdefault((_dow, utc_hour), _empty())
-                        db["up_n"] += w; db["dn_n"] += w
-                        if winner == "UP":
-                            db["up_w"] += w
-                        else:
-                            db["dn_w"] += w
-                    except Exception:
-                        pass
-            except Exception as e:
-                print(f"[GhostMemory] frank DB error: {e}")
-
-        return bias, coin_bias, dow_bias
-
-    async def refresh(self):
-        """Refresh bias tables from DB (async, non-blocking)."""
-        bias, coin_bias, dow_bias = await asyncio.to_thread(self._compute)
-        async with self._lock:
-            self._bias      = bias
-            self._coin_bias = coin_bias
-            self._dow_bias  = dow_bias
-            self._last_refresh = time.monotonic()
-        total  = sum(v["up_n"] + v["dn_n"] for v in bias.values())
-        strong = [(h, v) for h, v in bias.items()
-                  if (v["up_n"] >= HOUR_BIAS_MIN_SAMPLES and
-                      v["up_w"] / v["up_n"] >= HOUR_BIAS_MIN_WR) or
-                     (v["dn_n"] >= HOUR_BIAS_MIN_SAMPLES and
-                      v["dn_w"] / v["dn_n"] >= HOUR_BIAS_MIN_WR)]
-        coin_strong = len([k for k, v in coin_bias.items()
-                           if (v["up_n"] >= HOUR_BIAS_MIN_SAMPLES and
-                               v["up_w"] / v["up_n"] >= HOUR_BIAS_MIN_WR) or
-                              (v["dn_n"] >= HOUR_BIAS_MIN_SAMPLES and
-                               v["dn_w"] / v["dn_n"] >= HOUR_BIAS_MIN_WR)])
-        dow_strong = len([k for k, v in dow_bias.items()
-                          if (v["up_n"] >= HOUR_BIAS_MIN_SAMPLES and
-                              v["up_w"] / v["up_n"] >= HOUR_BIAS_MIN_WR) or
-                             (v["dn_n"] >= HOUR_BIAS_MIN_SAMPLES and
-                              v["dn_w"] / v["dn_n"] >= HOUR_BIAS_MIN_WR)])
-        print(f"[GhostMemory] Refreshed — {total:.0f} weighted trades | "
-              f"{len(strong)} biased global hours | {coin_strong} biased coin-hours | "
-              f"{dow_strong} biased dow-hours")
-
-    async def run_refresh_loop(self):
-        """Background task: refresh on startup then every HOUR_BIAS_REFRESH_MIN min."""
-        await self.refresh()
-        while True:
-            await asyncio.sleep(HOUR_BIAS_REFRESH_MIN * 60)
-            await self.refresh()
-
-    def _bucket_blocks(self, b: dict, buying_up: bool) -> bool:
-        """Return True if bucket b blocks the given direction."""
-        if buying_up:
-            dn_n = b["dn_n"]
-            if dn_n >= HOUR_BIAS_MIN_SAMPLES:
-                if b["dn_w"] / dn_n >= HOUR_BIAS_MIN_WR:
-                    return True
-        else:
-            up_n = b["up_n"]
-            if up_n >= HOUR_BIAS_MIN_SAMPLES:
-                if b["up_w"] / up_n >= HOUR_BIAS_MIN_WR:
-                    return True
-        return False
-
-    def should_skip(self, buying_up: bool, utc_hour: int, coin: str = "") -> bool:
-        """
-        Return True if this direction should be blocked at this UTC hour.
-        Checks per-coin bias first (if coin supplied + enough samples),
-        then day-of-week + hour bias, then falls back to global hour bias.
-        """
-        if not HOUR_BIAS_ENABLED:
-            return False
-
-        # ── Per-coin check (takes priority when coin has enough data) ─────────
-        if coin:
-            cb = self._coin_bias.get((coin.upper(), utc_hour))
-            if cb is not None:
-                coin_n = cb["up_n"] + cb["dn_n"]
-                if coin_n >= HOUR_BIAS_MIN_SAMPLES:
-                    return self._bucket_blocks(cb, buying_up)
-
-        # ── Day-of-week + hour check ──────────────────────────────────────────
-        try:
-            from datetime import datetime as _dtnow
-            _dow = _dtnow.utcnow().weekday()
-            db = self._dow_bias.get((_dow, utc_hour))
-            if db is not None:
-                dow_n = db["up_n"] + db["dn_n"]
-                if dow_n >= HOUR_BIAS_MIN_SAMPLES:
-                    return self._bucket_blocks(db, buying_up)
-        except Exception:
-            pass
-
-        # ── Global hour fallback ──────────────────────────────────────────────
-        b = self._bias.get(utc_hour)
-        if b is None:
-            return False
-        return self._bucket_blocks(b, buying_up)
-
-    def summary(self, utc_hour: int, coin: str = "") -> str:
-        """One-line summary for the given UTC hour (+ optional coin)."""
-        parts = []
-        if coin:
-            cb = self._coin_bias.get((coin.upper(), utc_hour))
-            if cb and (cb["up_n"] or cb["dn_n"]):
-                if cb["up_n"]:
-                    parts.append(f"[{coin}] UP {cb['up_w']:.1f}/{cb['up_n']:.1f} "
-                                 f"({100*cb['up_w']//cb['up_n']:.0f}%)")
-                if cb["dn_n"]:
-                    parts.append(f"[{coin}] DN {cb['dn_w']:.1f}/{cb['dn_n']:.1f} "
-                                 f"({100*cb['dn_w']//cb['dn_n']:.0f}%)")
-        b = self._bias.get(utc_hour)
-        if b:
-            if b["up_n"]:
-                parts.append(f"UP {b['up_w']:.1f}/{b['up_n']:.1f} "
-                             f"({100*b['up_w']//b['up_n']:.0f}%)")
-            if b["dn_n"]:
-                parts.append(f"DN {b['dn_w']:.1f}/{b['dn_n']:.1f} "
-                             f"({100*b['dn_w']//b['dn_n']:.0f}%)")
-        return " | ".join(parts) if parts else "no data"
 
 
-HOUR_BIAS = HourBiasEngine()
-
-
-# ── CoinDirEngine ─────────────────────────────────────────────────────────────
-class CoinDirEngine:
-    """
-    Tier-aware coin+direction auto-blocker. Reads live DB every
-    COIN_DIR_REFRESH_SECS seconds, computes EV/trade separately for T1 and T2
-    so old T3/T4 data never masks current-tier performance.
-
-    Blocked set stores (coin, direction, tier) tuples:
-      tier=1  → block only for WRAITH markets
-      tier=2  → block only for SPECTER markets
-      tier=0  → block for ALL tiers (pre-seeded from SKIP_DOWN_BIASED_COINS)
-
-    is_blocked(coin, buying_up, tier) checks tier-specific first, then
-    falls back to tier=0 (manual seed). This means a coin blocked for T2
-    can still fire freely on T1 if T1 data is clean.
-    """
-
-    def __init__(self):
-        self._blocked: set = set()
-        # Pre-seed from static env: tier=0 = all tiers blocked
-        for coin in SKIP_DOWN_BIASED_COINS:
-            self._blocked.add((coin.upper(), "DOWN", 0))
-        self._lock = asyncio.Lock()
-
-    async def refresh_loop(self):
-        """Background task: refresh immediately, then every COIN_DIR_REFRESH_SECS."""
-        await self._refresh()
-        while True:
-            await asyncio.sleep(COIN_DIR_REFRESH_SECS)
-            await self._refresh()
-
-    async def _refresh(self):
-        """Run DB query in executor — never blocks the event loop."""
-        try:
-            loop = asyncio.get_event_loop()
-            new_blocked = await loop.run_in_executor(None, self._query_db)
-            async with self._lock:
-                added   = new_blocked - self._blocked
-                removed = self._blocked - new_blocked
-                self._blocked = new_blocked
-            if added:
-                labels = [f"T{t}-{c}-{d}" if t else f"ALL-{c}-{d}"
-                          for c, d, t in sorted(added)]
-                print(f"[CoinDir] BLOCKED:   {labels}")
-            if removed:
-                labels = [f"T{t}-{c}-{d}" if t else f"ALL-{c}-{d}"
-                          for c, d, t in sorted(removed)]
-                print(f"[CoinDir] UNBLOCKED: {labels}")
-        except Exception as e:
-            print(f"[CoinDir] refresh error: {e}")
-
-    def _query_db(self) -> set:
-        """
-        Query last COIN_DIR_LOOKBACK settled trades grouped by (coin, outcome, tier).
-        Evaluates T1 and T2 independently so legacy T3/T4 data never masks them.
-        Minimum samples: COIN_DIR_MIN_TRADES for T1, COIN_DIR_MIN_TRADES_T2 for T2.
-        """
-        # Static seeds are tier=0 (block all tiers) — always sticky
-        static_seeds: set = {(c.upper(), "DOWN", 0) for c in SKIP_DOWN_BIASED_COINS}
-        new_blocked: set  = set(static_seeds)
-
-        try:
-            with _db() as conn:
-                rows = conn.execute("""
-                    SELECT coin, outcome, tier,
-                           COUNT(*)                       AS n,
-                           ROUND(SUM(pnl) / COUNT(*), 4) AS ev
-                    FROM (
-                        SELECT coin, outcome, tier, pnl
-                        FROM   trades
-                        WHERE  status IN ('won', 'lost')
-                          AND  tier IN (1, 2)
-                        ORDER  BY id DESC
-                        LIMIT  ?
-                    )
-                    GROUP BY coin, outcome, tier
-                """, (COIN_DIR_LOOKBACK,)).fetchall()
-        except Exception as e:
-            print(f"[CoinDir] DB query error: {e}")
-            return set(self._blocked)
-
-        for coin, outcome, tier, n, ev in rows:
-            coin_u = coin.upper()
-            dir_u  = outcome.upper()
-            min_n  = COIN_DIR_MIN_TRADES_T2 if tier == 2 else COIN_DIR_MIN_TRADES
-            key    = (coin_u, dir_u, tier)
-            seed0  = (coin_u, dir_u, 0)
-
-            if n >= min_n and ev < COIN_DIR_EV_THRESH:
-                new_blocked.add(key)
-            elif key in new_blocked and seed0 not in static_seeds:
-                # Unblock if EV fully recovered — never unblock manual static seeds
-                if n >= min_n and ev >= 0:
-                    new_blocked.discard(key)
-
-        return new_blocked
-
-    def is_blocked(self, coin: str, buying_up: bool, tier: int = 0) -> bool:
-        """
-        Return True if this coin+direction is blocked for the given tier.
-        Checks tier-specific block first, then falls through to tier=0 (all-tier seed).
-        tier=0 → all-tier check only (pre-seeded from SKIP_DOWN_BIASED_COINS).
-        BULL_REGIME=true → UP signals always pass through (DOWN still EV-filtered).
-        """
-        if buying_up and BULL_REGIME:
-            return False   # bull market: never suppress UP oracle-lag signals
-        c = coin.upper()
-        d = "UP" if buying_up else "DOWN"
-        if tier in (1, 2) and (c, d, tier) in self._blocked:
-            return True
-        return (c, d, 0) in self._blocked   # all-tier manual seed
-
-    def status_str(self) -> str:
-        """One-liner for dashboard/logging: T1-ETH-DOWN ALL-BNB-DOWN …"""
-        if not self._blocked:
-            return "all clear"
-        parts = []
-        for c, d, t in sorted(self._blocked):
-            parts.append(f"T{t}-{c}-{d}" if t else f"ALL-{c}-{d}")
-        return " ".join(parts)
-
-
-COIN_DIR = CoinDirEngine()
+# CoinDirEngine class deleted 2026-05-22
 
 
 class SegmentTracker:
@@ -3684,7 +3276,7 @@ async def direct_scan_updown(session: aiohttp.ClientSession) -> Dict[str, dict]:
             mins   = (end_dt.timestamp() - now) / 60
             if mins < 0 or mins > 1500:  # within 25 hours
                 continue
-            mid = m.get("conditionId", "") or m.get("id", "") or slug
+            mid = m.get("conditionId", "") or m.get("id", "") or slug  # conditionId first — matches whale cache key
             if mid in found:
                 continue
             tokens = m.get("tokens", []) or []
@@ -3795,16 +3387,30 @@ async def _discover_crypto_markets(session: aiohttp.ClientSession) -> Dict[str, 
                             continue
                         direction_w = "up" if outcome_w in ("UP", "YES", "HIGHER") else "down"
                         # Merge: if same market seen both directions → "both"
+                        # Cluster: count how many whales agree on the same direction
                         if cid_w in _new_signals:
-                            existing = _new_signals[cid_w]["direction"]
-                            if existing != direction_w:
-                                direction_w = "both"
-                        _new_signals[cid_w] = {
-                            "direction": direction_w,
-                            "ts":        now - age_w,
-                            "wallet":    w_addr[:10],
-                            "title":     title_w[:60],
-                        }
+                            existing_dir = _new_signals[cid_w]["direction"]
+                            existing_cnt = _new_signals[cid_w].get("count", 1)
+                            if existing_dir != direction_w:
+                                direction_w  = "both"
+                                existing_cnt = 0        # conflicting whales = no cluster
+                            else:
+                                existing_cnt += 1       # same direction → cluster grows
+                            _new_signals[cid_w] = {
+                                "direction": direction_w,
+                                "ts":        now - age_w,
+                                "wallet":    w_addr[:10],
+                                "title":     title_w[:60],
+                                "count":     existing_cnt,
+                            }
+                        else:
+                            _new_signals[cid_w] = {
+                                "direction": direction_w,
+                                "ts":        now - age_w,
+                                "wallet":    w_addr[:10],
+                                "title":     title_w[:60],
+                                "count":     1,
+                            }
                         # Also add to token_markets for discovery
                         if asset_w and asset_w not in token_markets:
                             token_markets[asset_w] = {
@@ -3815,7 +3421,7 @@ async def _discover_crypto_markets(session: aiohttp.ClientSession) -> Dict[str, 
                                 "_whale":   True,
                             }
             except Exception as e_w:
-                pass  # whale discovery is best-effort — never block main scan
+                print(f"[WHALE] {w_addr[:12]}... fetch error: {e_w}")  # never block main scan
         # Merge new signals, expire old ones
         _whale_signals = {
             cid: sig for cid, sig in {**_whale_signals, **_new_signals}.items()
@@ -3942,7 +3548,7 @@ async def _discover_crypto_markets(session: aiohttp.ClientSession) -> Dict[str, 
                         continue
                     token_markets[primary_token] = {
                         "question":   q,
-                        "id":         m.get("conditionId", "") or m.get("id", ""),
+                        "id":         m.get("conditionId", "") or m.get("id", ""),  # conditionId first — whale cache keyed by hex conditionId
                         "tokens":     tokens,
                         "endDateIso": end,
                     }
@@ -4555,53 +4161,72 @@ class CryptoGhostScanner:
         if _CLOB_DOWN:
             return False
 
-        # Bug #8 fix: include _pending in position count to prevent race condition
-        if token_id in self.open_positions or token_id in self._pending:
+        # ── In-process fire lock (Windows-safe, replaces broken fcntl approach) ──
+        # _FIRING_TOKENS is a module-level set. If another coroutine in THIS process
+        # is already mid-fire for this token, skip immediately.
+        # Cross-process race is caught by the DB UNIQUE INDEX (idx_one_open_per_token)
+        # + INSERT OR IGNORE in log_trade() — atomic at the SQLite level.
+        if token_id in _FIRING_TOKENS:
+            ts = __import__("datetime").datetime.now().strftime("%H:%M:%S")
+            print(f"[{ts}] [ASYNC-SKIP] token={str(token_id)[:12]} already firing in this process")
             return False
-
-        # Dedup guard: check DB for any existing open row with this token_id.
-        # Catches the case where open_positions was cleared (restart) but the
-        # DB still has an unresolved open trade — prevents double-firing the
-        # same market and the duplicate activity spam that follows.
+        _FIRING_TOKENS.add(token_id)
         try:
-            _chk = _db(timeout=3)
-            _dup = _chk.execute(
-                "SELECT COUNT(*) FROM trades WHERE token_id=? AND status='open'",
-                (token_id,)
-            ).fetchone()[0]
-            _chk.close()
-            if _dup > 0:
-                return False
-        except Exception:
-            pass  # DB unavailable — allow fire, resolver dedup handles it
-        if (len(self.open_positions) + len(self._pending)) >= MAX_OPEN_POSITIONS:
-            ts = datetime.now().strftime("%H:%M:%S")
-            print(f"[{ts}] SKIP: max positions ({MAX_OPEN_POSITIONS})")
-            return False
-        # Dual-fire bypasses kill_check: one side MUST win — pauses/limits don't apply
-        if not dual_fire and self.kill_check():
-            return False
-
-        # ── Global and per-coin exposure guards ──────────────────────────────
-        # Check before reserving the pending slot so rejected trades don't
-        # consume position capacity. Use passed size (dynamic) if available.
-        _req = size if size is not None else self.get_size(tier, coin)
-        if MAX_TOTAL_EXPOSURE > 0:
-            _total = self.get_total_exposure()
-            if _total + _req > MAX_TOTAL_EXPOSURE:
-                ts = datetime.now().strftime("%H:%M:%S")
-                print(f"[{ts}] SKIP {coin}: total exposure ${_total:.2f}+${_req:.2f} "
-                      f"> cap ${MAX_TOTAL_EXPOSURE:.2f}")
-                return False
-        if MAX_COIN_EXPOSURE > 0 and coin:
-            _coin_exp = self.get_coin_exposure(coin)
-            if _coin_exp + _req > MAX_COIN_EXPOSURE:
-                ts = datetime.now().strftime("%H:%M:%S")
-                print(f"[{ts}] SKIP {coin}: coin exposure ${_coin_exp:.2f}+${_req:.2f} "
-                      f"> cap ${MAX_COIN_EXPOSURE:.2f}")
+            # Bug #8 fix: include _pending in position count to prevent race condition
+            if token_id in self.open_positions or token_id in self._pending:
                 return False
 
-        self._pending.add(token_id)  # reserve slot before first await
+            # Dedup guard: check DB for any existing open row with this token_id.
+            # Catches the case where open_positions was cleared (restart) but the
+            # DB still has an unresolved open trade — prevents double-firing the
+            # same market and the duplicate activity spam that follows.
+            try:
+                _chk = _db(timeout=15)
+                _dup = _chk.execute(
+                    "SELECT COUNT(*) FROM trades WHERE token_id=? AND status='open'",
+                    (token_id,)
+                ).fetchone()[0]
+                _chk.close()
+                if _dup > 0:
+                    return False
+            except Exception as _dedup_err:
+                # L85 fix: fail-safe — if DB check fails, SKIP the fire.
+                # Old behaviour (pass) was fail-open: DB lock → check skipped →
+                # same market fires again after restart → duplicate trade in DB.
+                ts = __import__("datetime").datetime.now().strftime("%H:%M:%S")
+                print(f"[{ts}] [DEDUP-SKIP] token={str(token_id)[:12]} "
+                      f"DB check failed ({_dedup_err}) — skipping fire to prevent duplicate")
+                return False
+            if (len(self.open_positions) + len(self._pending)) >= MAX_OPEN_POSITIONS:
+                ts = datetime.now().strftime("%H:%M:%S")
+                print(f"[{ts}] SKIP: max positions ({MAX_OPEN_POSITIONS})")
+                return False
+            # Dual-fire bypasses kill_check: one side MUST win — pauses/limits don't apply
+            if not dual_fire and self.kill_check():
+                return False
+
+            # ── Global and per-coin exposure guards ──────────────────────────────
+            # Check before reserving the pending slot so rejected trades don't
+            # consume position capacity. Use passed size (dynamic) if available.
+            _req = size if size is not None else self.get_size(tier, coin)
+            if MAX_TOTAL_EXPOSURE > 0:
+                _total = self.get_total_exposure()
+                if _total + _req > MAX_TOTAL_EXPOSURE:
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    print(f"[{ts}] SKIP {coin}: total exposure ${_total:.2f}+${_req:.2f} "
+                          f"> cap ${MAX_TOTAL_EXPOSURE:.2f}")
+                    return False
+            if MAX_COIN_EXPOSURE > 0 and coin:
+                _coin_exp = self.get_coin_exposure(coin)
+                if _coin_exp + _req > MAX_COIN_EXPOSURE:
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    print(f"[{ts}] SKIP {coin}: coin exposure ${_coin_exp:.2f}+${_req:.2f} "
+                          f"> cap ${MAX_COIN_EXPOSURE:.2f}")
+                    return False
+
+            self._pending.add(token_id)  # reserve slot before first await
+        finally:
+            _FIRING_TOKENS.discard(token_id)  # release in-process fire lock
         PERF_ANALYTICS.record_attempt(tier, coin, token_id, _req, ask)
         _t_fire  = time.monotonic()  # latency: order submission start
 
@@ -4634,9 +4259,9 @@ class CryptoGhostScanner:
                 order_args = MarketOrderArgs(
                     token_id=token_id,
                     amount=size,          # USDC to spend
+                    price=ask,            # cap fill at signal price — prevents CLOB walk-up
                     side=BUY,
-                    order_type=OrderType.FOK,
-                    price=ask
+                    order_type=OrderType.FOK
                 )
                 # Let the v2 client auto-detect neg_risk per token via its
                 # internal get_neg_risk() API call (result is cached).
@@ -4683,8 +4308,8 @@ class CryptoGhostScanner:
                     try:
                         _r2_args   = MarketOrderArgs(
                             token_id=token_id, amount=size,
-                            side=BUY, order_type=OrderType.FOK,
-                            price=ask)
+                            price=ask,                          # cap fill at signal price
+                            side=BUY, order_type=OrderType.FOK)
                         _r2_signed = self.client.create_market_order(_r2_args)
                         _r2_resp   = self.client.post_order(_r2_signed, OrderType.FOK)
                         if _r2_resp:
@@ -4713,31 +4338,24 @@ class CryptoGhostScanner:
             if order_id:
                 # ── Register with ghost guard ─────────────────────────────────
                 if self.guard and not PAPER_TRADE:
-                    self.guard.register_order(
-                        order_id, token_id, coin,
-                        tier=f"T{tier}", ask_price=ask, size_usdc=size
-                    )
-                    self.guard.confirm_fill(
-                        order_id, filled=True, fill_price=fill_price
-                    )
+                    try:
+                        self.guard.register_order(
+                            order_id, token_id, coin,
+                            tier=f"T{tier}", ask_price=ask, size_usdc=size
+                        )
+                    except Exception as _ge:
+                        # Guard DB write failed — non-critical, must NOT abort log_trade
+                        print(f"[GhostGuard] register_order failed (non-fatal): {_ge}")
 
-                # DB write BEFORE open_positions — if DB fails, no orphaned
-                # in-memory position that can never be cleaned up.
-                try:
-                    log_trade(tier, coin, market.get("id",""),
-                              token_id, question, ask, size, order_id, outcome,
-                              fill_price=fill_price, fill_size=fill_size,
-                              ghost_score=ghost_score)
-                except Exception as _db_err:
-                    print(f"  DB write failed for {coin} {outcome}: {_db_err}")
-                    return False
-
+                _fire_ts = datetime.now(timezone.utc).isoformat()
                 self.open_positions[token_id] = {
                     "tier": tier, "coin": coin, "question": question,
                     "entry": ask,        "size":       size,
                     "fill_price": fill_price, "fill_size": fill_size,
                     "order_id": order_id, "ts": time.time(),
-                    "outcome": outcome,   # CRITICAL: T3 DOUBLE reads this to compute opposite leg
+                    "fire_ts": _fire_ts,
+                    "market_id": market.get("id", ""),
+                    "direction": outcome,
                 }
                 PERF_ANALYTICS.record_fill(token_id, fill_price, fill_size, ask)
                 if LATENCY_TRACK_ENABLED:
@@ -4748,6 +4366,10 @@ class CryptoGhostScanner:
                     LATENCY_TRACKER.record_execution(
                         tier, coin, token_id, _mv_age, _ord_ms, 0.0,
                         LATENCY_TRACKER.get_freshness_mult(coin, _lat_dir))
+                log_trade(tier, coin, market.get("id",""),
+                          token_id, question, ask, size, order_id, outcome,
+                          fill_price=fill_price, fill_size=fill_size,
+                          ghost_score=ghost_score)
                 self.trades_fired += 1
 
                 # Show fill accuracy: signal price vs actual fill
@@ -4757,7 +4379,7 @@ class CryptoGhostScanner:
                 payout    = round(fill_size / fill_price - fill_size, 2) if fill_price > 0 else 0
                 ts        = datetime.now().strftime("%H:%M:%S")
                 mode_tag  = "[PAPER]" if PAPER_TRADE else "[LIVE] "
-                tier_names = {1:"WRAITH",2:"SPECTER",3:"DOUBLE"}
+                tier_names = {1:"WRAITH",2:"SPECTER"}
                 # Latency breakdown: sign time + network round-trip (Punisher L43)
                 _sign_ms = round((locals().get("_t_send", _t_fire)
                                   - locals().get("_t_sign", _t_fire)) * 1000, 1)
@@ -4775,7 +4397,7 @@ class CryptoGhostScanner:
                 if TELEGRAM_ENABLED:
                     try:
                         asyncio.create_task(_tg_send(
-                            f"👻 <b>GHOST LATTICE</b> | 🎯 <b>FIRE T{tier} {coin} {outcome}</b> {mode_tag.strip()}\n"
+                            f"🎯 <b>FIRE T{tier} {coin} {outcome}</b> {mode_tag.strip()}\n"
                             f"Entry <code>${ask:.3f}</code>  "
                             f"Size <code>${size}</code>  "
                             f"Payout <code>+${payout:.2f}</code>\n"
@@ -4815,6 +4437,41 @@ class CryptoGhostScanner:
             except Exception as e:
                 print(f"[WARN] Paper position check: {e}")
             return
+
+        # ── Ghost recovery: retroactively log positions missing from DB ──────────
+        # Catches ghost fills: order placed on Polymarket but log_trade() failed.
+        # Runs every ~60s so missing trades appear in DB within one cycle.
+        try:
+            _conn_gr = None
+            try:
+                _conn_gr = _db()
+                _db_open = {row[0] for row in _conn_gr.execute(
+                    "SELECT token_id FROM trades WHERE status='open'"
+                ).fetchall()}
+            finally:
+                if _conn_gr:
+                    try: _conn_gr.close()
+                    except Exception: pass
+            for _tid, _tr in list(self.open_positions.items()):
+                if _tid not in _db_open:
+                    _age = time.time() - _tr.get("ts", time.time())
+                    _ts_now = datetime.now().strftime("%H:%M:%S")
+                    print(f"[{_ts_now}] [GhostRecovery] {_tr.get('coin','?')} "
+                          f"{_tid[:8]}... not in DB (age={_age:.0f}s) — logging retroactively")
+                    log_trade(
+                        _tr.get("tier", 2), _tr.get("coin", "?"),
+                        _tr.get("market_id", ""), _tid,
+                        _tr.get("question", "?"),
+                        _tr.get("entry", 0), _tr.get("size", 0),
+                        _tr.get("order_id", ""),
+                        _tr.get("direction", "?"),
+                        fill_price=_tr.get("fill_price"),
+                        fill_size=_tr.get("fill_size"),
+                        ghost_score=0.0,
+                        _ts=_tr.get("fire_ts"),
+                    )
+        except Exception as _gre:
+            print(f"[WARN] Ghost recovery check: {_gre}")
 
         # Live mode: poll Polymarket positions API
         try:
@@ -4883,14 +4540,19 @@ class CryptoGhostScanner:
                                 print(f"[{ts}] [AdaptiveRisk] {self.consecutive_losses} losses — "
                                       f"sizing at {LOSS_SIZE_FACTOR:.0%} (≈${reduced:.2f}/trade)")
 
-                    conn = _db(timeout=10)
-                    conn.execute(
-                        "UPDATE trades SET status=?,pnl=?,closed_at=? WHERE token_id=? AND status='open'",
-                        (outcome, pnl, datetime.now(timezone.utc).isoformat(), tid)
-                    )
-                    conn.commit()
-                    conn.close()
-                    closed_ids.append(tid)
+                    _upd_conn = None
+                    try:
+                        _upd_conn = _db(timeout=10)
+                        _upd_conn.execute(
+                            "UPDATE trades SET status=?,pnl=?,closed_at=? WHERE token_id=? AND status='open'",
+                            (outcome, pnl, datetime.now(timezone.utc).isoformat(), tid)
+                        )
+                        _upd_conn.commit()
+                        closed_ids.append(tid)
+                    finally:
+                        if _upd_conn:
+                            try: _upd_conn.close()
+                            except Exception: pass
             for tid in closed_ids:
                 del self.open_positions[tid]
         except Exception as e:
@@ -4901,14 +4563,7 @@ class CryptoGhostScanner:
                                   markets: List[dict]):
         fired     = 0
         skip_ask  = 0; skip_liq = 0; skip_cert = 0; skip_win = 0; signals = 0; skip_silent = 0; skip_vel = 0; skip_book = 0; skip_ws_qual = 0
-        skip_cert_tags: Dict[str, int] = {}   # per-tag cert-kill breakdown
         _recent_fires: dict = {}  # (coin,tier,direction) -> monotonic_ts
-
-        def _cert(tag: str):
-            """Increment skip_cert and record which gate killed the signal."""
-            nonlocal skip_cert
-            skip_cert += 1
-            skip_cert_tags[tag] = skip_cert_tags.get(tag, 0) + 1
 
         async def check_market(m):
             """
@@ -4924,7 +4579,7 @@ class CryptoGhostScanner:
             coin = get_coin(q)
             if not coin or "up or down" not in q.lower():
                 return
-            tier = classify_tier(q)
+            tier = m.get("_forced_tier") or classify_tier(q)
             if tier not in (1, 2):
                 return
             mins = m.get("_mins_left", 9999)
@@ -4942,12 +4597,16 @@ class CryptoGhostScanner:
             if tier == 2 and (secs > T2_MAX_SECS_LEFT or secs < T2_MIN_SECS_LEFT):
                 skip_win += 1
                 return
+            # T2 min-dev gate moved AFTER dev assignment (L72: dev unbound if gate here)
             # T1/T3/T4 (15-min, hourly, daily): fire at ≥5 min remaining.
             #   JonathanPetersonn repo (61.4% WR, 5,017 trades): fires at ≥5 min.
             #   MMs on longer markets reprice slowly; lag window is earlier and wider.
-            if tier == 1 and secs < T1_MIN_SECS_LEFT:
-                skip_win += 1
-                return
+            if tier == 1:
+                _is_5m_t1 = m.get("_forced_tier") == 1  # dual-tier 5-min contrarian pass
+                _t1_secs_floor = T1_5M_MIN_SECS_LEFT if _is_5m_t1 else T1_MIN_SECS_LEFT
+                if secs < _t1_secs_floor:
+                    skip_win += 1
+                    return
 
             # ── Punisher L1 warmup quality gate ──────────────────────────────
             # Before spending any HTTP or compute budget, confirm we have at least
@@ -4996,6 +4655,7 @@ class CryptoGhostScanner:
 
             _market_start_ts: Optional[float] = None  # set below for time-range markets
             _mkt_dur_mins:   Optional[float] = None  # window length (mins)
+            dev: Optional[float] = None  # L81: guard against UnboundLocalError if get_deviation throws
             if tier in (1, 2):
                 # T1 contrarian + T2 oracle-lag both anchor dev to their market's own start.
                 # T1: if BTC rose since 1:00PM (15-min market), we fade that move → need
@@ -5021,25 +4681,24 @@ class CryptoGhostScanner:
             # 5-minute market flag — detected from title time range ≤ 5 min
             _is_5m = (tier == 2 and _mkt_dur_mins is not None and _mkt_dur_mins <= 5.5)
             if dev is None:
-                _cert("dev_none")
+                skip_cert += 1
                 return
             if abs(dev) < MIN_TREND_STRENGTH:
-                _cert("dev_weak")
+                skip_cert += 1
                 return
 
             # ── 15-minute trend confirmation (Punisher filter) ────────────────
-            # For T2 only: require the 15-min trend to AGREE with the 5-min
-            # signal direction. Counter-trend 5m plays are the primary bleed
-            # source — if 15m is pointing the other way by ≥ 0.10%, skip it.
-            # Returns None during warmup (<2 candles) → fail-open, let through.
-            if tier == 2:
-                _dev_15m = self.tracker.get_deviation_15m(coin)
-                if _dev_15m is not None and abs(_dev_15m) >= DEV_15M_THRESH:
-                    _15m_up = _dev_15m > 0
-                    _5m_up  = dev > 0
-                    if _15m_up != _5m_up:   # 15m opposes 5m direction
-                        _cert("15m_oppose")
-                        return
+            # ALL markets (unified T1): block if 15m and 5m move IN THE SAME direction.
+            # Same direction = sustained trend = hard to fade. Block it.
+            # Opposite directions = micro-dip inside a longer opposing trend = ideal fade.
+            # Fail-open when warmup data absent (<2 candles) — never blocks on missing data.
+            _dev_15m = self.tracker.get_deviation_15m(coin)
+            if _dev_15m is not None and abs(_dev_15m) >= DEV_15M_THRESH:
+                _15m_up = _dev_15m > 0
+                _5m_up  = dev > 0
+                if _15m_up == _5m_up:   # 15m + 5m same direction = sustained trend = skip fade
+                    skip_cert += 1
+                    return
 
             # Compute entry ceiling and intended size BEFORE orderbook fetch so
             # best_ask_info() can sum cumulative depth up to our price ceiling.
@@ -5081,10 +4740,10 @@ class CryptoGhostScanner:
             _gb_score, _gb_state, _gb_learned = _read_ghost_brain(coin)
             if LAZY_ORDERBOOK:
                 # ── Predict cheap side from trend, fetch only that token ──
-                # T1/T2/T4: oracle-lag — cheap side AGREES with Binance move (WITH trend).
-                # T3: contrarian (fade) — 15-min market-start dev is the primary signal;
-                #     we buy the side the market HASN'T moved toward yet (mean-reversion).
-                want_up           = (dev < 0) if tier == 1 else (dev > 0)
+                # T1+T2 unified WRAITH contrarian: AGAINST Binance deviation always.
+                # T2 5-min markets now use the same fade logic as T1 15-min.
+                # Cheap side is the side the market HASN'T moved toward (mean-reversion).
+                want_up           = (dev > 0) if tier == 2 else (dev < 0)  # T2 oracle-lag (pbot): WITH Binance; T1 contrarian: AGAINST
                 target_token_id   = None
                 target_outcome    = "UP" if want_up else "DOWN"
                 up_aliases   = ("UP", "YES", "HIGHER", "ABOVE")
@@ -5181,8 +4840,7 @@ class CryptoGhostScanner:
             # is the 24h open deviation, not 10-tick (seconds) momentum.
             # T1 (contrarian) uses a relaxed momentum threshold (half of T2).
             # T2 (5-min oracle-lag) uses the full strict filter.
-            _vel = _mom = _vol = None
-            _obv = _rsi = None   # OBV + RSI Punisher indicators (computed below)
+            _vel = _mom = _vol = _obv = _rsi = None
             _trend_applies = TREND_ENHANCED and tier in (1, 2)
             if _trend_applies:
                 _n   = TREND_N_TICKS
@@ -5209,30 +4867,26 @@ class CryptoGhostScanner:
                     if tier != 2 and abs(_vel) < TREND_VELOCITY_MIN:
                         skip_vel += 1
                         return  # price stalled — no edge in either direction
-                    # T2 only: vel must agree with direction (stale-ask window — reversal is fatal).
-                    # T1 contrarian: vel direction exempt — market-start dev is the primary signal.
-                    if tier == 2:
-                        if (buying_up and _vel < 0) or (not buying_up and _vel > 0):
-                            skip_vel += 1
-                            return  # price moving opposite to our trade direction
+                    # T2 velocity direction check REMOVED (L75):
+                    # Oracle-lag edge = total dev from market open, NOT instantaneous velocity.
+                    # MM hasn't repriced in the stale window regardless of last-10-tick direction.
+                    # A 1-2 tick reversal in choppy conditions killed every T2 signal.
+                    # OBV_KILL_THRESH=-0.60 still blocks strongly counter-trend volume.
+                    # T1 contrarian: velocity direction also exempt — dev is primary signal.
 
-                    # Momentum: are enough recent ticks aligned? (T3 threshold halved)
+                    # Momentum: magnitude gate only — market must not be dead flat.
                     if abs(_mom) < _mom_min:
-                        _cert("mom_low")
-                        return  # choppy / oscillating — not a clean trend
-                    # T2 only: momentum direction must agree.
-                    # T1 contrarian: momentum direction exempt (wider window, dev is primary signal).
-                    if tier == 2:
-                        if (buying_up and _mom < 0) or (not buying_up and _mom > 0):
-                            _cert("mom_dir")
-                            return  # net tick direction contradicts our bet
+                        skip_cert += 1
+                        return  # near-zero momentum — no trend to exploit
+                    # T2 momentum direction check REMOVED (same reason as velocity above).
+                    # T1 contrarian: momentum direction exempt — wider window, dev is primary.
 
                     # Volatility: market alive but not spiking?
                     if _vol < TREND_VOLATILITY_MIN:
-                        _cert("vol_low")
+                        skip_cert += 1
                         return  # flat/dead market
                     if _vol > TREND_VOLATILITY_MAX:
-                        _cert("vol_high")
+                        skip_cert += 1
                         return  # extreme spike noise
             # T4 daily: trend filter bypassed — edge is 24h open deviation only
             # ────────────────────────────────────────────────────────────────────
@@ -5240,33 +4894,26 @@ class CryptoGhostScanner:
             # ── Whole-coin skip (independent of BIAS_FILTERS) ──
             _coin_u = (coin or "").upper()
             if _coin_u in SKIP_COINS:
-                _cert("skip_coin")
+                skip_cert += 1
                 return  # silent — counted in scan summary
+
+            # ── Direction-biased coin skip (SKIP_DOWN_BIASED_COINS) ──────────
+            # Blocks DOWN bets on coins with confirmed bull bias in current regime.
+            # Previously loaded but never checked — gate was silent/dead. Fixed 2026-05-22.
+            if not buying_up and _coin_u in SKIP_DOWN_BIASED_COINS:
+                skip_cert += 1
+                return
 
             # ── Per-coin daily trade cap — stop hammering same coin all day ──
             if MAX_TRADES_PER_COIN_DAY > 0:
                 _daily_coin = get_daily_coin_trades(_coin_u)
                 if _daily_coin >= MAX_TRADES_PER_COIN_DAY:
-                    _cert("daily_cap")
+                    skip_cert += 1
                     return  # silent — daily cap hit for this coin
 
             # ── Bias-aware filters (data-backed, on actual cheap side) ──
             if BIAS_FILTERS_ENABLED:
                 _h       = _et_hour()
-                if COIN_DIR.is_blocked(_coin_u, buying_up, tier):
-                    _cert("coin_dir")
-                    return  # silent — CoinDirEngine auto-blocked this coin+direction
-                if buying_up and _h in DEAD_UP_HOURS_ET:
-                    _cert("dead_up")
-                    return  # silent
-                if not buying_up and _h in DEAD_DOWN_HOURS_ET:
-                    _cert("dead_dn")
-                    return  # silent
-                # ── Ghost Memory hour bias gate (v2: coin-aware) ───────────
-                _utc_h = datetime.now(timezone.utc).hour
-                if HOUR_BIAS.should_skip(buying_up, _utc_h, _coin_u):
-                    _cert("hour_bias")
-                    return  # silent
 
             # Trend filter already gated above. Just final invariants.
             if not token_id or ask is None or ask <= 0:
@@ -5301,7 +4948,7 @@ class CryptoGhostScanner:
                 return
             # 5m certainty gate — active (hourly MIN_NO_PRICE gate is disabled)
             if _is_5m and no_implied < T2_5M_MIN_NO:
-                _cert("5m_no")
+                skip_cert += 1
                 return
             # Cumulative depth check: liq = sum of USDC at ask levels ≤ max_e.
             # Must cover the full intended bet size to avoid partial fills.
@@ -5323,7 +4970,7 @@ class CryptoGhostScanner:
             # T2 data: XRP disc≈0.433 (pass), BTC disc≈0.109 (borderline, now cut at 0.10).
             disc_score = abs(dev) / ask if ask > 0 else 0.0
             if ORACLE_DISC_ENABLED and tier == 2 and disc_score < ORACLE_DISC_MIN_RATIO:
-                _cert("oracle_disc")
+                skip_cert += 1
                 return
 
             # ── Oracle arbitrage score (PATH B) — runs FIRST so fair_p ──────────
@@ -5367,7 +5014,7 @@ class CryptoGhostScanner:
             # filter 4 — bad price zone: handled upstream by T*_MAX_ENTRY checks
             # filter 5 — late noise: hard floor across all tiers (T2 also has T2_MIN_SECS_LEFT)
             if secs < KILL_SECS_MIN:
-                _cert("secs_min")
+                skip_cert += 1
                 return
             # filter 6 — conflict: same coin+tier+direction fired recently
             # Akey et al: elite signals (arb_score >= ARB_OVERRIDE_SCORE) bypass cooldown.
@@ -5376,7 +5023,7 @@ class CryptoGhostScanner:
             _fire_age = time.monotonic() - _recent_fires.get(_fire_key, 0.0)
             _elite_bypass = ELITE_COOLDOWN_BYPASS and arb_score >= ARB_OVERRIDE_SCORE
             if _fire_age < KILL_COOLDOWN_SECS and not _elite_bypass:
-                _cert("cooldown")
+                skip_cert += 1
                 return
 
             # filter 7 — depth imbalance: skip if book is strongly against our direction
@@ -5387,19 +5034,19 @@ class CryptoGhostScanner:
                 # For DOWN bets: flip sign so same threshold applies in both directions
                 _dir_imb = _imb if buying_up else -_imb
                 if _dir_imb < KILL_DEPTH_IMBALANCE:
-                    _cert("depth_imb")
+                    skip_cert += 1
                     return
 
             # filter 8 — dev ceiling: underlying moved too much → oracle likely updated
             # Backtest: BTC_move >= 0.07% → 0% WR even in best entry range (0.05-0.08).
             if KILL_DEV_MAX > 0 and abs(dev) > KILL_DEV_MAX:
-                _cert("dev_max")
+                skip_cert += 1
                 return
 
             # filter 9 — velocity ceiling: BTC moving too fast = market makers repriced
             # Micro-lag arb edge lives at LOW velocity (oracle just starting to lag).
             if KILL_VELOCITY_MAX > 0 and _vel is not None and abs(_vel) > KILL_VELOCITY_MAX:
-                _cert("vel_max")
+                skip_cert += 1
                 return
 
             # ── Confidence score (6-component) ────────────────────────────────
@@ -5416,15 +5063,12 @@ class CryptoGhostScanner:
             # Not a hard kill — confidence gate still decides. Wires _dir_aligned into score.
             if not _dir_aligned:
                 confidence *= 0.92
-            # Hour confidence weight -- boost high-EV hours, reduce negative-EV hours
-            _hw = _et_hour()
-            if HOUR_BOOST_FACTOR != 1.0 and _hw in HOUR_BOOST_HOURS_ET:
-                confidence = min(confidence * HOUR_BOOST_FACTOR, 1.0)
-            elif HOUR_REDUCE_FACTOR != 1.0 and _hw in HOUR_REDUCE_HOURS_ET:
-                confidence = confidence * HOUR_REDUCE_FACTOR
 
-            if confidence < _adap_eff_conf():
-                _cert("conf")
+            # oracle-lag-sniper all tiers: confidence gate bypassed.
+            # Model underscores price_score (= 0 near ceiling) and mismatch component
+            # (Gaussian underestimates true WR on stale MM asks). Disabled across all tiers.
+            if False and confidence < _adap_eff_conf():
+                skip_cert += 1
                 return
 
             # ── Dynamic position sizing ────────────────────────────────────────
@@ -5464,49 +5108,58 @@ class CryptoGhostScanner:
             # If a discovery wallet recently traded this market in the same
             # direction, boost confidence (+WHALE_CONF_BOOST) and priority.
             # "both" directions (whale hedging) = no directional preference.
-            _cid = m.get("conditionId", "") or m.get("id", "")
+            _cid = m.get("conditionId") or m.get("id", "")  # conditionId first — whale cache keyed by hex conditionId
             _whale_hit = _whale_signals.get(_cid)
             if _whale_hit:
-                _whale_dir = _whale_hit.get("direction", "both")
-                _our_dir   = "up" if buying_up else "down"
+                _whale_dir   = _whale_hit.get("direction", "both")
+                _whale_count = max(_whale_hit.get("count", 1), 1)
+                _our_dir     = "up" if buying_up else "down"
                 if _whale_dir == "both":
-                    pass  # whale hedging — neutral, no boost
+                    pass  # conflicting whales — neutral, no boost
                 elif _whale_dir == _our_dir:
-                    confidence = min(confidence + WHALE_CONF_BOOST, 1.0)
+                    # Cluster amplifier: each additional agreeing whale stacks the boost
+                    # 1 whale = +0.03, 2 whales = +0.06, 3 whales = +0.09 (capped at 1.0)
+                    confidence = min(confidence + WHALE_CONF_BOOST * _whale_count, 1.0)
                 # Direction mismatch: mild confidence reduction (whale went other way)
                 else:
                     confidence = max(confidence - 0.02, 0.0)
 
-            # ── OBV volume confirmation (Punisher indicator) ─────────────────
-            # _obv_align: +1 = per-tick volume confirms our bet, −1 = opposes.
-            # > +0.30 → soft confidence boost. < OBV_KILL_THRESH → hard kill.
+            # ── OBV volume confirmation ───────────────────────────────────────
+            # _obv_align: +1 = volume confirms OUR bet, -1 = volume opposes it.
+            # Contrarian bot: buying_up means dev<0 (price fell), betting reversal up.
+            # OBV slope +1 = up-tick volume dominant = aligns with our UP reversal bet.
+            # OBV slope -1 = down-tick volume dominant = aligns with DOWN reversal bet.
             if OBV_CONFIRM_ENABLED and _obv is not None:
                 _obv_align = _obv if buying_up else -_obv
                 if _obv_align > 0.30:
+                    # Volume confirms our bet direction — small confidence lift
                     confidence = min(confidence + OBV_CONF_BOOST, 1.0)
                 elif _obv_align < OBV_KILL_THRESH:
-                    _cert("obv_kill")
-                    return  # volume strongly against bet — skip
+                    # Volume strongly opposing our bet — skip (trend not exhausting)
+                    skip_cert += 1
+                    return
 
-            # ── RSI-14 direction confirmation (1m candles, Punisher) ─────────
-            # Contrarian: overbought RSI confirms DOWN bet, oversold confirms UP.
-            # Soft-only boost (no hard kill — RSI alone is noisy).
+            # ── RSI-14 direction confirmation (1m candles) ───────────────────────
+            # Contrarian: dev UP → we bet DOWN → overbought RSI confirms exhaustion.
+            #             dev DOWN → we bet UP → oversold RSI confirms exhaustion.
             if RSI_ENABLED and _rsi is not None:
-                _rsi_confirm = ((_rsi > RSI_OVERBOUGHT and not buying_up) or
-                                (_rsi < RSI_OVERSOLD   and     buying_up))
+                _rsi_confirm = (_rsi > RSI_OVERBOUGHT and not buying_up) or \
+                               (_rsi < RSI_OVERSOLD and buying_up)
                 if _rsi_confirm:
                     confidence = min(confidence + RSI_CONF_BOOST, 1.0)
 
-            # Arb-amplified priority: arb_score [0,1] adds up to +100% boost
+            # Priority boost only when whale direction matches ours — mismatch gets no lift
+            _our_dir_check = "up" if buying_up else "down"
             _whale_priority_mult = (WHALE_PRIORITY_BOOST
-                                    if _whale_hit and _whale_hit.get("direction") != "both"
+                                    if _whale_hit
+                                    and _whale_hit.get("direction") == _our_dir_check
                                     else 1.0)
             priority_score = disc_score * no_implied * (1.0 + arb_score) * _whale_priority_mult
             # Override requires BOTH statistical confidence (arb_score) AND
             # confirmed active velocity — price must still be moving fast,
             # not just have moved. Prevents low-velocity stale signals from
             # bypassing TOP_N even when the statistical mismatch is large.
-            arb_override = ARB_ENABLED and ELITE_COOLDOWN_BYPASS and arb_score >= ARB_OVERRIDE_SCORE
+            arb_override   = False  # ARB_ENABLED=false
 
             # ── Tick freshness boost ─────────────────────────────────────────
             # Fresh Binance move (<3s) = oracle lag almost certainly still open.
@@ -5517,38 +5170,17 @@ class CryptoGhostScanner:
                           if LATENCY_TRACK_ENABLED else 1.0)
             priority_score *= _freshness
 
-            # ── Preferred-coin priority boost ────────────────────────────────
-            # Lifts BTC/ETH over SOL/XRP-heavy noise. No effect if dict empty.
-            _coin_boost = PREFERRED_COINS_BOOST.get(coin.upper(), 1.0)
-            if _coin_boost != 1.0:
-                priority_score *= _coin_boost
+            # ── Preferred coin baseline boost ────────────────────────────────────
+            # Gives BTC/ETH a standing priority advantage over SOL/XRP regardless
+            # of whale activity — helps them surface in top-N even without confluence
+            # Coin boost removed 2026-05-22 — whale boost (×1.80) is the sole ranking signal
 
             # ── Hard freshness gate ──────────────────────────────────────────────
             # Soft multiplier above only re-orders signals; stale signals still fire.
             # This hard gate KILLS signals where the oracle lag window has expired.
             # Research: window ≈55s; production move_age P50=88s → firing post-window.
-            if LATENCY_TRACK_ENABLED:
-                _move_age = LATENCY_TRACKER.get_move_age_secs(coin, _direction)
-                if _move_age > KILL_FRESHNESS_SECS:
-                    _cert("freshness")
-                    return
             # Mark this (coin,tier,direction) as recently fired for conflict filter
             _recent_fires[_fire_key] = time.monotonic()
-
-            # ── Dual-fire check ──────────────────────────────────────────────────
-            # When we already hold the opposite leg AND this side is ≤
-            # DUAL_FIRE_MAX_ENTRY: one side must settle at $1 → guaranteed net profit.
-            # Bypasses kill_check in fire_trade — direction gates are irrelevant.
-            _is_dual_fire = False
-            if DUAL_FIRE_ENABLED and ask <= DUAL_FIRE_MAX_ENTRY:
-                _opp_tid = next(
-                    (tok.get("token_id") or tok.get("id")
-                     for tok in tokens if isinstance(tok, dict)
-                     and (tok.get("token_id") or tok.get("id")) != token_id),
-                    None
-                )
-                if _opp_tid and _opp_tid in self.open_positions:
-                    _is_dual_fire = True
 
             return {
                 "tier":           tier,
@@ -5567,7 +5199,6 @@ class CryptoGhostScanner:
                 "confidence":     confidence,
                 "dyn_size":       dyn_size,
                 "seg_mult":       1.0,
-                "dual_fire":      _is_dual_fire,
                 # Arb engine metrics (PATH B)
                 "fair_p":         fair_p,
                 "mismatch":       mismatch,
@@ -5577,6 +5208,8 @@ class CryptoGhostScanner:
                 "velocity":       _vel,
                 "momentum":       _mom,
                 "volatility":     _vol,
+                "obv_slope":      _obv,
+                "rsi":            _rsi,
                 "signal_ts":      time.monotonic(),
                 "freshness":      _freshness,
                 "ghost_score":    _gb_score,
@@ -5584,7 +5217,19 @@ class CryptoGhostScanner:
 
 
         # ── Collect all valid signals across every market in this cycle ──────
-        raw = await asyncio.gather(*[check_market(m) for m in markets])
+        # Dual-tier expansion: 5-min markets run as BOTH T1 (contrarian 10-22¢)
+        # AND T2 (oracle-lag 28-78¢). Stamp _forced_tier so check_market uses it.
+        _expanded: list = []
+        for _m in markets:
+            _nat = classify_tier(_m.get("question", ""))
+            if _nat == 2:                    # 5-min market
+                _t1 = dict(_m); _t1["_forced_tier"] = 1   # contrarian pass
+                _t2 = dict(_m); _t2["_forced_tier"] = 2   # oracle-lag pass
+                _expanded.append(_t1)
+                _expanded.append(_t2)
+            else:
+                _expanded.append(_m)         # 15-min / hourly — single T1 pass
+        raw = await asyncio.gather(*[check_market(m) for m in _expanded])
         all_signals = [s for s in raw if s is not None]
         signals = len(all_signals)
 
@@ -5654,126 +5299,16 @@ class CryptoGhostScanner:
                     sig["market"], sig["ask"],
                     outcome=sig["outcome"], session=session,
                     size=sig.get("dyn_size"),
-                    ghost_score=sig.get("ghost_score", 0),
-                    dual_fire=sig.get("dual_fire", False)):
+                    ghost_score=sig.get("ghost_score", 0)):
                 fired += 1
                 await asyncio.sleep(0.3)
 
-        return fired, skip_ask, skip_liq, skip_cert, skip_win, signals, skip_silent, skip_vel, skip_book, skip_ws_qual, skip_cert_tags
-
-    async def _check_t3_double(self, session: aiohttp.ClientSession,
-                                markets: List[dict]) -> int:
-        """T3 DOUBLE — insurance hedge on already-open positions.
-
-        Bypasses ALL soft gates (SKIP_DOWN_BIASED_COINS, HourBias, CoinDir,
-        confidence, freshness, cooldown). Fires ONLY when:
-          1. self.open_positions has a non-T3 leg of this market (avoid hedging a hedge)
-          2. Opposite token's ask ∈ [T3_DOUBLE_MIN_ENTRY, T3_DOUBLE_MAX_ENTRY]
-          3. Book liquidity ≥ T3_DOUBLE_SIZE_USDC
-          4. Opposite token not already in open_positions or _pending
-          5. CLOB not in maintenance (_CLOB_DOWN check inside fire_trade)
-
-        Returns: number of T3D positions fired this cycle.
-        """
-        if not T3_DOUBLE_ENABLED or not self.open_positions or not markets:
-            return 0
-        if (len(self.open_positions) + len(self._pending)) >= MAX_OPEN_POSITIONS:
-            return 0
-
-        # Build market lookup: token_id → (market, opposite_token_id)
-        # Skip markets that don't have at least 2 token sides.
-        _market_by_tid: Dict[str, Tuple[dict, str]] = {}
-        for m in markets:
-            tokens = m.get("tokens", []) or []
-            tids = []
-            for tok in tokens:
-                if isinstance(tok, dict):
-                    tid = tok.get("token_id") or tok.get("id")
-                    if tid:
-                        tids.append(str(tid))
-            if len(tids) >= 2:
-                # Map each token to its market and opposite token
-                _market_by_tid[tids[0]] = (m, tids[1])
-                _market_by_tid[tids[1]] = (m, tids[0])
-
-        fired_count = 0
-        for token_id, pos in list(self.open_positions.items()):
-            # Skip if this position is itself a T3 (don't hedge a hedge)
-            if pos.get("tier") == 3:
-                continue
-
-            lookup = _market_by_tid.get(str(token_id))
-            if not lookup:
-                continue   # market not in current scan window
-            market, opp_tid = lookup
-
-            # Skip if opposite leg already held or being filled
-            if opp_tid in self.open_positions or opp_tid in self._pending:
-                continue
-
-            # Determine opp_outcome from opp_tid's actual token metadata.
-            # Authoritative — earlier path inverted pos.outcome with a "UP"
-            # fallback, which made every T3 fire DOWN when pos.outcome was
-            # missing/None (open_positions doesn't always carry outcome).
-            _up_aliases   = ("UP","YES","HIGHER","ABOVE")
-            _down_aliases = ("DOWN","NO","LOWER","BELOW")
-            opp_outcome = None
-            for _tok in (market.get("tokens") or []):
-                if not isinstance(_tok, dict):
-                    continue
-                if str(_tok.get("token_id") or _tok.get("id")) != str(opp_tid):
-                    continue
-                _o = (_tok.get("outcome") or "").upper()
-                if _o in _up_aliases:
-                    opp_outcome = "UP"
-                elif _o in _down_aliases:
-                    opp_outcome = "DOWN"
-                break
-            if opp_outcome is None:
-                continue   # token outcome metadata missing — don't guess
-            orig_outcome = (pos.get("outcome") or "?").upper()
-
-            # Fetch opposite leg orderbook (fresh)
-            book = await get_orderbook(session, opp_tid, max_age_ms=500)
-            if not book:
-                continue
-
-            ask, liq = best_ask_info(book, max_price=T3_DOUBLE_MAX_ENTRY)
-            if ask is None:
-                continue
-            # Strict range check
-            if ask < T3_DOUBLE_MIN_ENTRY or ask > T3_DOUBLE_MAX_ENTRY:
-                continue
-            # Liquidity must cover the bet
-            if liq < T3_DOUBLE_SIZE_USDC:
-                continue
-
-            # Fire — dual_fire=True bypasses kill_check() in fire_trade
-            ts = datetime.now().strftime("%H:%M:%S")
-            print(f"[{ts}] [T3-DOUBLE] Triggering hedge: {pos.get('coin','?')} "
-                  f"orig={orig_outcome} -> opp={opp_outcome} @${ask:.3f} "
-                  f"size=${T3_DOUBLE_SIZE_USDC:.2f}")
-
-            ok = await self.fire_trade(
-                tier=3, coin=pos.get("coin","?"), token_id=opp_tid,
-                market=market, ask=ask, outcome=opp_outcome,
-                session=session, size=T3_DOUBLE_SIZE_USDC,
-                dual_fire=True, ghost_score=0,
-            )
-            if ok:
-                fired_count += 1
-                log_event("🛡️", f"T3-DOUBLE hedge {pos.get('coin','?')} "
-                                  f"{opp_outcome} @${ask:.3f}")
-                await asyncio.sleep(0.3)   # small gap between fires
-
-        return fired_count
+        return fired, skip_ask, skip_liq, skip_cert, skip_win, signals, skip_silent, skip_vel, skip_book, skip_ws_qual
 
     async def refresh_opens_periodically(self):
         async with aiohttp.ClientSession() as session:
             while self.running:
                 await self.tracker.fetch_opens(session)
-                if self.guard and not PAPER_TRADE:
-                    self.guard.sweep_ghosts(self.client)
                 await asyncio.sleep(60)   # refresh every 60s (was 900) so opens stay current
 
     async def refresh_markets_periodically(self):
@@ -5827,8 +5362,6 @@ class CryptoGhostScanner:
         markets_task   = asyncio.create_task(self.refresh_markets_periodically())
         news_task      = asyncio.create_task(NEWS_MONITOR.run())
         clob_health_task  = asyncio.create_task(clob_health_monitor())
-        hour_bias_task    = asyncio.create_task(HOUR_BIAS.run_refresh_loop())
-        coin_dir_task     = asyncio.create_task(COIN_DIR.refresh_loop())
         # BUG FIX: WS_CLIENT was instantiated but start() was never called.
         # Without this, the entire WS orderbook loop never ran — every orderbook
         # fetch fell through to HTTP (50-200ms). With it, books are WS-pushed
@@ -5859,8 +5392,11 @@ class CryptoGhostScanner:
                     try:
                         from py_clob_client_v2.clob_types import (
                             BalanceAllowanceParams, AssetType)
-                        _br = self.client.get_balance_allowance(
-                            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+                        _loop = asyncio.get_event_loop()
+                        _br = await _loop.run_in_executor(
+                            None,
+                            lambda: self.client.get_balance_allowance(
+                                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)))
                         _raw = float(_br.get("balance", 0)) if isinstance(_br, dict) else 0.0
                         self._last_balance = _raw / 1_000_000
                     except Exception:
@@ -5972,13 +5508,8 @@ class CryptoGhostScanner:
 
                     result = await asyncio.wait_for(
                         self.scan_updown_markets(session, markets), timeout=30.0)
-                    _cert_tags: Dict[str, int] = {}
                     if isinstance(result, tuple):
-                        # Backwards compatible: accept 10-tuple (legacy) or 11-tuple (with cert tags).
-                        if len(result) >= 11:
-                            t234_fired, _sa, _sl, _sc, _sw, _sig, _ss, _sv, _sb, _swq, _cert_tags = result[:11]
-                        else:
-                            t234_fired, _sa, _sl, _sc, _sw, _sig, _ss, _sv, _sb, _swq = result
+                        t234_fired, _sa, _sl, _sc, _sw, _sig, _ss, _sv, _sb, _swq = result
                     else:
                         t234_fired = result or 0
                         _sa = _sl = _sc = _sw = _sig = _ss = _sv = _sb = _swq = 0
@@ -5989,25 +5520,8 @@ class CryptoGhostScanner:
                     skip_cert    += _sc
                     skip_win     += _sw
                     signals      += _sig
-                    skip_silent  += _ss
                     skip_vel     += _sv
-                    skip_book    += _sb
                     skip_ws_qual += _swq
-
-                    # \u2500\u2500 T3 DOUBLE check: hedge already-open positions \u2500\u2500\u2500\u2500\u2500
-                    # Runs AFTER main scan so any new positions fired this
-                    # cycle are visible to the hedge logic. Wrapped in
-                    # try/except so a failure here never breaks main loop.
-                    if T3_DOUBLE_ENABLED:
-                        try:
-                            t3d_fired = await asyncio.wait_for(
-                                self._check_t3_double(session, markets),
-                                timeout=10.0)
-                            fired += t3d_fired
-                        except asyncio.TimeoutError:
-                            log_event("\u26a0\ufe0f", "t3_double timeout")
-                        except Exception as e:
-                            log_event("\u26a0\ufe0f", f"t3_double error: {e}")
 
                 except asyncio.TimeoutError:
                     log_event("\u26a0\ufe0f", "scan_updown_markets timeout")
@@ -6028,34 +5542,31 @@ class CryptoGhostScanner:
                     elif self.consecutive_losses >= LOSS_STREAK_REDUCE:
                         _risk_str = (f"  \u26a0{self.consecutive_losses}L"
                                      f"@{LOSS_SIZE_FACTOR:.0%}")
-                # Build cert breakdown only if there were cert kills this scan.
-                _cert_str = ""
-                if _cert_tags:
-                    _parts = [f"{k}:{v}" for k, v in sorted(
-                        _cert_tags.items(), key=lambda kv: kv[1], reverse=True)]
-                    _cert_str = f"({','.join(_parts)})"
                 print(
                     f"[{datetime.now().strftime('%H:%M:%S')}] Scan {self.scan_count}"
-                    f" | Fired:{fired} | Skip ask:{skip_ask} cert:{skip_cert}{_cert_str}"
+                    f" | Fired:{fired} | Skip ask:{skip_ask} cert:{skip_cert}"
                     f" liq:{skip_liq} win:{skip_win} vel:{skip_vel}"
-                    f" wsq:{skip_ws_qual} silent:{skip_silent} book:{skip_book}"
-                    f" | Sig:{signals}"
+                    f" wsq:{skip_ws_qual} | Sig:{signals}"
                     f" | {elapsed * 1000:.0f}ms{_balance_str}{_risk_str}"
                 )
                 print(f"         {prices_str}")
                 log_scan_stats(len(markets), signals, skip_ask, skip_liq,
                                skip_cert, skip_win, int(elapsed * 1000),
-                               skip_vel)
-                await asyncio.sleep(SCAN_INTERVAL)
+                               skip_vel=skip_vel)
 
+                wait = max(0, SCAN_INTERVAL - elapsed)
+                await asyncio.sleep(wait)
 
-async def main():
-    scanner = CryptoGhostScanner()
-    await scanner.run()
-
+        ws_task.cancel()
+        opens_task.cancel()
+        markets_task.cancel()
+        news_task.cancel()
+        clob_health_task.cancel()
+        hour_bias_task.cancel()
+        coin_dir_task.cancel()
+        positions_task.cancel()
+        print(f"\n[STOPPED] PnL: ${self.session_pnl:+.2f}"
+              f" | Trades: {self.trades_fired}")
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n[STOPPED] GHOST LATTICE stopped.")
+    asyncio.run(CryptoGhostScanner().run())

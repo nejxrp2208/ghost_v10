@@ -83,7 +83,9 @@ class GhostFillGuard:
     # ── schema ────────────────────────────────────────────────────────────────
 
     def _conn(self):
-        return sqlite3.connect(self.db_path, timeout=10)
+        conn = sqlite3.connect(self.db_path, timeout=15)
+        conn.execute("PRAGMA busy_timeout=15000")
+        return conn
 
     def _ensure_schema(self):
         conn = self._conn()
@@ -183,28 +185,40 @@ class GhostFillGuard:
         # Set pending lock so we don't double-fire on same token
         self._pending_locks[token_id] = time.time() + DUP_LOCK_SEC
 
-        conn = self._conn()
-        try:
-            conn.execute("""
-                INSERT OR REPLACE INTO order_tracker
-                (order_id, token_id, coin, tier, ask_price, size_usdc,
-                 salt, submitted_at, filled, won, ghost)
-                VALUES (?,?,?,?,?,?,?,?,0,-1,0)
-            """, (order_id, token_id, coin, tier, ask_price, size_usdc, salt, now))
+        for _attempt in range(3):
+            try:
+                conn = self._conn()
+                conn.execute("""
+                    INSERT OR REPLACE INTO order_tracker
+                    (order_id, token_id, coin, tier, ask_price, size_usdc,
+                     salt, submitted_at, filled, won, ghost)
+                    VALUES (?,?,?,?,?,?,?,?,0,-1,0)
+                """, (order_id, token_id, coin, tier, ask_price, size_usdc, salt, now))
 
-            # Upsert coin_perf fires counter
-            conn.execute("""
-                INSERT INTO coin_perf (coin, fires, last_updated)
-                VALUES (?, 1, ?)
-                ON CONFLICT(coin) DO UPDATE SET
-                    fires        = fires + 1,
-                    total_staked = total_staked + ?,
-                    last_updated = ?
-            """, (coin, now, size_usdc, now))
+                # Upsert coin_perf fires counter
+                conn.execute("""
+                    INSERT INTO coin_perf (coin, fires, last_updated)
+                    VALUES (?, 1, ?)
+                    ON CONFLICT(coin) DO UPDATE SET
+                        fires        = fires + 1,
+                        total_staked = total_staked + ?,
+                        last_updated = ?
+                """, (coin, now, size_usdc, now))
 
-            conn.commit()
-        finally:
-            conn.close()
+                conn.commit()
+                conn.close()
+                break
+            except Exception as _ge:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                if _attempt < 2:
+                    import time as _t; _t.sleep(0.5 * (_attempt + 1))
+                else:
+                    log.warning("[GhostGuard] register_order failed 3x for %s: %s",
+                                order_id[:12], _ge)
+                    raise
 
         log.info("[GhostGuard] Registered order %s | %s %s @%.4f $%.2f salt=%d",
                  order_id[:12], coin, tier, ask_price, size_usdc, salt)
@@ -425,21 +439,4 @@ if __name__ == "__main__":
     oid2 = "order_ghost"
     guard.register_order(oid2, token, "ETH", "T2", ask_price=0.015, size_usdc=10.0)
     # Force the submitted_at to be old
-    conn = guard._conn()
-    conn.execute("UPDATE order_tracker SET submitted_at='2000-01-01T00:00:00+00:00' WHERE order_id=?", (oid2,))
-    conn.commit(); conn.close()
-    guard.sweep_ghosts(clob_client=None)
-    assert token in guard.ghost_locked_tokens()
-    print("Ghost cooldown confirmed on token.")
-
-    print("\n--- Test 3: blocked by ghost cooldown ---")
-    assert not guard.can_fire(token, "ETH")
-
-    print("\n--- Test 4: liquidity block ---")
-    token2 = "0xDEF456"
-    assert not guard.can_fire(token2, "SOL", ask_price=0.02, ask_liquidity=0.1)
-
-    guard.print_stats()
-
-    os.unlink(tmp_db)
-    print("All tests passed.")
+    conn = gu

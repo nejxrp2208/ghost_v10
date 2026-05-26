@@ -23,15 +23,23 @@ def _spawn_agents():
     env["PYTHONUTF8"]       = "1"
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONWARNINGS"]   = "ignore"
-    show_flags = subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
     for script in ["GHOST_LATTICE.py", "GHOST_LATTICE_resolver.py", "GHOST_LATTICE_redeemer.py"]:
         path = os.path.join(sd, script)
         if not os.path.exists(path):
             continue
-        proc = subprocess.Popen(
-            ["cmd.exe", "/k", py, "-u", "-X", "utf8", "-W", "ignore", path],
-            cwd=sd, env=env, creationflags=show_flags,
-        )
+        if sys.platform == "win32":
+            proc = subprocess.Popen(
+                ["cmd.exe", "/k", py, "-u", "-X", "utf8", "-W", "ignore", path],
+                cwd=sd, env=env, creationflags=subprocess.CREATE_NEW_CONSOLE,
+            )
+        else:
+            # Mac/Linux: redirect output to log files so Rich UI keeps the terminal
+            log_path = os.path.join(sd, f"{os.path.splitext(script)[0]}.log")
+            log_fh   = open(log_path, "a")
+            proc = subprocess.Popen(
+                [py, "-u", "-W", "ignore", path],
+                cwd=sd, env=env, stdout=log_fh, stderr=log_fh,
+            )
         _AGENTS.append(proc)
 
 def _kill_agents():
@@ -99,18 +107,7 @@ VEL_MIN   = float(os.getenv("TREND_VELOCITY_MIN",  "0.0003"))
 MOM_MIN   = float(os.getenv("TREND_MOMENTUM_MIN",  "0.05"))
 TREND_ENH = os.getenv("TREND_ENHANCED", "true").lower() in ("true","1","yes")
 CONF_MIN  = float(os.getenv("CONFIDENCE_MIN", "0.0"))
-HOUR_BIAS_MIN_SAMPLES = int(os.getenv("HOUR_BIAS_MIN_SAMPLES", "5"))
-HOUR_BIAS_MIN_WR      = float(os.getenv("HOUR_BIAS_MIN_WR",    "0.58"))
-
-# ── Ghost Memory stub (read-only view — populated by scanner process) ──────────
-class _HourBiasStub:
-    """Lightweight read-only stub populated from the scanner's DB at dashboard start."""
-    def __init__(self):
-        self._bias:     dict = {}
-        self._coin_bias: dict = {}
-        self._dow_bias: dict = {}
-
-HOUR_BIAS = _HourBiasStub()
+# Ghost Memory / HourBiasEngine deleted 2026-05-22 — simplicity pass
 
 # ── Dashboard theme ────────────────────────────────────────────────────────────
 DASHBOARD_THEME = os.getenv("DASHBOARD_THEME", "EIDOLON").upper()
@@ -479,8 +476,8 @@ def render_statistics():
 
     # ── TIER SNAPSHOT ─────────────────────────────────────────────
     t.add_row(Text.from_markup(f"[{_TH['sec']}]TIERS[/]"), Text(""))
-    tier_names = {1: "T1·WRAITH", 2: "T2·PHANTOM", 3: "T3·DOUBLE"}
-    tier_cols  = {1: _TH["tier"][1], 2: _TH["tier"][2], 3: _TH["tier"][3]}
+    tier_names = {1: "T1·WRAITH", 2: "T2·PHANTOM"}
+    tier_cols  = {1: _TH["tier"][1], 2: _TH["tier"][2]}
     tier_rows  = get_tier_stats()
     for row in tier_rows:
         if len(row) < 4: continue
@@ -549,7 +546,7 @@ def render_open_positions():
               show_header=True, header_style="bold white",
               expand=True, padding=(0,1))
     t.add_column("ID",    width=5,  style="dim")
-    t.add_column("Market",min_width=28, max_width=36, overflow="ellipsis")
+    t.add_column("Market",min_width=36, overflow="ellipsis")
     t.add_column("Tier",  width=10)
     t.add_column("Side",  width=5)
     t.add_column("$",     width=6,  justify="right")
@@ -558,7 +555,7 @@ def render_open_positions():
     t.add_column("Time",  width=8,  style="dim")
 
     tier_cols  = _TH["tier"]
-    tier_names = {1:"WRAITH", 2:"PHANTOM", 3:"DOUBLE"}
+    tier_names = {1:"WRAITH", 2:"PHANTOM"}
     for rid, tier, coin, q, entry, size, ts, outcome in rows:
         col  = tier_cols.get(tier, "white")
         tn   = tier_names.get(tier, f"T{tier}")
@@ -605,11 +602,11 @@ def render_scanner_stats():
     def _sec(label):
         return (Text(""), Text.from_markup(f"[dim bold]{label}[/]"), Text(""), Text(""))
 
-    t = Table.grid(padding=(0,1), expand=True)
+    t = Table.grid(padding=(0,1))
     t.add_column(width=10, no_wrap=True)
     t.add_column(width=18, no_wrap=True)
     t.add_column(width=9,  no_wrap=True)
-    t.add_column(ratio=1, no_wrap=True, overflow="crop")
+    t.add_column(width=18, no_wrap=True, overflow="crop")
 
     # ── Sparklines ────────────────────────────────────────────────
     for coin, hk, color, fmt in COINS:
@@ -690,8 +687,7 @@ def render_scanner_stats():
     # ── Tier config + sweet spot ───────────────────────────────────
     t.add_row(*_sec("─ Tier Config ───"))
     tier_data = [
-        ("T1·WRAITH",  "cyan",    T1_SIZE, T1_MIN, T1_MAX),   # 4hr contrarian
-        ("T2·PHANTOM", "green",   T2_SIZE, T2_MIN, T2_MAX),   # hourly oracle-lag
+        ("T1·WRAITH",  "cyan",    T1_SIZE, T1_MIN, T1_MAX),   # unified contrarian (all markets)
     ]
     for tn, col, sz, e_min, e_max in tier_data:
         if e_max == 0.0:
@@ -721,48 +717,6 @@ def render_scanner_stats():
               Text.from_markup("[dim]5.2% WR[/]"),
               Text.from_markup("[red]80% drawdown[/]" if "ETH" not in SKIP else "[green]protected[/]"))
 
-    # ── Ghost Memory live status ───────────────────────────────────────────
-    t.add_row(*_sec("─ Ghost Memory ──"))
-    try:
-        from datetime import timezone as _tz, datetime as _dtgm
-        _utc_h_now = _dtgm.now(_tz.utc).hour
-        _dow_now   = _dtgm.now(_tz.utc).weekday()
-        _DOW_NAMES = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-        _bias_obj  = HOUR_BIAS._bias.get(_utc_h_now)
-        _dow_obj   = HOUR_BIAS._dow_bias.get((_dow_now, _utc_h_now))
-
-        def _check_bucket(b, src):
-            if b is None: return None, None
-            up_n, dn_n = b["up_n"], b["dn_n"]
-            up_wr = b["up_w"]/up_n if up_n else 0
-            dn_wr = b["dn_w"]/dn_n if dn_n else 0
-            if dn_n >= HOUR_BIAS_MIN_SAMPLES and dn_wr >= HOUR_BIAS_MIN_WR:
-                return f"[red]BLOCK UP[/] [dim]({src} DN {dn_wr:.0%})[/]", "red"
-            if up_n >= HOUR_BIAS_MIN_SAMPLES and up_wr >= HOUR_BIAS_MIN_WR:
-                return f"[blue]BLOCK DN[/] [dim]({src} UP {up_wr:.0%})[/]", "blue"
-            total_n = up_n + dn_n
-            if total_n >= HOUR_BIAS_MIN_SAMPLES:
-                return f"[green]free[/] [dim]({src} {total_n:.0f}t)[/]", "green"
-            return f"[dim]learning ({total_n:.0f}/{HOUR_BIAS_MIN_SAMPLES:.0f}t)[/]", "dim"
-
-        _v, _c = _check_bucket(_dow_obj, f"{_DOW_NAMES[_dow_now]}")
-        if _v is None:
-            _v, _c = _check_bucket(_bias_obj, "global")
-        if _v is None:
-            _v, _c = "[dim]no data yet[/]", "dim"
-
-        _total_w = sum(v["up_n"]+v["dn_n"] for v in HOUR_BIAS._bias.values())
-        _n_blocked = sum(1 for v in HOUR_BIAS._bias.values()
-                        if (v["dn_n"] >= HOUR_BIAS_MIN_SAMPLES and v["dn_w"]/v["dn_n"] >= HOUR_BIAS_MIN_WR) or
-                           (v["up_n"] >= HOUR_BIAS_MIN_SAMPLES and v["up_w"]/v["up_n"] >= HOUR_BIAS_MIN_WR))
-        t.add_row(
-            Text.from_markup(f"[dim]{_utc_h_now:02d}:00 UTC[/]"),
-            Text.from_markup(_v),
-            Text.from_markup(f"[dim]{_total_w:.0f}t learned[/]"),
-            Text.from_markup(f"[dim]{_n_blocked} hr blocked[/]"))
-    except Exception:
-        t.add_row(Text(""), Text.from_markup("[dim]Ghost Memory unavailable[/]"), Text(""), Text(""))
-
     return Panel(t, title=f"[bold white]Wraith Radar[/]",
                  border_style=_TH["border"], box=rbox.SQUARE, padding=(0,1))
 
@@ -790,7 +744,7 @@ def render_last_trades():
     t.add_column("Result", width=19)
 
     tier_cols  = _TH["tier"]
-    tier_names = {1:"WRAITH", 2:"PHANTOM", 3:"DOUBLE"}
+    tier_names = {1:"WRAITH", 2:"PHANTOM"}
 
     for row in rows:
         rid, ts, tier, coin, q, size, pnl, status, outcome, entry = row
@@ -885,7 +839,7 @@ def log_activity(msg):
 #   MAIN
 # ══════════════════════════════════════════════════════════════════
 async def main():
-    # _spawn_agents()  # PM2 manages processes — dashboard is display-only
+    _spawn_agents()
 
     log_activity(f"{PROJECT_NAME} // {PROJECT_CODENAME} — online")
     log_activity(f"Mode: {'PAPER' if PAPER_TRADE else 'LIVE'} | Filter: VEL={VEL_MIN} MOM={MOM_MIN}")
@@ -901,7 +855,7 @@ async def main():
     )
     layout["top"].split_row(
         Layout(name="stats",     ratio=2),
-        Layout(name="positions", ratio=5),
+        Layout(name="positions", ratio=3),
         Layout(name="odds",      ratio=3),
     )
     layout["bottom"].split_row(

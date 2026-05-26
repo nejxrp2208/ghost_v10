@@ -1,94 +1,126 @@
-# GHOST LATTICE v10 — Setup Guide
-## SPECTER + WRAITH | Polymarket Crypto Oracle-Lag Bot
+# GHOST LATTICE v3 — Setup Guide
+## WRAITH + PHANTOM | Polymarket Crypto Oracle-Lag Bot
 
 ---
 
 ## What This Is
 
-GHOST LATTICE is an automated trading bot for Polymarket's 5-minute and hourly
-BTC/ETH/SOL/BNB/XRP Up-Down markets. It exploits the ~5-minute lag between
-Binance real-time prices and Chainlink's on-chain oracle updates.
+GHOST_LATTICE v3 is an automated trading bot for Polymarket's 5-minute and
+hourly BTC / ETH / SOL / BNB / XRP Up-Down markets. It exploits the lag
+between Binance real-time prices and Chainlink's on-chain oracle updates,
+combined with ML-scored signal selection (ghost_brain).
 
-- **T1 WRAITH** — Contrarian: fires AGAINST Binance momentum on 15-min/hourly markets
-- **T2 SPECTER** — Oracle-lag: fires WITH Binance momentum on 5-min markets before oracle catches up
-- Flat $6.66 sizing per trade. No compounding, no dynamic sizing by default.
-- Lotto wins: $30–$120+ on 4–9¢ entries when oracle is maximally stale.
+- **T1 WRAITH**  — Contrarian: fires AGAINST Binance momentum on hourly markets, entry 12–20¢
+- **T2 PHANTOM** — Oracle-lag: fires WITH Binance momentum, entry 1–8¢ (cheap-zone)
+- Flat $10 USDC per trade by default (configurable per coin)
+- Auto-spawning dashboard launches scanner, resolver, and redeemer together
 
 ---
 
 ## Requirements
 
-- Windows 10/11 (bot uses Windows-native asyncio)
-- Python 3.12+ (3.14 recommended) — https://python.org/downloads
+- Python **3.13** (recommended — per v3 README)
 - A Polymarket account funded with USDC on Polygon
-- A Polygon wallet private key (MetaMask or similar)
+- A Polygon wallet private key (MetaMask Export, or any standard wallet)
+- Internet connection (Binance WS + Polymarket WS + Polygon RPC)
 
 ---
 
 ## Step 1 — Install Dependencies
 
-Run `config\install.bat` as administrator, or manually:
+```
+pip install -r requirements.txt
+```
 
-```
-pip install aiohttp>=3.9.0 py-clob-client>=0.16.0 web3>=6.0.0 python-dotenv>=1.0.0 websockets>=12.0
-```
+This installs: `aiohttp`, `websockets`, `python-dotenv`, `urllib3`,
+`py-clob-client`, `web3`, `rich`.
+
+Windows users can alternatively double-click `config/install.bat`.
 
 ---
 
 ## Step 2 — Get Your Polymarket Credentials
 
-1. Go to https://polymarket.com and connect your wallet
-2. Go to **Settings → API Keys** → create a new API key
-3. You will receive: API Key, Secret, Passphrase — paste all three into `.env`
-4. Your **Proxy Address** is shown on the same API settings page
-5. Your **Private Key** is your wallet's private key (MetaMask → Account Details → Export)
+1. Go to https://polymarket.com and connect your wallet.
+2. Settings → API Keys → create a new API key.
+3. Receive: **API Key**, **Secret**, **Passphrase**.
+4. Your **Proxy Address** is on the same API settings page.
+5. Your **Private Key** comes from your wallet (MetaMask → Account Details → Export).
 
-> ⚠️ Never share your private key with anyone. The bot only uses it to sign
-> on-chain redemption transactions.
+> ⚠️ Never share your private key. The bot uses it only to sign on-chain
+> redemption transactions (CTF positions → USDC).
 
 ---
 
 ## Step 3 — Configure `.env`
 
-Open `.env` in any text editor and fill in the CREDENTIALS section:
+Copy `.env.example` to `.env` and fill in:
 
-```
+```ini
 PRIVATE_KEY=0x<your_wallet_private_key>
 POLYMARKET_PROXY_ADDRESS=0x<your_proxy_address>
 CLOB_API_KEY=<your_api_key>
 CLOB_SECRET=<your_secret>
 CLOB_PASSPHRASE=<your_passphrase>
+
+# Telegram (optional — leave blank to disable)
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# Mode
+PAPER_TRADE=true
+
+# Sizing (flat USDC per trade, per tier)
+T1_SIZE_USDC=4.00
+T2_SIZE_USDC=4.00
 ```
 
-**Telegram alerts (optional):**
-Create a Telegram bot via @BotFather and fill in:
-```
-TELEGRAM_BOT_TOKEN=<your_bot_token>
-TELEGRAM_CHAT_ID=<your_chat_id>
-```
-Leave as `YOUR_..._HERE` to disable alerts.
-
-**Key settings to review in `.env`:**
-- `PAPER_TRADE=true` — default. Change to `false` for live money.
-- `DAILY_LOSS_LIMIT=350` — bot stops trading if daily losses hit this amount.
-- `T1_SIZE_USDC=6.66` / `T2_SIZE_USDC=6.66` — flat bet size per trade.
-- `BULL_REGIME=true` — never blocks UP signals (leave true in bull markets).
+The v3 code has **178 optional `os.getenv()` reads** with sensible defaults —
+you only need to set the variables above for a working baseline. Tune
+strategy filters (`T1_MIN_ENTRY`, `T2_MIN_DEV`, `CONFIDENCE_MIN`, etc.)
+by reading `GHOST_LATTICE.py` and adding the relevant lines to `.env`.
 
 ---
 
 ## Step 4 — Run
 
-**Test first (paper mode):**
-```
-start_PAPER.bat
-```
-No real money. Simulates trades against the live orderbook.
+### Local (Windows / Mac / Linux) — dashboard auto-spawns the stack
 
-**Go live:**
 ```
-start_LIVE.bat
+python3.13 GHOST_LATTICE_dashboard.py
 ```
-Launches the full dashboard — scanner, resolver, and redeemer in separate windows.
+
+The dashboard spawns three subprocesses:
+- `GHOST_LATTICE.py`          — main scanner
+- `GHOST_LATTICE_resolver.py` — trade resolver
+- `GHOST_LATTICE_redeemer.py` — on-chain redeemer
+
+On Linux/macOS, subprocess output goes to `GHOST_LATTICE.log`,
+`GHOST_LATTICE_resolver.log`, and `GHOST_LATTICE_redeemer.log` in this
+folder. On Windows each spawns in a new console.
+
+Closing the dashboard kills all spawned subprocesses (via `atexit`).
+
+### Standalone (no dashboard)
+
+```
+python3.13 GHOST_LATTICE.py             # scanner only
+python3.13 GHOST_LATTICE_resolver.py    # resolver only
+python3.13 GHOST_LATTICE_redeemer.py    # redeemer only
+```
+
+### VPS (PM2)
+
+> ⚠️ The dashboard auto-spawns processes. On a VPS with PM2 you typically
+> want **only** PM2 to manage processes — run the three scripts as
+> separate PM2 services and DO NOT run the dashboard, or run the
+> dashboard locally pointing at the VPS DB (display-only).
+
+```bash
+pm2 start GHOST_LATTICE.py          --name ghost-lattice          --interpreter python3
+pm2 start GHOST_LATTICE_resolver.py --name ghost-lattice-resolver --interpreter python3
+pm2 start GHOST_LATTICE_redeemer.py --name ghost-lattice-redeemer --interpreter python3
+```
 
 ---
 
@@ -96,29 +128,40 @@ Launches the full dashboard — scanner, resolver, and redeemer in separate wind
 
 | File | Role |
 |------|------|
-| `GHOST_LATTICE.py` | Main scanner — finds and fires trades |
-| `GHOST_LATTICE_resolver.py` | Checks Chainlink oracle, marks trades won/lost |
-| `GHOST_LATTICE_redeemer.py` | Redeems winning CTF positions on-chain |
-| `GHOST_LATTICE_dashboard.py` | Terminal UI — spawns all three above |
-| `GHOST_LATTICE_fill_guard.py` | Ghost fill protection (prevents double-fills) |
-| `ghost_brain.py` | ML signal scoring layer |
-| `.env` | All configuration — edit this |
-| `start_LIVE.bat` | Launch live trading |
-| `start_PAPER.bat` | Launch paper/simulation mode |
+| `GHOST_LATTICE.py` | Main scanner — discovers markets, scores signals, fires trades |
+| `GHOST_LATTICE_resolver.py` | Polls Gamma + Chainlink, marks trades won/lost in DB |
+| `GHOST_LATTICE_redeemer.py` | Redeems winning CTF positions on Polygon for USDC |
+| `GHOST_LATTICE_dashboard.py` | Rich terminal UI; spawns the stack when run directly |
+| `GHOST_LATTICE_fill_guard.py` | Ghost-fill protection (prevents double-fills, dup orders) |
+| `ghost_brain.py` | ML signal scoring layer (0–100 utility score) |
+| `ghost_brain.json` | Persisted brain state (per-coin scores, learned thresholds) |
+| `gas_watcher.py` | Polygon gas-price watcher (used by redeemer for fee tuning) |
+| `telegram_alerts.py` | Telegram trade-alert sender (used by scanner) |
+| `.env` | All credentials + tunables (you create from `.env.example`) |
+| `config/requirements_crypto.txt` | Pinned core deps (subset of `requirements.txt`) |
+| `config/install.bat` | Windows one-click installer |
+
+---
+
+## Database
+
+- **Paper mode** (`PAPER_TRADE=true`): writes to `GHOST_LATTICE_PAPER.db`
+- **Live mode** (`PAPER_TRADE=false`): writes to `GHOST_LATTICE.db`
+
+Both are SQLite. DB is auto-created on first run. The resolver and redeemer
+write to the **same** DB as the scanner — they share state via the file.
 
 ---
 
 ## Safety
 
-- Start with `PAPER_TRADE=true` for at least a few hours to confirm the bot
-  is seeing markets and signals before switching to live.
-- The bot will NOT fire any trades if Binance WebSocket or Polymarket
-  WebSocket fail to connect — it waits for both.
-- `DAILY_LOSS_LIMIT` is your circuit breaker. Set it to an amount you are
-  comfortable losing in a single day.
-- After first launch, confirm the DB file `GHOST_LATTICE.db` is created in
-  the same folder. This is the live trade database.
+- Always run `PAPER_TRADE=true` for at least a few hours before going live.
+  Verify: signals fire, resolver marks them won/lost, redeemer skips
+  (it only runs in live mode).
+- The scanner refuses to trade if Binance or Polymarket WS is disconnected.
+- Set `DAILY_LOSS_LIMIT` (or env-equivalent) as your circuit breaker.
+- After first run, confirm the DB file exists in this folder.
 
 ---
 
-*GHOST LATTICE v10 | Build 2026-05-19*
+*GHOST_LATTICE v3 — Share Pack 2026-05-25*
