@@ -839,7 +839,10 @@ def log_activity(msg):
 #   MAIN
 # ══════════════════════════════════════════════════════════════════
 async def main():
-    _spawn_agents()
+    # Auto-spawn disabled — PM2 manages scanner/resolver/redeemer processes.
+    # Running this dashboard alongside PM2 with spawn enabled would create
+    # duplicate processes writing to the same DB (double-fires, SQLite contention).
+    # _spawn_agents()
 
     log_activity(f"{PROJECT_NAME} // {PROJECT_CODENAME} — online")
     log_activity(f"Mode: {'PAPER' if PAPER_TRADE else 'LIVE'} | Filter: VEL={VEL_MIN} MOM={MOM_MIN}")
