@@ -1341,7 +1341,7 @@ async def main():
         )
     except ImportError:
         console.print("[yellow]  websockets not installed — running without liquidation feed[/]")
-        console.print("ht_black]  Install with: pip install websockets --break-system-packages[/]\n")
+        console.print("[bright_black]  Install with: pip install websockets --break-system-packages[/]\n")
         await asyncio.gather(
             brain_loop(),
             display_loop(),

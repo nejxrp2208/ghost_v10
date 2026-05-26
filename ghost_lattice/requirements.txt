@@ -8,7 +8,10 @@ websockets>=12.0
 python-dotenv>=1.0.0
 urllib3>=2.0.0
 
-# Polymarket CLOB SDK (v3 code falls back to py_clob_client_v2 if available)
+# Polymarket CLOB SDK — v3 scanner imports py_clob_client_v2 with no fallback
+# (resolver and redeemer fall back to v1). Install both: v2 for the scanner,
+# v1 as fallback / for legacy callsites.
+py-clob-client-v2
 py-clob-client>=0.16.0
 
 # Polygon on-chain (used by resolver + redeemer for Chainlink + CTF redemption)

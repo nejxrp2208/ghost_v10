@@ -1,5 +1,5 @@
 """
-GHOST LATTICE v10 — Polymarket Crypto Scanner (SPECTER + WRAITH)
+GHOST LATTICE v10 — Polymarket Crypto Scanner (PHANTOM + WRAITH)
 ================================================================
 Live on Polygon/Polymarket. PAPER_TRADE=false = real money.
 Place in: C:\\Users\\ooage\\Desktop\\GHOST LATTICE\\
@@ -10,7 +10,7 @@ T1-WRAITH   Contrarian tier — fires AGAINST Binance deviation
             Target: 15-min & hourly Up/Down markets, final window
             Entry: $0.03-0.18 | Size: $6.66 flat | Avg win: ~$20
 
-T2-SPECTER  Oracle-lag tier — fires WITH Binance deviation
+T2-PHANTOM  Oracle-lag tier — fires WITH Binance deviation
             Target: 5-min Up/Down markets, Chainlink stale window
             Entry: $0.04-0.09 | Size: $6.66 flat | Lotto wins: $30-$120+
 
@@ -75,15 +75,12 @@ _FIRING_TOKENS: set = set()
 # ─── LOAD .ENV ────────────────────────────────────────────────────────────────
 try:
     from dotenv import load_dotenv
-    # Try multiple locations (your existing UnifiedBot .env or local)
+    # Search standard locations: same dir as script, parent dir, ~/Desktop.
     script_dir = os.path.dirname(os.path.abspath(__file__))
     env_candidates = [
         os.path.join(script_dir, ".env"),
         os.path.join(script_dir, "..", ".env"),
-        r"C:\Users\ramos\OneDrive\Desktop\CryptoGhostScanner\.env",
-        r"C:\Users\ramos\Desktop\CryptoGhostScanner\.env",
         os.path.join(os.path.expanduser("~"), "Desktop", ".env"),
-        r"C:\Users\ramos\OneDrive\Desktop\UnifiedBot\.env",
     ]
     for ep in env_candidates:
         if os.path.exists(ep):
@@ -4379,7 +4376,7 @@ class CryptoGhostScanner:
                 payout    = round(fill_size / fill_price - fill_size, 2) if fill_price > 0 else 0
                 ts        = datetime.now().strftime("%H:%M:%S")
                 mode_tag  = "[PAPER]" if PAPER_TRADE else "[LIVE] "
-                tier_names = {1:"WRAITH",2:"SPECTER"}
+                tier_names = {1:"WRAITH",2:"PHANTOM"}
                 # Latency breakdown: sign time + network round-trip (Punisher L43)
                 _sign_ms = round((locals().get("_t_send", _t_fire)
                                   - locals().get("_t_sign", _t_fire)) * 1000, 1)
@@ -4861,7 +4858,7 @@ class CryptoGhostScanner:
                 else:
                     # Velocity: price must be moving in the trade direction.
                     # T1 (WRAITH): velocity magnitude gate applies — contrarian needs real momentum.
-                    # T2 (SPECTER): velocity magnitude gate REMOVED — oracle-lag edge exists even in
+                    # T2 (PHANTOM): velocity magnitude gate REMOVED — oracle-lag edge exists even in
                     #   slow markets; stale MMs haven't repriced regardless of Binance speed.
                     #   Direction gate still applies (buying direction must match Binance move).
                     if tier != 2 and abs(_vel) < TREND_VELOCITY_MIN:
