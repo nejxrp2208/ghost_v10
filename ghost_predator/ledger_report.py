@@ -18,7 +18,7 @@ TG = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CH = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # run the ledger, keep only the summary (from the totals line onward — concise for Telegram)
-out = subprocess.run(["/root/gp_venv/bin/python", os.path.join(SD, "live_ledger.py"),
+out = subprocess.run(["/root/ghost_v10/venv/bin/python3", os.path.join(SD, "live_ledger.py"),
                       os.path.join(SD, "ghost_predator.db")],
                      capture_output=True, text=True).stdout.splitlines()
 keep, grab = [], False
