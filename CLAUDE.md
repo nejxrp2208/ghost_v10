@@ -21,6 +21,9 @@
 | `zugu-scanner` | `zugu_bot/zugu_scanner.py` | ZUGU: FOLLOW LEADER strategy (50/50 zone, last 5-15s, BTC+ETH) |
 | `zugu-resolver` | `zugu_bot/zugu_resolver.py` | ZUGU resolver (separate subsystem) |
 | `zugu-redeemer` | `zugu_bot/zugu_redeemer.py` | ZUGU redeemer (separate subsystem) |
+| `ghost-predator` | `ghost_predator/ghost_predator.py` | GHOST PREDATOR: last-window latency snipe (BTC/ETH 5m+15m, T-12s) |
+| `ghost-predator-resolver` | `ghost_predator/resolver.py` | GHOST PREDATOR resolver (on-chain token-level winner, separate subsystem) |
+| `ghost-predator-alarm` | `ghost_predator/alarmghost.py` | GHOST PREDATOR Telegram health alarm (loss/cold/daily-loss triggers) |
 
 **Scanner architecture:** Each scanner = one strategy = one PM2 process. All write to the same `crypto_ghost_PAPER.db`, distinguished by `strategy` column. Resolver handles all.
 
@@ -55,6 +58,20 @@
 - T1=WRAITH (contrarian), T2=SPECTER (oracle-lag), `ghost_brain.py` ML scoring (0-100)
 - Flat $6.66 sizing, CoinDirEngine (auto-blocks negative-EV pairs), HourBiasEngine, AdaptiveRisk
 
+**GHOST PREDATOR — separate system in `ghost_predator/` subfolder:**
+- Location: `/root/ghost_v10/ghost_predator/`
+- Own `.env`: `/root/ghost_v10/ghost_predator/.env` (separate from v10, ghost_lattice, zugu — gitignored; copy from `.env.example`)
+- Own DB: `ghost_predator/ghost_predator.db` (single DB for paper+live, distinguished by `mode` column)
+- Dashboard (display-only, PM2 manages processes): `python3 ghost_predator/dashboard.py`
+- Strategy: **Last-window latency snipe** — in the final ~12s of a 5m/15m up/down market, compute leader from our own Binance feed and snipe PM's stale ask before it reprices
+- Entry band: `MIN_ASK=0.65`, `MAX_ASK=0.85` (favorites with profit room, no coinflips)
+- Move gate: `MIN_MOVE_BPS=1.0` (≥0.01% Binance move from open required)
+- Window: 5m=T-12s, 15m=T-30s (`SNIPE_WINDOW_SECS=12`, `SNIPE_WINDOW_15M=30`)
+- Sizing: `WALK_FILL=true` — walks the ask ladder, fires only if full $30 fillable in-band ("$30 or skip")
+- Realtime: WSS Polymarket book channel (REST fallback), `BOOK_POLL_MS=10` snipe cadence
+- Guardrails: `DAILY_LOSS_LIMIT=150`, `MAX_LOSS_STREAK=5` — auto-halts trading
+- See `ghost_predator/FILTERS.md` and `ghost_predator/LEARNINGS.md` for full filter chain + tuning history
+
 **ZUGU v4 — separate system in `zugu_bot/` subfolder:**
 - Location: `/root/ghost_v10/zugu_bot/`
 - Own `.env`: `/root/ghost_v10/zugu_bot/.env` (separate from v10 and ghost_lattice)
@@ -69,6 +86,7 @@
 
 **DBs (v10):** `crypto_ghost_PAPER.db` (trades), `scanner.db` (book/summary), `marketghost.db` (market snapshots).
 **DBs (GHOST_LATTICE):** `ghost_lattice/GHOST_LATTICE_PAPER.db` (paper trades), `ghost_lattice/GHOST_LATTICE.db` (live trades).
+**DBs (GHOST PREDATOR):** `ghost_predator/ghost_predator.db` (paper + live, distinguished by `mode` column).
 
 ---
 
@@ -110,6 +128,11 @@ pm2 restart ghost-lattice-redeemer   # GHOST_LATTICE redeemer
 pm2 restart zugu-scanner             # FOLLOW LEADER (50/50 zone, 5-15s window)
 pm2 restart zugu-resolver            # ZUGU resolver
 pm2 restart zugu-redeemer            # ZUGU redeemer
+
+# ── GHOST PREDATOR ────────────────────────────────────────────
+pm2 restart ghost-predator           # main snipe engine (Binance feed + WSS book + snipe loop)
+pm2 restart ghost-predator-resolver  # on-chain token-level settlement
+pm2 restart ghost-predator-alarm     # Telegram health alarm (loss/cold/daily-loss)
 ```
 
 ### First-time deploy (zugu_bot)
@@ -123,6 +146,19 @@ pm2 start zugu_bot/zugu_resolver.py --name zugu-resolver --interpreter python3
 pm2 start zugu_bot/zugu_redeemer.py --name zugu-redeemer --interpreter python3
 ```
 
+### First-time deploy (ghost_predator)
+
+```bash
+cd /root/ghost_v10 && git pull
+cp ghost_predator/.env.example ghost_predator/.env   # paper defaults work as-is; fill Telegram + (later) live creds
+# venv check: aiohttp + rich must be installed in /root/ghost_v10/venv
+/root/ghost_v10/venv/bin/pip install aiohttp rich
+pm2 start ghost_predator/ghost_predator.py --name ghost-predator           --interpreter /root/ghost_v10/venv/bin/python3
+pm2 start ghost_predator/resolver.py       --name ghost-predator-resolver  --interpreter /root/ghost_v10/venv/bin/python3
+pm2 start ghost_predator/alarmghost.py     --name ghost-predator-alarm     --interpreter /root/ghost_v10/venv/bin/python3
+pm2 save
+```
+
 ### GHOST_LATTICE Dashboard
 
 ```bash
@@ -130,6 +166,14 @@ cd /root/ghost_v10 && source venv/bin/activate && python3 ghost_lattice/GHOST_LA
 ```
 
 Dashboard je display-only — PM2 upravlja procese. Ne zažene dvojnikov.
+
+### GHOST PREDATOR Dashboard
+
+```bash
+cd /root/ghost_v10 && source venv/bin/activate && python3 ghost_predator/dashboard.py
+```
+
+Dashboard je display-only — bere `ghost_predator/state.json` (zapisuje ga PM2 proces vsako sekundo) in DB v read-only načinu. Ne spawna procesov.
 
 ---
 
