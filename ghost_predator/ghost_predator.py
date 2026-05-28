@@ -185,9 +185,12 @@ def live_client():
     if _client is None:
         from py_clob_client_v2.client import ClobClient
         from py_clob_client_v2.constants import POLYGON
+        from py_clob_client_v2.clob_types import ApiCreds
         _client = ClobClient(CLOB, key=os.getenv("PRIVATE_KEY"), chain_id=POLYGON,
-                             signature_type=1, funder=os.getenv("POLYMARKET_PROXY_ADDRESS"))
-        _client.set_api_creds(_client.create_or_derive_api_key())   # 2026-05-27: v2 rename (was create_or_derive_api_creds, removed in CLOB v2)
+                             creds=ApiCreds(api_key=os.getenv("CLOB_API_KEY"),
+                                            api_secret=os.getenv("CLOB_SECRET"),
+                                            api_passphrase=os.getenv("CLOB_PASSPHRASE")),
+                             signature_type=3, funder=os.getenv("POLYMARKET_PROXY_ADDRESS"))
     return _client
 
 # ── 1) Binance price feed (WSS) ──────────────────────────────────────────────
