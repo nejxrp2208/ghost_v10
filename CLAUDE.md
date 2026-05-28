@@ -173,7 +173,172 @@ Dashboard je display-only — PM2 upravlja procese. Ne zažene dvojnikov.
 cd /root/ghost_v10 && source venv/bin/activate && python3 ghost_predator/dashboard.py
 ```
 
-Dashboard je display-only — bere `ghost_predator/state.json` (zapisuje ga PM2 proces vsako sekundo) in DB v read-only načinu. Ne spawna procesov.
+Ali od koderkoli z eno vrstico:
+```bash
+ssh root@70.34.204.152 'cd /root/ghost_v10 && source venv/bin/activate && python3 ghost_predator/dashboard.py'
+```
+
+Dashboard je display-only — bere `ghost_predator/state.json` (zapisuje ga `ghost-predator` PM2 proces vsako sekundo) in DB v read-only načinu. Ne spawna procesov. Ctrl+C ga zapre, PM2 procesi tečejo dalje.
+
+### GHOST PREDATOR — Operativni ukazi (vse, kar rabiš)
+
+#### Pogled na status / loge
+
+```bash
+pm2 list | grep ghost-predator                          # 3 vrstice (scanner, resolver, alarm)
+pm2 logs ghost-predator --lines 50 --nostream           # zadnjih 50 vrstic (snapshot)
+pm2 logs ghost-predator                                 # živo sledenje (Ctrl+C izstop)
+pm2 logs ghost-predator --err --lines 100 --nostream    # samo napake
+pm2 logs ghost-predator-resolver --lines 30 --nostream  # resolver log
+pm2 logs ghost-predator-alarm --lines 30 --nostream     # alarm log
+pm2 describe ghost-predator                             # podroben info (pot, PID, uptime, restarts, memory)
+pm2 monit                                               # interaktivni live monitor vseh procesov
+```
+
+#### Restart / stop / start
+
+```bash
+# Restart enega procesa
+pm2 restart ghost-predator
+
+# Restart vseh 3 naenkrat (rabiš to po vsaki spremembi .env ali kode)
+pm2 restart ghost-predator ghost-predator-resolver ghost-predator-alarm
+
+# Ustavi proces (ostane v PM2 listi, status=stopped)
+pm2 stop ghost-predator
+
+# Zaženi ustavljen proces nazaj
+pm2 start ghost-predator
+
+# Popolnoma odstrani iz PM2 (rabiš First-time deploy za nazaj)
+pm2 delete ghost-predator
+```
+
+#### Urejanje .env (in uveljavitev sprememb)
+
+`.env` je v `.gitignore` — obstaja SAMO na VPS-u, ne v gitu. Po vsaki spremembi je treba restartirati procese, ker `.env` berejo samo ob zagonu.
+
+```bash
+nano /root/ghost_v10/ghost_predator/.env
+# uredi karkoli, shrani (Ctrl+O, Enter, Ctrl+X)
+pm2 restart ghost-predator ghost-predator-resolver ghost-predator-alarm
+# preveri da ni napake po restartu
+pm2 logs ghost-predator --lines 20 --nostream
+```
+
+#### Telegram alerti — setup
+
+Telegram je trenutno disabled (`no Telegram creds in .env`). Da vključiš:
+
+```bash
+nano /root/ghost_v10/ghost_predator/.env
+# najdi vrstici na dnu:
+#   TELEGRAM_BOT_TOKEN=
+#   TELEGRAM_CHAT_ID=
+# vnesi:
+#   TELEGRAM_BOT_TOKEN=<token od BotFather>
+#   TELEGRAM_CHAT_ID=<tvoj chat id>
+pm2 restart ghost-predator ghost-predator-resolver ghost-predator-alarm
+# v alarm logu ne bi smel več videti "alerts disabled"
+pm2 logs ghost-predator-alarm --lines 5 --nostream
+```
+
+Po tem boš dobil Telegram alerte: 🎯 ob vsakem fire, ✅/❌ ob resolve, in 🧊/🥶/🛑 od alarmghosta.
+
+#### Deploy spremembe kode (lokalno → GitHub → VPS)
+
+```bash
+# 1) LOKALNO (Windows): uredi datoteko v c:/Users/nejcj/Downloads/GhostScanner_v10_full/ghost_predator/
+cd c:/Users/nejcj/Downloads/GhostScanner_v10_full
+git add ghost_predator/<datoteka>
+git commit -m "ghost-predator: <kaj se je spremenilo>"
+git push origin master
+
+# 2) VPS: povleci in restartiraj prizadeti proces
+cd /root/ghost_v10 && git pull && pm2 restart ghost-predator
+# (če si spremenil resolver.py: pm2 restart ghost-predator-resolver)
+# (če si spremenil alarmghost.py: pm2 restart ghost-predator-alarm)
+# (če nisi siguren: pm2 restart ghost-predator ghost-predator-resolver ghost-predator-alarm)
+```
+
+#### Analiza / poročila (CLI orodja, enkratni zagon na VPS)
+
+```bash
+cd /root/ghost_v10 && source venv/bin/activate
+
+# Fee-adjusted live-fillable ledger — "pravi" denarni rezultat z modelirano taker fee
+python3 ghost_predator/live_ledger.py ghost_predator/ghost_predator.db
+
+# Re-audit vseh trade-ov proti Polymarket on-chain winnerju (preveri da ni lažnih W/L)
+python3 ghost_predator/audit_trades.py ghost_predator/ghost_predator.db predator
+
+# Dnevno ledger poročilo → Telegram (lahko poženeš ročno; cron tudi to lahko kliče)
+python3 ghost_predator/ledger_report.py
+
+# Backtest (rabi lag_data.db)
+python3 ghost_predator/snipe_backtest.py
+
+# Analiza po (coin, duration)
+python3 ghost_predator/dur_compare.py
+
+# Frekvenca fire-ov + win rate sweep
+python3 ghost_predator/freq_check.py
+python3 ghost_predator/sweep.py
+python3 ghost_predator/watch_check.py
+```
+
+#### Reset DB (počisti vse trade-e in začni znova)
+
+⚠️ **DESTRUKTIVNO** — trajno briše vse zgodovinske trade-e. Naredi samo če zares hočeš čist start.
+
+```bash
+pm2 stop ghost-predator ghost-predator-resolver ghost-predator-alarm
+rm /root/ghost_v10/ghost_predator/ghost_predator.db
+rm /root/ghost_v10/ghost_predator/ghost_predator.db-shm 2>/dev/null
+rm /root/ghost_v10/ghost_predator/ghost_predator.db-wal 2>/dev/null
+rm /root/ghost_v10/ghost_predator/state.json 2>/dev/null
+rm /root/ghost_v10/ghost_predator/alarmghost_state.json 2>/dev/null
+pm2 start ghost-predator ghost-predator-resolver ghost-predator-alarm
+# DB se avtomatsko ustvari ob prvem fire-u
+```
+
+#### PAPER → LIVE (NIKOLI brez explicit ukaza lastnika)
+
+⚠️ Pred LIVE: fee-adjusted ledger (`live_ledger.py`) MORA biti prepričljivo pozitiven na smiselnem vzorcu. **Paper mode je sacred** — ne preklapljaj sam.
+
+```bash
+# 1) inštaliraj live SDK (samo prvič)
+/root/ghost_v10/venv/bin/pip install py-clob-client-v2
+
+# 2) uredi .env
+nano /root/ghost_v10/ghost_predator/.env
+#   PAPER_TRADE=false
+#   PRIVATE_KEY=<tvoj key>
+#   POLYMARKET_PROXY_ADDRESS=<tvoj proxy addr>
+#   CLOB_API_KEY=<...>
+#   CLOB_SECRET=<...>
+#   CLOB_PASSPHRASE=<...>
+
+# 3) restart in nadziraj prve order-je
+pm2 restart ghost-predator ghost-predator-resolver ghost-predator-alarm
+pm2 logs ghost-predator       # živo sledi prvim fire-om za [live-err] ali [miss]
+```
+
+Banner mora pokazati `*** LIVE ***` namesto `PAPER`. Začni z majhnim BASE_SIZE.
+
+#### Pomembne poti na VPS
+
+| Kaj | Pot |
+|---|---|
+| Koda | `/root/ghost_v10/ghost_predator/` |
+| `.env` (gitignored) | `/root/ghost_v10/ghost_predator/.env` |
+| DB | `/root/ghost_v10/ghost_predator/ghost_predator.db` |
+| Dashboard state | `/root/ghost_v10/ghost_predator/state.json` |
+| Alarm state | `/root/ghost_v10/ghost_predator/alarmghost_state.json` |
+| PM2 stdout log | `/root/.pm2/logs/ghost-predator-out.log` |
+| PM2 stderr log | `/root/.pm2/logs/ghost-predator-error.log` |
+| Python venv | `/root/ghost_v10/venv/bin/python3` |
+| SSH | `ssh root@70.34.204.152` |
 
 ---
 
