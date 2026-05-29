@@ -106,6 +106,75 @@ def init_db() -> None:
             id   INTEGER PRIMARY KEY DEFAULT 1,
             cash REAL
         );
+
+        CREATE TABLE IF NOT EXISTS edgefinder_signals (
+            id                  TEXT PRIMARY KEY,
+            question            TEXT,
+            direction           TEXT DEFAULT 'NO',
+            yes_price           REAL,
+            signal_type         TEXT,
+            pattern             TEXT,
+            market_url          TEXT,
+            status              TEXT,
+            detected_at         TEXT,
+            resolved_at         TEXT,
+            free_signal_of_day  INTEGER DEFAULT 0,
+            fetched_at          TEXT,
+            our_paper_action    TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS edgefinder_stats_snapshots (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_at      TEXT,
+            day              INTEGER,
+            overall_win_rate REAL,
+            overall_wins     INTEGER,
+            overall_losses   INTEGER,
+            overall_pending  INTEGER,
+            ml_win_rate      REAL,
+            crash_win_rate   REAL,
+            combined_win_rate REAL,
+            raw_json         TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS market_snapshots (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_id   TEXT,
+            token_id    TEXT,
+            question    TEXT,
+            outcome     TEXT,
+            yes_price   REAL,
+            no_price    REAL,
+            spread      REAL,
+            volume_24hr REAL,
+            liquidity   REAL,
+            bid_depth   REAL,
+            ask_depth   REAL,
+            end_date    TEXT,
+            captured_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS our_signals (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            market_id     TEXT,
+            token_id      TEXT,
+            question      TEXT,
+            direction     TEXT DEFAULT 'NO',
+            yes_price     REAL,
+            signal_kind   TEXT,
+            pattern       TEXT,
+            features_json TEXT,
+            confidence    REAL,
+            status        TEXT DEFAULT 'pending',
+            detected_at   TEXT,
+            resolved_at   TEXT,
+            agreement     TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_ef_signals_status   ON edgefinder_signals(status);
+        CREATE INDEX IF NOT EXISTS idx_ef_signals_detected ON edgefinder_signals(detected_at);
+        CREATE INDEX IF NOT EXISTS idx_snaps_token         ON market_snapshots(token_id, captured_at);
+        CREATE INDEX IF NOT EXISTS idx_snaps_captured      ON market_snapshots(captured_at);
         """)
         conn.execute(
             "INSERT OR IGNORE INTO account (id, cash) VALUES (1, ?)",
