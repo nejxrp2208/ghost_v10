@@ -97,3 +97,39 @@ Live orders are FOK at `price=ask` (capped — no slippage walk-up); unfilled or
 - `dashboard.py` — rich terminal dashboard
 - `snipe_backtest.py` — the backtest that proved the edge
 - `ghost_predator.db` — SQLite: `positions` (every snipe + depth/fill/move/secs columns)
+
+---
+
+## Changelog (v10 deploy)
+
+### Live mode fixes (2026-05-28)
+- `live_client()` fixed: `signature_type=1` → `signature_type=3` (POLY_1271 — deposit wallet flow required by CLOB v2)
+- `creds=ApiCreds(...)` now passed directly to `ClobClient` constructor instead of `set_api_creds()` — required for correct L1/L2 auth pairing
+- `POLYMARKET_PROXY_ADDRESS` in `.env` must be the proxy wallet shown in Polymarket profile (not the EOA)
+- `ledger_report.py` venv path fixed: `/root/gp_venv/bin/python` → `/root/ghost_v10/venv/bin/python3`
+
+### Wick analysis logging (2026-05-29)
+Two new columns added to `positions` table to detect the **wick loss pattern**:
+
+| Column | Type | Meaning |
+|---|---|---|
+| `pre_window_move_bps` | REAL | Move from open at ~T-25s (5m) or ~T-40s (15m) — price state just before the snipe window opened. Captures the wick height. |
+| `price_trend` | REAL | bps change over last ~5s at fire time, relative to leader direction. Positive = moving away from open (good momentum). Negative = reverting toward open (wick warning). |
+
+**What to look for after 30-50 trades:**
+```sql
+SELECT id, coin, outcome,
+       pre_window_move_bps,
+       move_bps,
+       round(cast(move_bps as float)/pre_window_move_bps, 2) as reversal_ratio,
+       price_trend,
+       status, pnl
+FROM positions WHERE status IN ('won','lost') ORDER BY id;
+```
+
+**Loss patterns:**
+- `reversal_ratio` low (< 0.3) + `price_trend` negative → wick/late reversal (price was far, came back)
+- `move_bps` < 2 → near-flat close, Chainlink vs Binance disagreement risk
+- `price_trend` negative + `move_bps` still large → active reversal in progress
+
+**Next step:** once enough data is collected, add `REVERSAL_FACTOR` config to skip trades where `move_bps < pre_window_move_bps × factor`.
