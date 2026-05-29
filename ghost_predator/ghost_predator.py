@@ -569,7 +569,8 @@ async def fire(session, tok, m, ask, size, move_bps, left, cur, ask_sz=0.0, cum_
             # skipping the ~30-50ms EIP-712 signing. Fall back to signing inline if none is cached.
             order = presigned.pop(tok, None)
             if order is None:
-                amt = BASE_SIZE if WALK_FILL else size
+                coin_b = BTC_BASE_SIZE if coin == "BTC" else ETH_BASE_SIZE
+                amt = coin_b if WALK_FILL else size
                 cap = MAX_ASK if WALK_FILL else ask
                 args = MarketOrderArgs(token_id=tok, amount=amt, side=BUY, price=cap,
                                        order_type=OrderType.FOK)
@@ -759,7 +760,8 @@ async def presign_loop():
                 from py_clob_client_v2.clob_types import MarketOrderArgs, OrderType
                 from py_clob_client_v2.order_builder.constants import BUY
                 cap = MAX_ASK if WALK_FILL else None
-                args = MarketOrderArgs(token_id=tok, amount=BASE_SIZE, side=BUY,
+                coin_b = BTC_BASE_SIZE if m.get("coin") == "BTC" else ETH_BASE_SIZE
+                args = MarketOrderArgs(token_id=tok, amount=coin_b, side=BUY,
                                        price=(cap if cap is not None else MAX_ASK),
                                        order_type=OrderType.FOK)
                 presigned[tok] = await asyncio.to_thread(live_client().create_market_order, args)
