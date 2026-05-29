@@ -61,6 +61,10 @@ MIN_ASK         = envf("MIN_ASK", "0.02")
 MAX_ASK         = envf("MAX_ASK", "0.90")           # only snipe if ask <= this (profit room)
 BASE_SIZE       = envf("BASE_SIZE", "5.0")
 MAX_PER_MARKET  = envf("MAX_PER_MARKET", "10.0")
+BTC_BASE_SIZE      = envf("BTC_BASE_SIZE", str(BASE_SIZE))        # BTC stake (data: 82% WR → bigger bet)
+ETH_BASE_SIZE      = envf("ETH_BASE_SIZE", str(BASE_SIZE))        # ETH stake (data: lower WR → smaller bet)
+BTC_MAX_PER_MARKET = envf("BTC_MAX_PER_MARKET", str(MAX_PER_MARKET))
+ETH_MAX_PER_MARKET = envf("ETH_MAX_PER_MARKET", str(MAX_PER_MARKET))
 REQUIRE_FILL    = os.getenv("REQUIRE_FILL", "true").lower() == "true"  # only fire/record when resting depth >= stake (skip unfillable; paper mirrors live FOK). false = record everything + tag would_fill
 DYNAMIC_SIZE    = os.getenv("DYNAMIC_SIZE", "true").lower() == "true"  # 2026-05-23: size each order to depth at the ask = min(BASE_SIZE, depth) for ~100% fill. Captures thin high-win books at small size; supersedes the REQUIRE_FILL gate. BASE_SIZE becomes the CAP.
 MIN_STAKE       = envf("MIN_STAKE", "1.0")                             # Polymarket min order; if depth-matched size is below this, the book is truly unfillable -> skip
@@ -490,9 +494,11 @@ async def snipe_loop():
                 # refresh ask (+ how many shares are offered at it)
                 ask, ask_sz = await best_ask(s, tok)
                 if ask is None or not (MIN_ASK <= ask <= MAX_ASK): continue
+                coin_base = BTC_BASE_SIZE if coin == "BTC" else ETH_BASE_SIZE
+                coin_max  = BTC_MAX_PER_MARKET if coin == "BTC" else ETH_MAX_PER_MARKET
                 exp = market_exposure(m["cond"])
-                if exp >= MAX_PER_MARKET: continue
-                target = min(BASE_SIZE, MAX_PER_MARKET - exp)
+                if exp >= coin_max: continue
+                target = min(coin_base, coin_max - exp)
                 # cumulative in-band ask depth (<= MAX_ASK) = the walk-the-book fill ceiling
                 cum_usdc = round(sum(p * s for p, s in books.get(tok, {}).items() if p <= MAX_ASK), 2)
                 if WALK_FILL:
