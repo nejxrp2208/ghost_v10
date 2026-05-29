@@ -74,11 +74,13 @@
 - Own `.env`: `/root/ghost_v10/ghost_predator/.env` (separate from v10, ghost_lattice, zugu — gitignored; copy from `.env.example`)
 - Own DB: `ghost_predator/ghost_predator.db` (single DB for paper+live, distinguished by `mode` column)
 - Dashboard (display-only, PM2 manages processes): `python3 ghost_predator/dashboard.py`
-- Strategy: **Last-window latency snipe** — in the final ~12s of a 5m/15m up/down market, compute leader from our own Binance feed and snipe PM's stale ask before it reprices
+- Strategy: **Last-window latency snipe** — in the final ~17s (5m) / ~30s (15m) of a BTC/ETH up-down market, compute leader from our own Binance feed and snipe PM's stale ask before it reprices
 - Entry band: `MIN_ASK=0.65`, `MAX_ASK=0.85` (favorites with profit room, no coinflips)
-- Move gate: `MIN_MOVE_BPS=1.0` (≥0.01% Binance move from open required)
-- Window: 5m=T-12s, 15m=T-30s (`SNIPE_WINDOW_SECS=12`, `SNIPE_WINDOW_15M=30`)
-- Sizing: `WALK_FILL=true` — walks the ask ladder, fires only if full $30 fillable in-band ("$30 or skip")
+- Move gate: `BTC_MIN_MOVE_BPS=1.0`, `ETH_MIN_MOVE_BPS=1.3` (per-coin, data-driven from 57 live trades)
+- ETH 15m skipped: `ETH_SKIP_15M=true` (data: 54% WR = coinflip, Chainlink disagree)
+- Sizing: `WALK_FILL=true` + per-coin: `BTC_BASE_SIZE=12`, `ETH_BASE_SIZE=7` (data: BTC 82% WR vs ETH 64%)
+- Safety: `FILL_FLOOR=0.50` (prevents stale WSS levels dragging blended fill below viable entry)
+- Live auth: `signature_type=3` (POLY_1271 deposit wallet flow), `creds=ApiCreds(...)` in constructor
 - Realtime: WSS Polymarket book channel (REST fallback), `BOOK_POLL_MS=10` snipe cadence
 - Guardrails: `DAILY_LOSS_LIMIT=150`, `MAX_LOSS_STREAK=5` — auto-halts trading
 - See `ghost_predator/FILTERS.md` and `ghost_predator/LEARNINGS.md` for full filter chain + tuning history

@@ -45,14 +45,18 @@ Needs `aiohttp`. Live mode also needs `py-clob-client-v2` + creds.
 ## Config (.env) — these are the exact live settings
 | Key | Value | Meaning |
 |---|---|---|
-| `PAPER_TRADE` | true | Simulated fills. False = live (needs VPS + creds). |
+| `PAPER_TRADE` | false | Live mode. true = paper (no creds needed). |
 | `COINS` / `DURATIONS` | BTC,ETH / 5m,15m | What to trade. |
-| `SNIPE_WINDOW_SECS` / `_15M` | 12 / 30 | Start sniping at T-12s (5m) / T-30s (15m). |
+| `SNIPE_WINDOW_SECS` / `_15M` | 17 / 30 | Start sniping at T-17s (5m) / T-30s (15m). |
 | `MIN_FILL_SECS` | 2 | Never fire with less than this left. |
-| `MIN_MOVE_BPS` | 1.0 | Leader must be ≥0.01% ahead. **Don't raise** (see Findings). |
-| `MIN_ASK` / `MAX_ASK` | 0.50 / 0.85 | Buy band — a favorite with profit room. |
-| `BASE_SIZE` / `MAX_PER_MARKET` | 30 / 30 | Stake **cap** (actual size = depth-matched). |
-| `DYNAMIC_SIZE` | true | Size to book depth for ~100% fill. |
+| `BTC_MIN_MOVE_BPS` | 1.0 | BTC: leader must be ≥1.0bps ahead (data: 86% WR even at 1.0-1.5bps). |
+| `ETH_MIN_MOVE_BPS` | 1.3 | ETH: higher threshold (data: borderline 1.0-1.3bps trades lossy). |
+| `ETH_SKIP_15M` | true | Skip ETH 15m entirely (data: 54% WR = coinflip, Chainlink disagree). |
+| `MIN_ASK` / `MAX_ASK` | 0.65 / 0.85 | Global ask band — favorites with profit room. |
+| `BTC_BASE_SIZE` / `BTC_MAX_PER_MARKET` | 12 / 12 | BTC stake (data: 82% WR → bigger bet). |
+| `ETH_BASE_SIZE` / `ETH_MAX_PER_MARKET` | 7 / 7 | ETH stake (data: lower WR → smaller bet). |
+| `WALK_FILL` | true | Walk ask ladder to fill full stake; skip if book too thin. |
+| `FILL_FLOOR` | 0.50 | Safety floor on blended fill price (prevents stale WSS dragging avg down). |
 | `MIN_STAKE` | 1.0 | Skip if depth-matched size below PM's min order. |
 | `USE_WSS_BOOK` | true | Real-time book via WSS (REST fallback). |
 | `BOOK_POLL_MS` | 10 | Snipe-loop sweep cadence (free reads via WSS). |
@@ -68,17 +72,15 @@ Needs `aiohttp`. Live mode also needs `py-clob-client-v2` + creds.
   `fee = shares × 0.07 × price × (1-price)`. Largest at 0.50, small at the edges
   (favorites). `live_ledger.py` models this — watch the **fee-adjusted net**.
 
-## Findings (honest, from live paper data)
-- Track outcomes with `audit_trades.py` (token-verified) and the real money
-  number with `live_ledger.py` (fillable trades, fee-adjusted). The raw paper PnL
-  overstates reality because it assumes fills that thin books wouldn't give live.
-- **Win rate is ~the same across move sizes**, so raising `MIN_MOVE_BPS` removes
-  profitable small-move wins without removing losses — verified, leave it at 1.0.
-- **Dynamic sizing flipped the modeled fee-adjusted net positive** by capturing
-  thin high-win books at small size — but live capture depends on winning the
-  taker race for thin depth (hence the WSS + colocation focus).
-- The live-realistic edge is **thin** — paper-test the fee-adjusted ledger across
-  a meaningful sample before funding real money.
+## Findings (from live data, n=57 resolved trades)
+- **BTC 82% WR, ETH 64% WR** overall. After filters (ETH_SKIP_15M + ETH_MIN_MOVE_BPS=1.3): ETH ~78%.
+- **ETH 15m = coinflip (54% WR)** — Chainlink ETH/USD disagrees with Binance on 15m resolution. Skip entirely.
+- **ETH 5m = 78% WR** — solid, keep with slightly higher move threshold (1.3bps).
+- **Entry price bands matter:** BTC 0.75–0.85 = 90%+ WR. ETH 0.80–0.85 = 83% WR; ETH 0.75–0.80 = 50% (coinflip).
+- **Decisive BTC moves (3+bps) ≠ higher WR** — at 5+bps BTC is 50% (book already repriced, Chainlink agrees). Don't over-filter on move size.
+- **WALK_FILL** ($X-or-skip) is the correct execution model for live — thin fills don't survive slippage+fees.
+- **FILL_FLOOR=0.50** prevents stale WSS book levels from dragging blended fill below the viable entry zone.
+- Track `pre_window_move_bps` and `price_trend` columns in DB — wick pattern analysis after 30-50 trades.
 
 ## Going live (only after the fee-adjusted ledger is convincingly positive)
 1. Run on a VPS in **AWS eu-west-2 (London)** — Polymarket's CLOB is hosted there;
@@ -133,3 +135,12 @@ FROM positions WHERE status IN ('won','lost') ORDER BY id;
 - `price_trend` negative + `move_bps` still large → active reversal in progress
 
 **Next step:** once enough data is collected, add `REVERSAL_FACTOR` config to skip trades where `move_bps < pre_window_move_bps × factor`.
+
+### Data-driven filters (2026-05-29, n=57 live trades)
+Based on analysis of both DB files:
+- `ETH_SKIP_15M=true` — ETH 15m WR=54% (coinflip), Chainlink/Binance disagree on 15m ETH resolution
+- `ETH_MIN_MOVE_BPS=1.3` — borderline ETH moves (1.0–1.3bps) are lossy; BTC stays at 1.0 (86% WR even at 1.0–1.5bps)
+- `BTC_BASE_SIZE=12.0` / `ETH_BASE_SIZE=7.0` — per-coin Kelly-proportional sizing (BTC 82% WR vs ETH 64% WR)
+- `BTC_MAX_PER_MARKET=12.0` / `ETH_MAX_PER_MARKET=7.0` — match per-coin base size
+- `FILL_FLOOR=0.50` — safety floor on blended walk-fill entry (prevents stale WSS dragging avg to 0.46)
+- All three paths updated for per-coin sizing: `snipe_loop` (target), `presign_loop` (pre-signed amount), `fire()` inline fallback
