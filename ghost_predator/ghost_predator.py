@@ -61,6 +61,7 @@ MAX_PER_MARKET  = envf("MAX_PER_MARKET", "10.0")
 REQUIRE_FILL    = os.getenv("REQUIRE_FILL", "true").lower() == "true"  # only fire/record when resting depth >= stake (skip unfillable; paper mirrors live FOK). false = record everything + tag would_fill
 DYNAMIC_SIZE    = os.getenv("DYNAMIC_SIZE", "true").lower() == "true"  # 2026-05-23: size each order to depth at the ask = min(BASE_SIZE, depth) for ~100% fill. Captures thin high-win books at small size; supersedes the REQUIRE_FILL gate. BASE_SIZE becomes the CAP.
 MIN_STAKE       = envf("MIN_STAKE", "1.0")                             # Polymarket min order; if depth-matched size is below this, the book is truly unfillable -> skip
+FILL_FLOOR      = envf("FILL_FLOOR", "0.0")                            # safety floor on blended walk-fill entry price. 0 = disabled. Set e.g. 0.50 to prevent a stale WSS book from producing a sub-floor blended avg (observed: best_ask=0.65 passed gate but stale WSS levels dragged blended to 0.46)
 WALK_FILL       = os.getenv("WALK_FILL", "true").lower() == "true"     # 2026-05-25: WALK THE BOOK to fill the FULL BASE_SIZE ($30) across the ask ladder within MAX_ASK, recording the BLENDED avg entry (realistic multi-level FOK). Fire ONLY if the in-band book can supply the full stake ("$30 or skip") — thin books that can't are skipped because a live FOK for $30 would miss them anyway, and their small wins don't survive live slippage/fees. Supersedes DYNAMIC_SIZE's shrink-to-best-ask. false = old depth-matched behavior.
 BOOK_POLL_MS    = envi("BOOK_POLL_MS", "300")       # ask-refresh cadence for in-window markets
 USE_WSS_BOOK    = os.getenv("USE_WSS_BOOK", "true").lower() == "true"  # real-time book via WSS (REST fallback). flip false = exact old REST behavior
@@ -494,6 +495,12 @@ async def snipe_loop():
                     eff_ask, walk_sh, walk_cost, fully = walk_book_fill(books.get(tok, {}), target, MAX_ASK)
                     if eff_ask is None:
                         continue                                  # nothing resting in-band
+                    if FILL_FLOOR > 0 and eff_ask < FILL_FLOOR:
+                        if tok not in thin_skip:
+                            print(f"[{ts_str()}] [skip-floor] {coin} {m['side']} {m.get('dur','5m')} "
+                                  f"blended {eff_ask:.3f} < FILL_FLOOR {FILL_FLOOR:.2f} — stale WSS levels, not fired")
+                            thin_skip.add(tok)
+                        continue
                     if (not fully) or walk_cost < MIN_STAKE:
                         # in-band book can't supply the full stake -> a live FOK for $30 would miss.
                         # Skip the dust: thin fills don't survive live slippage/fees anyway.
