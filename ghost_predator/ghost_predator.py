@@ -119,7 +119,8 @@ def init_db():
         ask_shares REAL, ask_usdc REAL, would_fill INTEGER, cum_usdc REAL)""")
     # migrate older DBs that predate the depth columns
     cols = [r[1] for r in c.execute("PRAGMA table_info(positions)").fetchall()]
-    for col, typ in (("ask_shares", "REAL"), ("ask_usdc", "REAL"), ("would_fill", "INTEGER"), ("cum_usdc", "REAL")):
+    for col, typ in (("ask_shares", "REAL"), ("ask_usdc", "REAL"), ("would_fill", "INTEGER"), ("cum_usdc", "REAL"),
+                     ("pre_window_move_bps", "REAL"), ("price_trend", "REAL")):
         if col not in cols:
             c.execute(f"ALTER TABLE positions ADD COLUMN {col} {typ}")
     c.commit(); c.close()
@@ -429,6 +430,25 @@ def walk_book_fill(book, target_usdc, max_ask):
     return (round(cost / shares, 6), round(shares, 4), round(cost, 2),
             cost >= target_usdc - 1e-6)
 
+def _wick_snapshot(coin, op, leading_up, dur):
+    """Snapshot price state just BEFORE the snipe window opened.
+    Returns (pre_window_move_bps, price_trend).
+    pre_window_move_bps: move at ~T-25s (5m) or ~T-40s (15m) — captures the wick height.
+    price_trend: bps/5s relative to leader direction. Positive = moving away from open (good).
+                 Negative = reverting toward open (wick warning)."""
+    hist = list(price_hist.get(coin, []))
+    lookback = 8 if dur == "5m" else 10   # entries back = ~seconds back (1 entry/s from state_writer)
+    if not op or len(hist) < 2:
+        return (None, None)
+    pre_px = hist[-(lookback+1)] if len(hist) > lookback else hist[0]
+    pre_move = round((pre_px - op) / op * 1e4, 1)
+    if len(hist) >= 6:
+        trend_raw = (hist[-1] - hist[-6]) / op * 1e4   # bps change over last ~5s
+        p_trend = round(trend_raw if leading_up else -trend_raw, 2)  # positive = away from open
+    else:
+        p_trend = None
+    return (pre_move, p_trend)
+
 # ── 4) snipe loop ────────────────────────────────────────────────────────────
 async def snipe_loop():
     async with aiohttp.ClientSession() as s:
@@ -483,9 +503,8 @@ async def snipe_loop():
                             thin_skip.add(tok)
                         continue
                     sniped.add(tok)
-                    # fire at the BLENDED avg ask with the full stake. Pass walk_sh as resting-shares
-                    # so ask_usdc == stake and would_fill == 1 (full in-band depth verified above).
-                    await fire(s, tok, m, eff_ask, walk_cost, move_bps, int(left), cur, walk_sh, cum_usdc)
+                    pre_move, p_trend = _wick_snapshot(coin, op, leading_up, m.get("dur","5m"))
+                    await fire(s, tok, m, eff_ask, walk_cost, move_bps, int(left), cur, walk_sh, cum_usdc, pre_move, p_trend)
                     continue
                 # ── legacy sizing (WALK_FILL=false): depth-matched best-ask fill ──
                 size = target
@@ -507,10 +526,11 @@ async def snipe_loop():
                         thin_skip.add(tok)
                     continue
                 sniped.add(tok)
-                await fire(s, tok, m, ask, size, move_bps, int(left), cur, ask_sz, cum_usdc)
+                pre_move, p_trend = _wick_snapshot(coin, op, leading_up, m.get("dur","5m"))
+                await fire(s, tok, m, ask, size, move_bps, int(left), cur, ask_sz, cum_usdc, pre_move, p_trend)
             await asyncio.sleep(BOOK_POLL_MS / 1000)
 
-async def fire(session, tok, m, ask, size, move_bps, left, cur, ask_sz=0.0, cum_usdc=0.0):
+async def fire(session, tok, m, ask, size, move_bps, left, cur, ask_sz=0.0, cum_usdc=0.0, pre_window_move_bps=None, price_trend=None):
     coin, side, cond, slug = m["coin"], m["side"], m["cond"], m["slug"]
     mode = "PAPER" if PAPER else "LIVE"
     fill_price, shares = ask, round(size/ask, 4)
@@ -547,11 +567,13 @@ async def fire(session, tok, m, ask, size, move_bps, left, cur, ask_sz=0.0, cum_
     c = db()
     cur_db = c.execute("""INSERT INTO positions(ts,coin,outcome,token_id,condition_id,slug,whale,
                  entry_price,size_usdc,shares,close_ts,status,mode,open_price,dec_price,
-                 move_bps,secs_left,ask_shares,ask_usdc,would_fill,cum_usdc)
-                 VALUES(?,?,?,?,?,?, 'SNIPE', ?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?)""",
+                 move_bps,secs_left,ask_shares,ask_usdc,would_fill,cum_usdc,
+                 pre_window_move_bps,price_trend)
+                 VALUES(?,?,?,?,?,?, 'SNIPE', ?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?,?,?)""",
               (datetime.now(timezone.utc).isoformat(), coin, side, tok, cond, slug,
                fill_price, size, shares, m["close_ts"], mode, m["open_price"], cur,
-               round(move_bps,1), left, round(ask_sz,2), ask_usdc, would_fill, cum_usdc))
+               round(move_bps,1), left, round(ask_sz,2), ask_usdc, would_fill, cum_usdc,
+               pre_window_move_bps, price_trend))
     pid = cur_db.lastrowid
     c.commit(); c.close()
     dur = m.get("dur", "5m")
