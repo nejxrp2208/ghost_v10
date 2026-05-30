@@ -73,19 +73,33 @@ def header(st):
     mode=st.get("mode","?") if st else "?"
     live=(st and time.time()-st.get("ts",0)<5)
     halt=(st or {}).get("halt")
+    regime=(st or {}).get("regime",{})
+    gate=regime.get("gate",True)
+    enabled=regime.get("enabled",False)
+    edge=regime.get("edge")
+    paper_n=regime.get("paper_n",0)
+    window=regime.get("window",15)
     t=Text()
     t.append("  GHOST PREDATOR ",style="bold bright_white")
     t.append("// LATENCY SNIPE // ",style=ACCENT)
     t.append(f"{mode}",style=HOT if mode=="LIVE" else WIN)
     t.append("      "); t.append("● FEED LIVE" if live else "● FEED STALE",
                                   style=WIN if live else LOSS)
+    # edge gate indicator
+    if enabled:
+        if gate:
+            e_str = f"{edge:+.1%}" if edge is not None else "—"
+            t.append(f"      🟢 EDGE ON {e_str}",style="bold green3")
+        else:
+            e_str = f"{edge:+.1%}" if edge is not None else "—"
+            t.append(f"      🔴 NO EDGE · PAPER-WATCH {e_str}  paper {paper_n}/{window}",style="bold red1")
     if halt:
         t.append(f"      ⛔ HALTED: {halt}",style="bold white on red3")
-    else:
+    elif gate or not enabled:
         t.append("      ▶ TRADING",style=WIN)
     t.append(f"   {datetime.now(timezone.utc):%H:%M:%S} UTC",style="bright_cyan")
-    return Panel(Align.center(t),style="on grey15",
-                 border_style=(LOSS if halt else BORDER),height=3)
+    border = LOSS if (halt or (enabled and not gate)) else BORDER
+    return Panel(Align.center(t),style="on grey15",border_style=border,height=3)
 
 # ── wallet (now with deployed + potential) ───────────────────────────────────
 def wallet_panel(st):
@@ -132,6 +146,19 @@ def feed_panel(st):
                   style=LOSS if today<=-dll*0.7 else (HOT if today<0 else WIN))
         t.add_row("day stop",used)
     t.add_row("streak cap",Text(f"{cfg.get('max_loss_streak','?')} losses",style=VAL))
+    # edge gate / regime
+    regime=(st or {}).get("regime",{})
+    if regime.get("enabled"):
+        t.add_row("","")
+        gate=regime.get("gate",True)
+        edge=regime.get("edge")
+        pn=regime.get("paper_n",0); pw=regime.get("window",15)
+        pe=regime.get("paper_edge")
+        e_txt=Text(f"{'ON' if gate else 'OFF'} {edge:+.1%}" if edge is not None else f"{'ON' if gate else 'OFF'} —",
+                   style=WIN if gate else LOSS)
+        t.add_row("edge gate",e_txt)
+        t.add_row("paper",Text(f"{pn}/{pw}" + (f"  {pe:+.1%}" if pe is not None else ""),
+                               style=WIN if (pe is not None and pe>=0) else (HOT if pn>0 else DIM)))
     return Panel(t,title=title("FEED + GUARDRAILS"),border_style=BORDER)
 
 # ── HUNT cards (one per coin, video style) ───────────────────────────────────
@@ -146,7 +173,7 @@ def status_of(h, cfg):
     if left<=120:                                        return "DRIFTING", BARC
     return "DORMANT", DIM
 
-def coin_card(coin, h, cfg):
+def coin_card(coin, h, cfg, regime=None):
     if h is None:
         g=Table.grid(); g.add_column()
         g.add_row(Text("no active market",style=DIM))
@@ -189,12 +216,17 @@ def coin_card(coin, h, cfg):
         g.add_row("edge", bar(0,10,DIM), Text("—",style=DIM))
     g.add_row(Text("─"*6,style=DIM),Text("─"*11,style=DIM),Text("─"*11,style=DIM))
     armed = stat.startswith("◆")
+    gate_on = (regime or {}).get("gate", True) or not (regime or {}).get("enabled", False)
     if armed and ask is not None:
-        g.add_row(Text("ENTER",style=ARM), Text(f"${base:.0f}",style=HOT),
-                  Text(f"WIN +${profit:.2f}",style=WIN))
+        if gate_on:
+            g.add_row(Text("ENTER",style=ARM), Text(f"${base:.0f}",style=HOT),
+                      Text(f"WIN +${profit:.2f}",style=WIN))
+        else:
+            g.add_row(Text("PAPER",style="bold yellow"), Text(f"${base:.0f}",style=DIM),
+                      Text(f"~+${profit:.2f} shadow",style=DIM))
     elif ask is not None:
         g.add_row("stake", Text(f"${base:.0f}",style=DIM),
-                  Text(f"~+${profit:.2f} if it arms",style=DIM))   # preview, NOT entering
+                  Text(f"~+${profit:.2f} if it arms",style=DIM))
     else:
         g.add_row("stake", Text(f"${base:.0f}",style=DIM), Text("(no ask yet)",style=DIM))
     _win=h.get("window","")
@@ -296,6 +328,7 @@ def percoin_panel():
 def render():
     st=load_state(); lay=Layout()
     cfg=(st or {}).get("cfg",{}); hunt=(st or {}).get("hunt",[]); charts=(st or {}).get("charts",{})
+    regime=(st or {}).get("regime",{})
     # one ROW per (coin, duration) present — so you see both 5m and 15m timers
     order=[]
     for dl in ("5m","15m","1h"):
@@ -310,7 +343,7 @@ def render():
         cand=[h for h in hunt if h["coin"]==c and h.get("dur")==dl]
         h=min(cand,key=lambda x:(x["secs_left"], x.get("ask") is None)) if cand else None
         u=Layout(name=f"u_{c}_{dl}")
-        u.split_row(Layout(coin_card(c,h,cfg),ratio=2),
+        u.split_row(Layout(coin_card(c,h,cfg,regime),ratio=2),
                     Layout(price_chart(c,charts.get(key)),ratio=3))
         units.append(u)
     # arrange units in a 2-per-row grid (max 2 rows tall, so it always fits)

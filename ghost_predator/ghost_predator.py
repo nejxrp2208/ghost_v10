@@ -75,9 +75,13 @@ USE_WSS_BOOK    = os.getenv("USE_WSS_BOOK", "true").lower() == "true"  # real-ti
 DISCOVERY_SECS  = envi("DISCOVERY_SECS", "20")
 PRICE_MAX_AGE   = envf("PRICE_MAX_AGE", "3.0")      # don't trade if Binance price is older than this (stale feed)
 # ── account-survival guardrails (so a bad run can never drain the account) ──
-DAILY_LOSS_LIMIT = envf("DAILY_LOSS_LIMIT", "150")  # halt for the day if today's PnL <= -this
-MAX_LOSS_STREAK  = envi("MAX_LOSS_STREAK", "5")     # halt if this many losses in a row (edge broke)
-MIN_BALANCE      = envf("MIN_BALANCE", "0")         # halt if balance < this (0 -> floor = one stake)
+DAILY_LOSS_LIMIT  = envf("DAILY_LOSS_LIMIT", "150")   # halt for the day if today's PnL <= -this
+MAX_LOSS_STREAK   = envi("MAX_LOSS_STREAK", "5")      # halt if this many losses in a row (edge broke)
+MIN_BALANCE       = envf("MIN_BALANCE", "0")          # halt if balance < this (0 -> floor = one stake)
+ROLLING_24H_LIMIT = envf("ROLLING_24H_LIMIT", "0")   # halt if rolling-24h PnL <= -this (0 = disabled)
+# ── Edge gate (regime detector) ───────────────────────────────────────────────
+REGIME_GATE   = os.getenv("REGIME_GATE", "true").lower() == "true"  # master switch for edge gate
+REGIME_WINDOW = envi("REGIME_WINDOW", "15")           # last-N resolved trades used to measure edge
 TG_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT         = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -89,6 +93,14 @@ CLOB_WSS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"  # public mark
 BINANCE_REST = "https://api.binance.com"
 
 # ── shared state ─────────────────────────────────────────────────────────────
+# ── regime / edge gate state (updated by regime_loop every 30s) ─────────────
+REGIME = {
+    "gate":       True,   # True = real bets ON, False = paper-watch only
+    "edge":       None,   # float: win_rate - avg_entry_price from last REGIME_WINDOW real trades
+    "n":          0,      # how many real resolved trades in the window
+    "paper_n":    0,      # how many shadow picks resolved so far
+    "paper_edge": None,   # edge on shadow picks (used to flip gate back ON)
+}
 prices  = {}     # COIN -> latest Binance price
 price_ts = {}    # COIN -> time.time() when that price arrived (stale-feed guard)
 markets = {}     # token_id -> dict(coin, side, cond, slug, open_price, close_ts)
@@ -125,6 +137,12 @@ def init_db():
         open_price REAL, dec_price REAL, move_bps REAL, secs_left INTEGER,
         pm_confirmed INTEGER DEFAULT 0,
         ask_shares REAL, ask_usdc REAL, would_fill INTEGER, cum_usdc REAL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS shadow_positions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, coin TEXT, outcome TEXT,
+        token_id TEXT, condition_id TEXT, slug TEXT,
+        entry_price REAL, close_ts INTEGER,
+        status TEXT DEFAULT 'open', resolved_at TEXT,
+        open_price REAL, dec_price REAL, move_bps REAL, secs_left INTEGER)""")
     # migrate older DBs that predate the depth columns
     cols = [r[1] for r in c.execute("PRAGMA table_info(positions)").fetchall()]
     for col, typ in (("ask_shares", "REAL"), ("ask_usdc", "REAL"), ("would_fill", "INTEGER"), ("cum_usdc", "REAL"),
@@ -146,9 +164,18 @@ def halt_reason():
     total_pnl = c.execute("SELECT COALESCE(SUM(pnl),0) FROM positions").fetchone()[0]
     streak_rows = c.execute("SELECT status FROM positions WHERE status IN('won','lost') "
                             "ORDER BY id DESC LIMIT ?", (MAX_LOSS_STREAK,)).fetchall()
+    # rolling 24h PnL (true rolling window, not UTC-day reset)
+    if ROLLING_24H_LIMIT > 0:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        rolling_pnl = c.execute("SELECT COALESCE(SUM(pnl),0) FROM positions "
+                                "WHERE status IN('won','lost') AND ts >= ?", (cutoff,)).fetchone()[0]
+    else:
+        rolling_pnl = 0.0
     c.close()
     balance = START_BAL + total_pnl
     floor = MIN_BALANCE if MIN_BALANCE > 0 else BASE_SIZE
+    if ROLLING_24H_LIMIT > 0 and rolling_pnl <= -ROLLING_24H_LIMIT:
+        return f"ROLLING 24H LIMIT (${rolling_pnl:.2f} <= -${ROLLING_24H_LIMIT:.0f})"
     if today_pnl <= -DAILY_LOSS_LIMIT:
         return f"DAILY LOSS LIMIT (today ${today_pnl:.2f} <= -${DAILY_LOSS_LIMIT:.0f})"
     if balance < floor:
@@ -438,6 +465,120 @@ def walk_book_fill(book, target_usdc, max_ask):
     return (round(cost / shares, 6), round(shares, 4), round(cost, 2),
             cost >= target_usdc - 1e-6)
 
+async def regime_loop():
+    """Edge gate — measures edge (win_rate - avg_entry_price) on last REGIME_WINDOW real trades.
+    If edge < 0: gate OFF → snipe_loop routes picks to shadow table (zero real money at risk).
+    When gate is OFF, monitors shadow picks; if shadow edge >= 0 → flips gate back ON.
+    Disabled when REGIME_GATE=false."""
+    if not REGIME_GATE:
+        REGIME["gate"] = True   # always ON when feature disabled
+        return
+    prev_gate = True
+    while True:
+        try:
+            c = db()
+            # ── real trades edge ──────────────────────────────────────────────
+            rows = c.execute("""SELECT entry_price, status FROM positions
+                                WHERE status IN('won','lost') AND mode='LIVE'
+                                ORDER BY id DESC LIMIT ?""", (REGIME_WINDOW,)).fetchall()
+            # ── shadow picks edge ─────────────────────────────────────────────
+            p_rows = c.execute("""SELECT entry_price, status FROM shadow_positions
+                                  WHERE status IN('won','lost')
+                                  ORDER BY id DESC LIMIT ?""", (REGIME_WINDOW,)).fetchall()
+            c.close()
+
+            # real edge
+            if len(rows) >= REGIME_WINDOW:
+                wins = sum(1 for r in rows if r[1] == 'won')
+                avg_px = sum(r[0] for r in rows) / len(rows)
+                edge = round(wins / len(rows) - avg_px, 4)
+                REGIME["edge"] = edge
+                REGIME["n"] = len(rows)
+                REGIME["gate"] = edge >= 0
+            else:
+                REGIME["edge"] = None
+                REGIME["n"] = len(rows)
+                REGIME["gate"] = True   # not enough history → default ON
+
+            # paper edge (used to wake up from OFF state)
+            REGIME["paper_n"] = len(p_rows)
+            if len(p_rows) >= REGIME_WINDOW:
+                pw = sum(1 for r in p_rows if r[1] == 'won')
+                pp = sum(r[0] for r in p_rows) / len(p_rows)
+                paper_edge = round(pw / len(p_rows) - pp, 4)
+                REGIME["paper_edge"] = paper_edge
+                if not REGIME["gate"] and paper_edge >= 0:
+                    REGIME["gate"] = True
+                    REGIME["edge"] = paper_edge
+                    print(f"[{ts_str()}] *** EDGE GATE → ON (paper edge {paper_edge:+.3f} over {len(p_rows)} picks) ***")
+                    tg(f"🟢 EDGE GATE ON — paper edge {paper_edge:+.1%} over {len(p_rows)} shadow picks. Real bets resuming.")
+            else:
+                REGIME["paper_edge"] = None
+
+            # log gate transitions
+            if REGIME["gate"] != prev_gate:
+                if not REGIME["gate"]:
+                    e = REGIME["edge"]
+                    print(f"[{ts_str()}] *** EDGE GATE → OFF (edge {e:+.3f}, {REGIME['n']}/{REGIME_WINDOW} trades) — PAPER-WATCH ***")
+                    tg(f"🔴 EDGE GATE OFF — edge {e:+.1%} on last {REGIME['n']} trades. Paper-watching until edge returns.")
+                prev_gate = REGIME["gate"]
+        except Exception as ex:
+            print(f"[{ts_str()}] [regime-err] {ex}")
+        await asyncio.sleep(30)
+
+async def shadow_fire(tok, m, ask, move_bps, left, cur):
+    """Log a paper pick to shadow_positions when edge gate is OFF.
+    No real money — used by regime_loop to detect when edge returns."""
+    coin, side, cond, slug = m["coin"], m["side"], m["cond"], m["slug"]
+    sniped.add(tok)   # prevent double-logging same token
+    c = db()
+    c.execute("""INSERT INTO shadow_positions(ts,coin,outcome,token_id,condition_id,slug,
+                 entry_price,close_ts,status,open_price,dec_price,move_bps,secs_left)
+                 VALUES(?,?,?,?,?,?,?,?,'open',?,?,?,?)""",
+              (datetime.now(timezone.utc).isoformat(), coin, side, tok, cond, slug,
+               ask, m["close_ts"], m["open_price"], cur, round(move_bps, 1), left))
+    pid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    c.commit(); c.close()
+    dur = m.get("dur", "5m")
+    print(f"[{ts_str()}] [PAPER] #{pid} {coin} {side} {dur} @ {ask:.3f} | {move_bps:+.1f}bps | {left}s | gate OFF ({REGIME['edge']:+.1%} edge)" if REGIME["edge"] is not None else
+          f"[{ts_str()}] [PAPER] #{pid} {coin} {side} {dur} @ {ask:.3f} | {move_bps:+.1f}bps | {left}s | gate OFF")
+
+
+async def shadow_resolver_loop():
+    """Resolve shadow picks from Binance close price (free, no on-chain needed).
+    Won/lost based on whether Binance agreed with our leader call at the close."""
+    async with aiohttp.ClientSession() as s:
+        while True:
+            try:
+                t_now = int(now())
+                c = db()
+                rows = c.execute("""SELECT id, coin, outcome, close_ts, open_price
+                                    FROM shadow_positions
+                                    WHERE status='open' AND close_ts < ?""",
+                                 (t_now - 30,)).fetchall()
+                c.close()
+                for pid, coin, side, close_ts, open_px in rows:
+                    sym = BINANCE_SYM.get(coin)
+                    if not sym or not open_px:
+                        continue
+                    d = await jget(s, f"{BINANCE_REST}/api/v3/klines?symbol={sym}&interval=1m"
+                                      f"&startTime={(close_ts-60)*1000}&limit=1")
+                    if not d or not d[0]:
+                        continue
+                    close_px = float(d[0][4])   # 1m candle close
+                    is_up = side.upper() in ("UP", "YES")
+                    won = (close_px >= open_px) if is_up else (close_px < open_px)
+                    status = 'won' if won else 'lost'
+                    c = db()
+                    c.execute("UPDATE shadow_positions SET status=?,resolved_at=? WHERE id=?",
+                              (status, datetime.now(timezone.utc).isoformat(), pid))
+                    c.commit(); c.close()
+                    print(f"[{ts_str()}] [PAPER-RESOLVE] #{pid} {coin} {side} {'WIN' if won else 'loss'} | open={open_px:.2f} close={close_px:.2f}")
+            except Exception as ex:
+                print(f"[{ts_str()}] [shadow-resolve-err] {ex}")
+            await asyncio.sleep(30)
+
+
 def _wick_snapshot(coin, op, leading_up, dur):
     """Snapshot price state just BEFORE the snipe window opened.
     Returns (pre_window_move_bps, price_trend).
@@ -520,9 +661,13 @@ async def snipe_loop():
                                   f"best {ask:.3f} fills only ${walk_cost:.0f}/${target:.0f} <= {MAX_ASK} — not fired")
                             thin_skip.add(tok)
                         continue
-                    sniped.add(tok)
-                    pre_move, p_trend = _wick_snapshot(coin, op, leading_up, m.get("dur","5m"))
-                    await fire(s, tok, m, eff_ask, walk_cost, move_bps, int(left), cur, walk_sh, cum_usdc, pre_move, p_trend)
+                    # ── edge gate: real bet or paper shadow? ──
+                    if REGIME_GATE and not REGIME["gate"]:
+                        await shadow_fire(tok, m, eff_ask, move_bps, int(left), cur)
+                    else:
+                        sniped.add(tok)
+                        pre_move, p_trend = _wick_snapshot(coin, op, leading_up, m.get("dur","5m"))
+                        await fire(s, tok, m, eff_ask, walk_cost, move_bps, int(left), cur, walk_sh, cum_usdc, pre_move, p_trend)
                     continue
                 # ── legacy sizing (WALK_FILL=false): depth-matched best-ask fill ──
                 size = target
@@ -543,9 +688,13 @@ async def snipe_loop():
                               f"depth ${depth_usdc:.0f} < ${MIN_STAKE:.0f} min — not fired")
                         thin_skip.add(tok)
                     continue
-                sniped.add(tok)
-                pre_move, p_trend = _wick_snapshot(coin, op, leading_up, m.get("dur","5m"))
-                await fire(s, tok, m, ask, size, move_bps, int(left), cur, ask_sz, cum_usdc, pre_move, p_trend)
+                # ── edge gate: real bet or paper shadow? ──
+                if REGIME_GATE and not REGIME["gate"]:
+                    await shadow_fire(tok, m, ask, move_bps, int(left), cur)
+                else:
+                    sniped.add(tok)
+                    pre_move, p_trend = _wick_snapshot(coin, op, leading_up, m.get("dur","5m"))
+                    await fire(s, tok, m, ask, size, move_bps, int(left), cur, ask_sz, cum_usdc, pre_move, p_trend)
             await asyncio.sleep(BOOK_POLL_MS / 1000)
 
 async def fire(session, tok, m, ask, size, move_bps, left, cur, ask_sz=0.0, cum_usdc=0.0, pre_window_move_bps=None, price_trend=None):
@@ -687,6 +836,10 @@ async def state_writer():
                 payload = {"ts": t, "mode": "PAPER" if PAPER else "LIVE",
                            "bankroll": START_BAL, "prices": prices, "tracking": len(hunt),
                            "halt": HALT["reason"], "charts": charts,
+                           "regime": {"gate": REGIME["gate"], "edge": REGIME["edge"],
+                                      "n": REGIME["n"], "window": REGIME_WINDOW,
+                                      "paper_n": REGIME["paper_n"], "paper_edge": REGIME["paper_edge"],
+                                      "enabled": REGIME_GATE},
                            "cfg": {"window": SNIPE_WINDOW, "window_15m": SNIPE_WINDOW_15M, "min_move": MIN_MOVE_BPS,
                                    "max_ask": MAX_ASK, "min_fill": MIN_FILL_SECS,
                                    "base_size": BASE_SIZE, "max_mkt": MAX_PER_MARKET,
@@ -775,7 +928,8 @@ async def presign_loop():
 async def main():
     init_db(); banner()
     await asyncio.gather(binance_feed(), book_feed(), discovery(), snipe_loop(),
-                         status_loop(), state_writer(), prewarm_loop(), presign_loop())
+                         status_loop(), state_writer(), prewarm_loop(), presign_loop(),
+                         regime_loop(), shadow_resolver_loop())
 
 if __name__ == "__main__":
     try:
