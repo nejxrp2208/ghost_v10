@@ -24,6 +24,7 @@
 | `ghost-predator` | `ghost_predator/ghost_predator.py` | GHOST PREDATOR: last-window latency snipe (BTC/ETH 5m+15m, T-12s) |
 | `ghost-predator-resolver` | `ghost_predator/resolver.py` | GHOST PREDATOR resolver (on-chain token-level winner, separate subsystem) |
 | `ghost-predator-alarm` | `ghost_predator/alarmghost.py` | GHOST PREDATOR Telegram health alarm (loss/cold/daily-loss triggers) |
+| `ghost-predator-radar` | `ghost_predator/divergence_scan.py` | GHOST PREDATOR Reversal Radar — read-only T-11s PM-vs-spot divergence collector |
 
 **Scanner architecture:** Each scanner = one strategy = one PM2 process. All write to the same `crypto_ghost_PAPER.db`, distinguished by `strategy` column. Resolver handles all.
 
@@ -144,11 +145,12 @@ pm2 restart zugu-redeemer            # ZUGU redeemer
 
 # ── GHOST PREDATOR ────────────────────────────────────────────
 pm2 restart ghost-predator           # main snipe engine (Binance feed + WSS book + snipe loop)
+pm2 restart ghost-predator-resolver  # on-chain token-level settlement
+pm2 restart ghost-predator-alarm     # Telegram health alarm (loss/cold/daily-loss)
+pm2 restart ghost-predator-radar     # Reversal Radar (T-11s PM-vs-spot divergence collector)
 
 # ── WORLD EVENTS ──────────────────────────────────────────────
 pm2 restart world-events             # background engine (market scan + signal eval + paper trade)
-pm2 restart ghost-predator-resolver  # on-chain token-level settlement
-pm2 restart ghost-predator-alarm     # Telegram health alarm (loss/cold/daily-loss)
 ```
 
 ### First-time deploy (zugu_bot)
@@ -191,8 +193,28 @@ cp ghost_predator/.env.example ghost_predator/.env   # paper defaults work as-is
 pm2 start ghost_predator/ghost_predator.py --name ghost-predator           --interpreter /root/ghost_v10/venv/bin/python3
 pm2 start ghost_predator/resolver.py       --name ghost-predator-resolver  --interpreter /root/ghost_v10/venv/bin/python3
 pm2 start ghost_predator/alarmghost.py     --name ghost-predator-alarm     --interpreter /root/ghost_v10/venv/bin/python3
+pm2 start ghost_predator/divergence_scan.py --name ghost-predator-radar    --interpreter /root/ghost_v10/venv/bin/python3
 pm2 save
 ```
+
+### First-time deploy (Edge-return monitoring — hour_scan + divergence_scan)
+
+These are **read-only collectors** — no money at risk. They sit alongside the bot and watch for the day the PM mispricing returns. Stdlib only (no pip install needed).
+
+**Hour Scanner — backfill + hourly cron** (one-time setup):
+```bash
+# 1) Backfill 30 days of historical data (~22k windows, takes ~10-15 min HTTP time)
+/root/ghost_v10/venv/bin/python3 /root/ghost_v10/ghost_predator/hour_scan.py backfill 30
+
+# 2) Install hourly cron (append last 2 days, idempotent — keeps dataset growing)
+( crontab -l 2>/dev/null; echo "5 * * * * /root/ghost_v10/venv/bin/python3 /root/ghost_v10/ghost_predator/hour_scan.py append >> /tmp/hour_scan.log 2>&1" ) | crontab -
+
+# 3) Verify cron installed
+crontab -l | grep hour_scan
+```
+
+**Reversal Radar — PM2** (included in first-time deploy above as `ghost-predator-radar`).
+Snapshots PM-vs-spot at ~T-11s for every BTC/ETH 5m + 15m window, resolves after close. Own DB `ghost_predator/divergence.db`.
 
 ### GHOST_LATTICE Dashboard
 
@@ -322,6 +344,24 @@ python3 ghost_predator/sweep.py
 python3 ghost_predator/watch_check.py
 ```
 
+#### Edge-return radarji (READ-ONLY — preverka kdaj se PM mispricing vrne)
+
+```bash
+# Reversal Radar — ali PM-vs-spot divergence pri T-11s napove reversal?
+python3 ghost_predator/divergence_scan.py report
+
+# Hour Scanner — per-hour late-leader accuracy + edge vs PM cena 0.75
+python3 ghost_predator/hour_scan.py report
+```
+
+**Kdaj se edge vrne (kar opazuješ v hour_scan report):**
+- `acc≥2` (accuracy na ≥2bps moveih) sustained nad 90% → signal je močan
+- `edge` (acc≥2 − 75%) sustained pozitivna → PM ne ceni efficiently
+- **OPOMBA:** zahteva n≥40 per hour preden zaupaš; ne reagiraj na enkratno uro
+
+**Kdaj reversal opozori (kar opazuješ v divergence_scan report):**
+- `reversed` rate v DIVERGED oknih bistveno višji kot v AGREED oknih → divergence je defensive signal (NE stavi na spot leaderja takrat)
+
 #### Reset DB (počisti vse trade-e in začni znova)
 
 ⚠️ **DESTRUKTIVNO** — trajno briše vse zgodovinske trade-e. Naredi samo če zares hočeš čist start.
@@ -367,7 +407,9 @@ Banner mora pokazati `*** LIVE ***` namesto `PAPER`. Začni z majhnim BASE_SIZE.
 |---|---|
 | Koda | `/root/ghost_v10/ghost_predator/` |
 | `.env` (gitignored) | `/root/ghost_v10/ghost_predator/.env` |
-| DB | `/root/ghost_v10/ghost_predator/ghost_predator.db` |
+| DB (trading) | `/root/ghost_v10/ghost_predator/ghost_predator.db` |
+| DB (Reversal Radar) | `/root/ghost_v10/ghost_predator/divergence.db` |
+| DB (Hour Scanner) | `/root/ghost_v10/ghost_predator/hour_scan.db` |
 | Dashboard state | `/root/ghost_v10/ghost_predator/state.json` |
 | Alarm state | `/root/ghost_v10/ghost_predator/alarmghost_state.json` |
 | PM2 stdout log | `/root/.pm2/logs/ghost-predator-out.log` |

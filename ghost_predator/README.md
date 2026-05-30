@@ -136,6 +136,20 @@ FROM positions WHERE status IN ('won','lost') ORDER BY id;
 
 **Next step:** once enough data is collected, add `REVERSAL_FACTOR` config to skip trades where `move_bps < pre_window_move_bps × factor`.
 
+### Edge-return monitoring (2026-05-30)
+Added two **standalone read-only collectors** to detect when PM mispricing returns. Neither risks money; both sit alongside the bot ("ambush with the safety on").
+
+| Tool | File | DB | Run mode |
+|---|---|---|---|
+| **Reversal Radar** | `divergence_scan.py` | `divergence.db` | PM2 process `ghost-predator-radar` (forever loop, ~2s tick) |
+| **Hour Scanner** | `hour_scan.py` | `hour_scan.db` | CLI (`backfill 30` once, then hourly cron `append`) |
+
+**Reversal Radar:** snapshots Polymarket ask vs Binance spot at ~T-11s for every BTC/ETH 5m + 15m window. Flags `diverged=1` when PM already prices the OTHER side as favorite (whale footprint). After close, flags `reversed=1` if T-11 spot leader lost. Key test in `report()`: does reversal rate among DIVERGED windows exceed reversal rate in AGREED windows? If yes, divergence is a defensive predictive signal.
+
+**Hour Scanner:** backfills 30 days of Binance 1m klines (~22k windows), measures whether the late-window leader (price ~1 min before close) predicted the actual close, broken down by UTC hour. Initial finding: 86.8% overall accuracy, 92.6% on ≥2bps moves, **flat across all 24 hours (no time-of-day edge)**. Standing job: watch `edge` column (acc≥2 minus 75%) — when it sustains positive across multiple hours with n≥40, PM mispricing has returned. Watch this alongside paper-watch shadow picks in the trading bot.
+
+**Team framing:** *"bps has not gone above +2, that's where our edge lives and our 92% win ratio... don't lose money — we have the edge, now we find the time to use it when actual mispricing happens."* The bot is in edge gate OFF; these radars tell us when to flip it ON.
+
 ### Data-driven filters (2026-05-29, n=57 live trades)
 Based on analysis of both DB files:
 - `ETH_SKIP_15M=true` — ETH 15m WR=54% (coinflip), Chainlink/Binance disagree on 15m ETH resolution
