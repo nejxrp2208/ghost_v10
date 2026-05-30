@@ -473,7 +473,7 @@ async def regime_loop():
     if not REGIME_GATE:
         REGIME["gate"] = True   # always ON when feature disabled
         return
-    prev_gate = True
+    prev_gate = None   # None = no prior state → seed from first measurement (no TG on startup)
     while True:
         try:
             c = db()
@@ -487,41 +487,56 @@ async def regime_loop():
                                   ORDER BY id DESC LIMIT ?""", (REGIME_WINDOW,)).fetchall()
             c.close()
 
-            # real edge
+            # compute real edge
             if len(rows) >= REGIME_WINDOW:
                 wins = sum(1 for r in rows if r[1] == 'won')
                 avg_px = sum(r[0] for r in rows) / len(rows)
-                edge = round(wins / len(rows) - avg_px, 4)
-                REGIME["edge"] = edge
-                REGIME["n"] = len(rows)
-                REGIME["gate"] = edge >= 0
+                real_edge = round(wins / len(rows) - avg_px, 4)
             else:
-                REGIME["edge"] = None
-                REGIME["n"] = len(rows)
-                REGIME["gate"] = True   # not enough history → default ON
+                real_edge = None
+            REGIME["edge"] = real_edge
+            REGIME["n"] = len(rows)
 
-            # paper edge (used to wake up from OFF state)
+            # compute paper edge
             REGIME["paper_n"] = len(p_rows)
             if len(p_rows) >= REGIME_WINDOW:
                 pw = sum(1 for r in p_rows if r[1] == 'won')
                 pp = sum(r[0] for r in p_rows) / len(p_rows)
                 paper_edge = round(pw / len(p_rows) - pp, 4)
-                REGIME["paper_edge"] = paper_edge
-                if not REGIME["gate"] and paper_edge >= 0:
-                    REGIME["gate"] = True
-                    REGIME["edge"] = paper_edge
-                    print(f"[{ts_str()}] *** EDGE GATE → ON (paper edge {paper_edge:+.3f} over {len(p_rows)} picks) ***")
-                    tg(f"🟢 EDGE GATE ON — paper edge {paper_edge:+.1%} over {len(p_rows)} shadow picks. Real bets resuming.")
             else:
-                REGIME["paper_edge"] = None
+                paper_edge = None
+            REGIME["paper_edge"] = paper_edge
 
-            # log gate transitions
-            if REGIME["gate"] != prev_gate:
-                if not REGIME["gate"]:
-                    e = REGIME["edge"]
-                    print(f"[{ts_str()}] *** EDGE GATE → OFF (edge {e:+.3f}, {REGIME['n']}/{REGIME_WINDOW} trades) — PAPER-WATCH ***")
-                    tg(f"🔴 EDGE GATE OFF — edge {e:+.1%} on last {REGIME['n']} trades. Paper-watching until edge returns.")
-                prev_gate = REGIME["gate"]
+            # decide new gate state ONCE (no double-write)
+            #   - not enough real history → default ON
+            #   - have real history → gate on if real_edge >= 0
+            #   - have real history but it's negative AND paper edge proves recovery → wake up
+            if real_edge is None:
+                new_gate = True
+                gate_reason = "warmup"
+            elif real_edge >= 0:
+                new_gate = True
+                gate_reason = f"real edge {real_edge:+.1%}"
+            elif paper_edge is not None and paper_edge >= 0:
+                new_gate = True
+                gate_reason = f"paper edge {paper_edge:+.1%} (real {real_edge:+.1%})"
+            else:
+                new_gate = False
+                gate_reason = f"real edge {real_edge:+.1%}"
+
+            # write + log/alert ONLY on actual transition
+            if prev_gate is None:
+                # first iteration: seed silently, no TG
+                prev_gate = new_gate
+            elif new_gate != prev_gate:
+                if new_gate:
+                    print(f"[{ts_str()}] *** EDGE GATE → ON ({gate_reason}) ***")
+                    tg(f"🟢 EDGE GATE ON — {gate_reason}. Real bets resuming.")
+                else:
+                    print(f"[{ts_str()}] *** EDGE GATE → OFF ({gate_reason}, {REGIME['n']}/{REGIME_WINDOW} trades) — PAPER-WATCH ***")
+                    tg(f"🔴 EDGE GATE OFF — {gate_reason}. Paper-watching until edge returns.")
+                prev_gate = new_gate
+            REGIME["gate"] = new_gate
         except Exception as ex:
             print(f"[{ts_str()}] [regime-err] {ex}")
         await asyncio.sleep(30)
