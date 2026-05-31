@@ -25,6 +25,7 @@
 | `ghost-predator-resolver` | `ghost_predator/resolver.py` | GHOST PREDATOR resolver (on-chain token-level winner, separate subsystem) |
 | `ghost-predator-alarm` | `ghost_predator/alarmghost.py` | GHOST PREDATOR Telegram health alarm (loss/cold/daily-loss triggers) |
 | `ghost-predator-radar` | `ghost_predator/divergence_scan.py` | GHOST PREDATOR Reversal Radar — read-only T-11s PM-vs-spot divergence collector |
+| `ghost-predator-firstmover` | `ghost_predator/firstmover.py` | First-mover edge detector — rolling 20-window WR-vs-PM-ask, signals GO/WAIT/OUT |
 
 **Scanner architecture:** Each scanner = one strategy = one PM2 process. All write to the same `crypto_ghost_PAPER.db`, distinguished by `strategy` column. Resolver handles all.
 
@@ -148,6 +149,7 @@ pm2 restart ghost-predator           # main snipe engine (Binance feed + WSS boo
 pm2 restart ghost-predator-resolver  # on-chain token-level settlement
 pm2 restart ghost-predator-alarm     # Telegram health alarm (loss/cold/daily-loss)
 pm2 restart ghost-predator-radar     # Reversal Radar (T-11s PM-vs-spot divergence collector)
+pm2 restart ghost-predator-firstmover # First-mover edge detector (gates real fires on GO/OUT)
 
 # ── WORLD EVENTS ──────────────────────────────────────────────
 pm2 restart world-events             # background engine (market scan + signal eval + paper trade)
@@ -215,6 +217,24 @@ crontab -l | grep hour_scan
 
 **Reversal Radar — PM2** (included in first-time deploy above as `ghost-predator-radar`).
 Snapshots PM-vs-spot at ~T-11s for every BTC/ETH 5m + 15m window, resolves after close. Own DB `ghost_predator/divergence.db`.
+
+**First-Mover Detector — PM2 + .env switch:**
+```bash
+# 1) Add to .env (gates real fires when ENABLED=true)
+echo "FIRSTMOVER_ENABLED=true" >> /root/ghost_v10/ghost_predator/.env
+
+# 2) Start PM2 process (reads divergence.db, writes firstmover_state.json every 60s)
+pm2 start /root/ghost_v10/ghost_predator/firstmover.py --name ghost-predator-firstmover --interpreter /root/ghost_v10/venv/bin/python3 && pm2 save
+
+# 3) Restart predator to pick up new env
+pm2 restart ghost-predator
+
+# 4) Verify
+pm2 logs ghost-predator-firstmover --lines 10 --nostream
+/root/ghost_v10/venv/bin/python3 /root/ghost_v10/ghost_predator/firstmover.py report
+```
+
+When ENABLED=true, predator only fires real money when signal is GO or WARMUP (default-safe). WAIT/OUT routes to shadow paper.
 
 ### GHOST_LATTICE Dashboard
 
@@ -352,6 +372,9 @@ python3 ghost_predator/divergence_scan.py report
 
 # Hour Scanner — per-hour late-leader accuracy + edge vs PM cena 0.75
 python3 ghost_predator/hour_scan.py report
+
+# First-Mover Detector — current GO/WAIT/OUT signal + rolling edge stats
+python3 ghost_predator/firstmover.py report
 ```
 
 **Kdaj se edge vrne (kar opazuješ v hour_scan report):**
@@ -410,6 +433,7 @@ Banner mora pokazati `*** LIVE ***` namesto `PAPER`. Začni z majhnim BASE_SIZE.
 | DB (trading) | `/root/ghost_v10/ghost_predator/ghost_predator.db` |
 | DB (Reversal Radar) | `/root/ghost_v10/ghost_predator/divergence.db` |
 | DB (Hour Scanner) | `/root/ghost_v10/ghost_predator/hour_scan.db` |
+| First-mover state | `/root/ghost_v10/ghost_predator/firstmover_state.json` |
 | Dashboard state | `/root/ghost_v10/ghost_predator/state.json` |
 | Alarm state | `/root/ghost_v10/ghost_predator/alarmghost_state.json` |
 | PM2 stdout log | `/root/.pm2/logs/ghost-predator-out.log` |

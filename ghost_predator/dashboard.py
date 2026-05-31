@@ -93,6 +93,21 @@ def header(st):
         else:
             e_str = f"{edge:+.1%}" if edge is not None else "—"
             t.append(f"      🔴 NO EDGE · PAPER-WATCH {e_str}  paper {paper_n}/{window}",style="bold red1")
+    # first-mover detector indicator
+    fm = (st or {}).get("firstmover", {})
+    if fm.get("enabled"):
+        sig = fm.get("signal", "?")
+        fm_edge = fm.get("edge")
+        fm_n = fm.get("n", 0)
+        fm_edge_s = f"{fm_edge*100:+.1f}%" if fm_edge is not None else "—"
+        if sig == "GO":
+            t.append(f"      ◆ FIRST-MOVER GO {fm_edge_s}", style="bold green3")
+        elif sig == "OUT":
+            t.append(f"      ◆ FIRST-MOVER OUT {fm_edge_s}", style="bold red1")
+        elif sig == "WAIT":
+            t.append(f"      ◆ FIRST-MOVER WAIT {fm_edge_s}", style="bold yellow")
+        else:
+            t.append(f"      ◆ FIRST-MOVER WARMUP {fm_n}/20", style="grey58")
     if halt:
         t.append(f"      ⛔ HALTED: {halt}",style="bold white on red3")
     elif gate or not enabled:

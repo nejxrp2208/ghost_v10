@@ -82,6 +82,9 @@ ROLLING_24H_LIMIT = envf("ROLLING_24H_LIMIT", "0")   # halt if rolling-24h PnL <
 # ── Edge gate (regime detector) ───────────────────────────────────────────────
 REGIME_GATE   = os.getenv("REGIME_GATE", "true").lower() == "true"  # master switch for edge gate
 REGIME_WINDOW = envi("REGIME_WINDOW", "15")           # last-N resolved trades used to measure edge
+# ── First-mover detector (radar-based) ───────────────────────────────────────
+FIRSTMOVER_ENABLED    = os.getenv("FIRSTMOVER_ENABLED", "false").lower() == "true"
+FIRSTMOVER_STATE_FILE = os.path.join(SD, "firstmover_state.json")
 TG_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT         = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -101,6 +104,8 @@ REGIME = {
     "paper_n":    0,      # how many shadow picks resolved so far
     "paper_edge": None,   # edge on shadow picks (used to flip gate back ON)
 }
+# ── First-mover detector state (updated by firstmover_reader from firstmover_state.json) ──
+FIRSTMOVER = {"signal": "WARMUP", "edge": None, "n": 0, "ts": 0}
 prices  = {}     # COIN -> latest Binance price
 price_ts = {}    # COIN -> time.time() when that price arrived (stale-feed guard)
 markets = {}     # token_id -> dict(coin, side, cond, slug, open_price, close_ts)
@@ -594,6 +599,26 @@ async def shadow_resolver_loop():
             await asyncio.sleep(30)
 
 
+async def firstmover_reader():
+    """Read firstmover_state.json every 30s into global FIRSTMOVER dict.
+    The firstmover.py PM2 process computes and writes this file. No-op if disabled."""
+    if not FIRSTMOVER_ENABLED:
+        return
+    print(f"[{ts_str()}] firstmover reader active — gating real fires on signal=GO/WARMUP")
+    while True:
+        try:
+            if os.path.exists(FIRSTMOVER_STATE_FILE):
+                with open(FIRSTMOVER_STATE_FILE) as f:
+                    s = json.load(f)
+                FIRSTMOVER["signal"] = s.get("signal", "WARMUP")
+                FIRSTMOVER["edge"]   = s.get("rolling_edge")
+                FIRSTMOVER["n"]      = s.get("n", 0)
+                FIRSTMOVER["ts"]     = s.get("ts", 0)
+        except Exception as e:
+            print(f"[{ts_str()}] [firstmover-read-err] {e}")
+        await asyncio.sleep(30)
+
+
 def _wick_snapshot(coin, op, leading_up, dur):
     """Snapshot price state just BEFORE the snipe window opened.
     Returns (pre_window_move_bps, price_trend).
@@ -676,8 +701,10 @@ async def snipe_loop():
                                   f"best {ask:.3f} fills only ${walk_cost:.0f}/${target:.0f} <= {MAX_ASK} — not fired")
                             thin_skip.add(tok)
                         continue
-                    # ── edge gate: real bet or paper shadow? ──
-                    if REGIME_GATE and not REGIME["gate"]:
+                    # ── edge gates: REGIME (live trades) AND FIRSTMOVER (radar) ──
+                    regime_block = REGIME_GATE and not REGIME["gate"]
+                    firstmover_block = FIRSTMOVER_ENABLED and FIRSTMOVER["signal"] not in ("GO", "WARMUP")
+                    if regime_block or firstmover_block:
                         await shadow_fire(tok, m, eff_ask, move_bps, int(left), cur)
                     else:
                         sniped.add(tok)
@@ -703,8 +730,10 @@ async def snipe_loop():
                               f"depth ${depth_usdc:.0f} < ${MIN_STAKE:.0f} min — not fired")
                         thin_skip.add(tok)
                     continue
-                # ── edge gate: real bet or paper shadow? ──
-                if REGIME_GATE and not REGIME["gate"]:
+                # ── edge gates: REGIME (live trades) AND FIRSTMOVER (radar) ──
+                regime_block = REGIME_GATE and not REGIME["gate"]
+                firstmover_block = FIRSTMOVER_ENABLED and FIRSTMOVER["signal"] not in ("GO", "WARMUP")
+                if regime_block or firstmover_block:
                     await shadow_fire(tok, m, ask, move_bps, int(left), cur)
                 else:
                     sniped.add(tok)
@@ -855,6 +884,10 @@ async def state_writer():
                                       "n": REGIME["n"], "window": REGIME_WINDOW,
                                       "paper_n": REGIME["paper_n"], "paper_edge": REGIME["paper_edge"],
                                       "enabled": REGIME_GATE},
+                           "firstmover": {"enabled": FIRSTMOVER_ENABLED,
+                                          "signal": FIRSTMOVER["signal"],
+                                          "edge": FIRSTMOVER["edge"],
+                                          "n": FIRSTMOVER["n"]},
                            "cfg": {"window": SNIPE_WINDOW, "window_15m": SNIPE_WINDOW_15M, "min_move": MIN_MOVE_BPS,
                                    "max_ask": MAX_ASK, "min_fill": MIN_FILL_SECS,
                                    "base_size": BASE_SIZE, "max_mkt": MAX_PER_MARKET,
@@ -944,7 +977,8 @@ async def main():
     init_db(); banner()
     await asyncio.gather(binance_feed(), book_feed(), discovery(), snipe_loop(),
                          status_loop(), state_writer(), prewarm_loop(), presign_loop(),
-                         regime_loop(), shadow_resolver_loop())
+                         regime_loop(), shadow_resolver_loop(),
+                         firstmover_reader())
 
 if __name__ == "__main__":
     try:

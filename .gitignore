@@ -25,6 +25,7 @@ ghost_stats.json
 *.log
 ghost_predator/state.json
 ghost_predator/alarmghost_state.json
+ghost_predator/firstmover_state.json
 
 # OS
 .DS_Store
