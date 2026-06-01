@@ -31,6 +31,33 @@ try:
 except Exception:
     pass
 
+# ── ZUGU v3.5 system modules (telegram, guardrails, sizing, state writer) ───
+# All optional — bot falls back to v3 defaults if any module is missing.
+try:
+    from telegram_alerts import alert_entry as _zugu_alert_entry
+    from telegram_alerts import alert_halt  as _zugu_alert_halt
+    from telegram_alerts import alert_heartbeat as _zugu_alert_heartbeat
+    from guardrails      import halt_reason as _zugu_halt_reason
+    from sizing          import compute_size as _zugu_compute_size
+    from sizing          import describe_mode as _zugu_sizing_mode
+    from state_writer    import state_writer_loop as _zugu_state_writer_loop
+    _ZUGU_MODULES_AVAILABLE = True
+except Exception as _zugu_import_err:
+    _ZUGU_MODULES_AVAILABLE = False
+    # Safe no-op fallbacks so the bot behaves exactly like v3 if modules missing.
+    def _zugu_alert_entry(*a, **kw): pass
+    def _zugu_alert_halt(*a, **kw):  pass
+    def _zugu_alert_heartbeat(*a, **kw): pass
+    def _zugu_halt_reason(_db_path): return None
+    def _zugu_compute_size(ask):
+        # legacy fallback: 5 shares fixed
+        return 5.0, round(5.0 * (ask or 0), 4)
+    def _zugu_sizing_mode(): return "fixed_shares=5 (fallback)"
+    async def _zugu_state_writer_loop(_build):
+        # idle forever — no state.json written
+        while True:
+            await asyncio.sleep(3600)
+
 # ─────────────────────────── CONSTANTS ───────────────────────────────────────
 
 ASSETS     = ["BTC", "ETH"]
@@ -2598,10 +2625,19 @@ def _strategy_persist_trade(
     outcome: str,
     binance_price: Optional[float] = None,
     price_to_beat: Optional[float] = None,
+    secs_left: Optional[int] = None,    # v3.5: for telegram alert (optional kw)
 ) -> bool:
     try:
+        # ── Account-survival guardrail (zero-impact if all FL_*_LIMIT = 0) ───
+        halt = _zugu_halt_reason(_DB_PATH)
+        if halt:
+            log.info(f"SKIP FL halt={halt}")
+            _zugu_alert_halt(halt)   # one alert per supervisor restart (TG-side de-dup if needed)
+            return False
+
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        size_usdc = round(FL_FIXED_SHARES * entry_ask, 4)
+        # ── Risk-based sizing (FL_RISK_USDC > 0) or legacy FL_FIXED_SHARES ──
+        shares, size_usdc = _zugu_compute_size(entry_ask)
         conn = _strategy_db_connect()
         try:
             open_n = conn.execute(
@@ -2640,6 +2676,23 @@ def _strategy_persist_trade(
             "🎯",
             f"OPEN T{FL_TIER} {coin} {outcome} ${size_usdc:.2f}@{entry_ask:.3f}",
         )
+        # ── ZUGU Telegram entry alert (opt-in via FL_TG_ENTRY_ALERT=true) ────
+        if os.getenv("FL_TG_ENTRY_ALERT", "false").strip().lower() in ("true", "1", "yes"):
+            try:
+                bias_val = _get_dynamic_bias(coin)
+                if binance_price and price_to_beat and price_to_beat > 0:
+                    lead_pct = abs(binance_price - price_to_beat) / price_to_beat
+                else:
+                    lead_pct = 0.0
+                _zugu_alert_entry(
+                    coin=coin, side=outcome, ask=entry_ask,
+                    shares=shares, size_usdc=size_usdc,
+                    bias_bps=bias_val * 10000,
+                    lead_pct=lead_pct,
+                    secs_left=int(secs_left) if secs_left is not None else 0,
+                )
+            except Exception as alert_err:
+                log.debug(f"telegram entry alert failed: {alert_err}")
         return True
     except Exception as exc:
         log.debug(f"persist trade error: {exc}", exc_info=True)
@@ -2924,6 +2977,7 @@ async def entry_watcher_loop() -> None:
                         outcome=side,
                         binance_price=t.binance_price,
                         price_to_beat=t.price_to_beat,
+                        secs_left=secs_left,
                     )
                     if placed:
                         open_trades_count += 1
@@ -2945,6 +2999,84 @@ async def entry_watcher_loop() -> None:
             markets_found = signals_passed = skip_ask = 0
             skip_liq = skip_certainty = skip_window = 0
 
+
+
+# ── ZUGU v3.5: state.json builder for dashboard ──────────────────────────────
+def _zugu_build_state() -> Dict:
+    """Snapshot of current bot state for dashboard consumption. Read-only — never
+    mutates anything. Errors per-section so a broken metric never poisons the whole."""
+    payload: Dict = {
+        "mode":     "PAPER" if _PAPER_TRADE else "LIVE",
+        "strategy": "FOLLOW_LEADER",
+        "version":  "v3.5",
+    }
+    # ── Halt status ──────────────────────────────────────────────────────────
+    try:
+        payload["halt"] = _zugu_halt_reason(_DB_PATH)
+    except Exception:
+        payload["halt"] = None
+    # ── Live prices from in-memory Binance feed ──────────────────────────────
+    try:
+        prices = {}
+        for asset in ASSETS:
+            dq = _binance_price_history.get(asset) or deque()
+            if dq:
+                prices[asset] = round(dq[-1][1], 4)
+        payload["prices"] = prices
+    except Exception:
+        payload["prices"] = {}
+    # ── Dynamic bias per asset ───────────────────────────────────────────────
+    try:
+        bias = {}
+        for asset in ASSETS:
+            samples = len(_spread_history.get(asset) or [])
+            bias[asset] = {
+                "value":   _get_dynamic_bias(asset),
+                "samples": samples,
+            }
+        payload["bias"] = bias
+    except Exception:
+        payload["bias"] = {}
+    # ── Aggregate DB stats (open/today/lifetime) ─────────────────────────────
+    try:
+        conn = sqlite3.connect(f"file:{_DB_PATH}?mode=ro", uri=True, timeout=3)
+        today = datetime.now().strftime("%Y-%m-%d")
+        open_n = conn.execute(
+            "SELECT COUNT(*) FROM trades WHERE status='open'"
+        ).fetchone()[0]
+        today_pnl = conn.execute(
+            "SELECT COALESCE(SUM(pnl),0) FROM trades "
+            "WHERE status IN('won','lost') AND substr(ts,1,10)=?", (today,)
+        ).fetchone()[0]
+        row = conn.execute(
+            "SELECT COALESCE(SUM(status='won'),0), COALESCE(SUM(status='lost'),0), "
+            "COALESCE(SUM(pnl),0) FROM trades WHERE status IN('won','lost')"
+        ).fetchone()
+        conn.close()
+        payload["stats"] = {
+            "open_trades":  int(open_n),
+            "today_pnl":    round(float(today_pnl), 4),
+            "lifetime_won": int(row[0]),
+            "lifetime_lost": int(row[1]),
+            "lifetime_pnl": round(float(row[2]), 4),
+        }
+    except Exception:
+        payload["stats"] = {}
+    # ── Config snapshot (so dashboard can show what bot is configured for) ───
+    try:
+        payload["config"] = {
+            "sizing":          _zugu_sizing_mode(),
+            "min_entry_ask":   FL_MIN_ENTRY_ASK,
+            "max_entry_ask":   FL_MAX_ENTRY_ASK,
+            "max_open_trades": FL_MAX_OPEN_TRADES,
+            "min_secs_left":   FL_MIN_SECS_LEFT,
+            "max_secs_left":   FL_MAX_SECS_LEFT,
+            "skip_hours_utc":  sorted(FL_SKIP_HOURS_UTC),
+            "skip_weekends":   FL_SKIP_WEEKENDS,
+        }
+    except Exception:
+        payload["config"] = {}
+    return payload
 
 
 async def _run_forever(coro_fn, name: str) -> None:
@@ -2972,6 +3104,8 @@ async def main() -> None:
         _run_forever(discovery_loop,                     "discovery"),
         _run_forever(scan_printer,                       "spread-sampler"),
         _run_forever(entry_watcher_loop,                 "entry-watcher"),
+        # v3.5: 1Hz state.json writer for dashboard (no-op if module missing)
+        _run_forever(lambda: _zugu_state_writer_loop(_zugu_build_state), "state-writer"),
     )
 
 

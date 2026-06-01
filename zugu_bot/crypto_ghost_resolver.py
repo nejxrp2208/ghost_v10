@@ -887,10 +887,11 @@ PM verification ({PM_VERIFY_DELAY}s after close, up to {PM_VERIFY_RETRY} retries
                         log_event(icon, f"T{tier} {coin} {side} {status} ${pnl:+.2f} [PM]")
 
                         # Fire-and-forget Telegram alert. Silent if creds missing.
+                        # v3.5: ZUGU-branded so it's easy to distinguish from other bots.
                         if TELEGRAM_ENABLED:
                             try:
                                 await _tg_send(
-                                    f"{icon} <b>T{tier} {coin} {side}</b> "
+                                    f"🔮 <b>ZUGU</b> {icon} <b>T{tier} {coin} {side}</b> "
                                     f"{status.upper()} <code>${pnl:+.2f}</code> {src_tag} "
                                     f"<b>#{trade_id}</b>\n"
                                     f"{question[:80]}\n"
