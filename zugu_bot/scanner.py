@@ -2436,8 +2436,17 @@ FL_MIN_LEAD_PCT        = float(os.getenv("FL_MIN_LEAD_PCT", "0.0001"))
 # DOWN has the same effective chance to fire as UP.
 FL_DOWN_BIAS_OFFSET    = float(os.getenv("FL_DOWN_BIAS_OFFSET", "0.0015"))
 FL_DOWN_REQUIRE_PM_AGREE = os.getenv("FL_DOWN_REQUIRE_PM_AGREE", "false").strip().lower() in ("true", "1", "yes")
-FL_MIN_ENTRY_ASK       = float(os.getenv("FL_MIN_ENTRY_ASK", "0.30"))
+FL_MIN_ENTRY_ASK       = float(os.getenv("FL_MIN_ENTRY_ASK", "0.35"))   # was 0.30; v3 data: 0.30-0.40 bucket = 31.5% WR, -$20.45
 FL_MAX_ENTRY_ASK       = float(os.getenv("FL_MAX_ENTRY_ASK", "0.75"))
+# ── Time filters (data-driven from v3 1113-trade analysis) ───────────────────
+# Hours UTC to skip (comma-separated). v3 worst: 00:00 (45.1% WR, -$28.70), 02:00 (45.2%, -$31.30),
+# 08:00 (51.5%, -$0.20), 17:00 (52.8%, -$14.35). Default skips 0,1,8,9 per user request.
+_skip_hours_raw = os.getenv("FL_SKIP_HOURS_UTC", "0,1,8,9").strip()
+FL_SKIP_HOURS_UTC = {
+    int(h.strip()) for h in _skip_hours_raw.split(",") if h.strip().isdigit()
+} if _skip_hours_raw else set()
+# Skip weekend days (Saturday=5, Sunday=6). v3 data: Sat 54.5% WR +$1.95 (basically deadweight).
+FL_SKIP_WEEKENDS = os.getenv("FL_SKIP_WEEKENDS", "true").strip().lower() in ("true", "1", "yes")
 FL_FIXED_SHARES        = float(os.getenv("FL_FIXED_SHARES", "5"))
 FL_MAX_OPEN_TRADES     = int(os.getenv("FL_MAX_OPEN_TRADES", "2"))
 FL_TIER                = int(os.getenv("FL_TIER", "2"))
@@ -2719,6 +2728,12 @@ def _evaluate_follow_leader(
         return None, None, "outside_entry_window_too_early"
     if secs_left < FL_MIN_SECS_LEFT:
         return None, None, "outside_entry_window_too_late"
+    # ── Time filters (data-driven from v3 analysis) ──────────────────────────
+    now_utc = now if now.tzinfo == timezone.utc else now.astimezone(timezone.utc)
+    if FL_SKIP_WEEKENDS and now_utc.weekday() >= 5:   # 5=Sat, 6=Sun
+        return None, None, "skip_weekend"
+    if now_utc.hour in FL_SKIP_HOURS_UTC:
+        return None, None, "skip_hour"
 
     ptb = t.price_to_beat
     if ptb is None or ptb <= 0:
