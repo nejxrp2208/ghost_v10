@@ -18,6 +18,9 @@
 | `ghost-lattice` | `ghost_lattice/GHOST_LATTICE.py` | GHOST_LATTICE: unified ML scanner (T1=WRAITH, T2=SPECTER, ghost_brain) |
 | `ghost-lattice-resolver` | `ghost_lattice/GHOST_LATTICE_resolver.py` | GHOST_LATTICE resolver (separate from v10 resolver) |
 | `ghost-lattice-redeemer` | `ghost_lattice/GHOST_LATTICE_redeemer.py` | GHOST_LATTICE redeemer (separate from v10 redeemer) |
+| `zugu-scanner` | `zugu_bot/scanner.py` | ZUGU v3.5: FOLLOW LEADER strategy (last 5-15s, dynamic bias, 5 shares, ask 0.30-0.75) |
+| `zugu-resolver` | `zugu_bot/crypto_ghost_resolver.py` | ZUGU resolver (Polymarket/Chainlink settlement) |
+| `zugu-redeemer` | `zugu_bot/crypto_ghost_redeemer.py` | ZUGU on-chain winnings redeemer |
 | `ghost-predator` | `ghost_predator/ghost_predator.py` | GHOST PREDATOR: last-window latency snipe (BTC/ETH 5m+15m, T-12s) |
 | `ghost-predator-resolver` | `ghost_predator/resolver.py` | GHOST PREDATOR resolver (on-chain token-level winner, separate subsystem) |
 | `ghost-predator-alarm` | `ghost_predator/alarmghost.py` | GHOST PREDATOR Telegram health alarm (loss/cold/daily-loss triggers) |
@@ -84,11 +87,32 @@
 - Guardrails: `DAILY_LOSS_LIMIT=150`, `MAX_LOSS_STREAK=5` — auto-halts trading
 - See `ghost_predator/FILTERS.md` and `ghost_predator/LEARNINGS.md` for full filter chain + tuning history
 
+**ZUGU v3.5 — separate system in `zugu_bot/` subfolder:**
+- Location: `/root/ghost_v10/zugu_bot/`
+- Own `.env`: `/root/ghost_v10/zugu_bot/.env` (gitignored; copy from `.env.example`)
+- Own DB: `zugu_bot/crypto_ghost_PAPER.db` (paper) / `crypto_ghost.db` (live)
+- Dashboard (display-only): `python3 zugu_bot/crypto_ghost_dashboard.py`
+- Strategy: **FOLLOW LEADER** (late-candle momentum) — in last 5-15s of 5min candle, if Binance price leads PTB by ≥0.01%, buy that side at ask
+- Entry: `FL_MIN_LEAD_PCT=0.0001`, ask band `0.30-0.75`, 5 shares fixed, max 2 open trades
+- v3 production data (1113 trades / 21 days, 2026-05-10 → 2026-05-31): **62.1% WR, +$205.55 PnL (+$9.79/day avg)**; BTC 59.1% WR, ETH 65.8% WR; UP/DOWN imbalance 1097/16 (motivated v3.5 dynamic-bias)
+- Best hours (UTC): 21:00 (75.7%), 13:00 (73.2%), 12:00 (72.2%), 22:00 (71.1%) — worst: 00:00, 02:00, 17:00
+- Sweet entry band: **0.65-0.70 = 75% WR, +$68 PnL**; avoid 0.30-0.40 (31% WR) and 0.70-0.75 (70% WR but -$17)
+- **v3 → v3.5 changes (2026-05-31):**
+  - WebSocket event-driven entry (~1-2ms vs ~500ms polling) — new `entry_watcher_loop`
+  - Dynamic DOWN bias: rolling 60s spread tracker (Binance ~15-19bps over PTB due to Chainlink lag), auto-corrects after 30 samples via `_get_dynamic_bias()`
+  - PM oracle check disabled for DOWN signals (oracle has same Chainlink lag)
+  - DB now stores `binance_price` + `price_to_beat` for offset calibration analysis
+  - `FL_DOWN_BIAS_OFFSET=0` until ~100 v3.5 trades collected to determine real offset
+  - `QUIET_MODE` configurable via .env, `FL_RESET_ON_START=false` (preserves DB)
+- Assets: BTC + ETH only, `FL_PAPER_ONLY=true` by default
+- Tools: `monitor.py` (real-time stats), `full_analysis.py` + `velocity_volume_analysis.py` (post-hoc analysis)
+
 **Tech:** Python async (`asyncio` + `aiohttp`), SQLite, Polygon/Chainlink, Polymarket CLOB + Gamma APIs.
 
 **DBs (v10):** `crypto_ghost_PAPER.db` (trades), `scanner.db` (book/summary), `marketghost.db` (market snapshots).
 **DBs (GHOST_LATTICE):** `ghost_lattice/GHOST_LATTICE_PAPER.db` (paper trades), `ghost_lattice/GHOST_LATTICE.db` (live trades).
 **DBs (GHOST PREDATOR):** `ghost_predator/ghost_predator.db` (paper + live, distinguished by `mode` column).
+**DBs (ZUGU v3.5):** `zugu_bot/crypto_ghost_PAPER.db` (paper) / `zugu_bot/crypto_ghost.db` (live).
 
 ---
 
@@ -126,6 +150,11 @@ pm2 restart ghost-lattice            # main scanner (T1+T2, ghost_brain ML)
 pm2 restart ghost-lattice-resolver   # GHOST_LATTICE resolver
 pm2 restart ghost-lattice-redeemer   # GHOST_LATTICE redeemer
 
+# ── ZUGU v3.5 ─────────────────────────────────────────────────
+pm2 restart zugu-scanner             # FOLLOW LEADER scanner (event-driven entry, dynamic bias)
+pm2 restart zugu-resolver            # ZUGU resolver
+pm2 restart zugu-redeemer            # ZUGU on-chain winnings redeemer
+
 # ── GHOST PREDATOR ────────────────────────────────────────────
 pm2 restart ghost-predator           # main snipe engine (Binance feed + WSS book + snipe loop)
 pm2 restart ghost-predator-resolver  # on-chain token-level settlement
@@ -135,6 +164,37 @@ pm2 restart ghost-predator-firstmover # First-mover edge detector (gates real fi
 
 # ── WORLD EVENTS ──────────────────────────────────────────────
 pm2 restart world-events             # background engine (market scan + signal eval + paper trade)
+```
+
+### First-time deploy (zugu_bot v3.5)
+
+```bash
+cd /root/ghost_v10 && git pull
+/root/ghost_v10/venv/bin/pip install -r zugu_bot/requirements.txt
+cp zugu_bot/.env.example zugu_bot/.env
+# Edit zugu_bot/.env to fill PRIVATE_KEY + CLOB credentials (for live mode)
+# Defaults: PAPER_TRADE=true, FL_PAPER_ONLY=true, FL_DOWN_BIAS_OFFSET=0
+
+pm2 start zugu_bot/scanner.py                 --name zugu-scanner   --interpreter /root/ghost_v10/venv/bin/python3
+pm2 start zugu_bot/crypto_ghost_resolver.py   --name zugu-resolver  --interpreter /root/ghost_v10/venv/bin/python3
+pm2 start zugu_bot/crypto_ghost_redeemer.py   --name zugu-redeemer  --interpreter /root/ghost_v10/venv/bin/python3
+pm2 save
+```
+
+### ZUGU v3.5 Dashboard & analysis
+
+```bash
+# Dashboard (read-only TUI)
+cd /root/ghost_v10 && source venv/bin/activate && python3 zugu_bot/crypto_ghost_dashboard.py
+
+# Real-time monitor (lightweight stats)
+python3 zugu_bot/monitor.py
+
+# Full historical analysis (after 100+ trades)
+python3 zugu_bot/full_analysis.py
+
+# Velocity/volume bucket analysis
+python3 zugu_bot/velocity_volume_analysis.py
 ```
 
 ### First-time deploy (world_event_bot)
