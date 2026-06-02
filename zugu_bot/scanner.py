@@ -50,13 +50,34 @@ except Exception as _zugu_import_err:
     def _zugu_alert_heartbeat(*a, **kw): pass
     def _zugu_halt_reason(_db_path): return None
     def _zugu_compute_size(ask):
-        # legacy fallback: 5 shares fixed
-        return 5.0, round(5.0 * (ask or 0), 4)
-    def _zugu_sizing_mode(): return "fixed_shares=5 (fallback)"
+        # safe fallback if sizing.py is missing: hardcoded $2 risk
+        if not ask or ask <= 0:
+            return 0.0, 0.0
+        s = round(2.0 / ask, 4)
+        return s, round(s * ask, 4)
+    def _zugu_sizing_mode(): return "risk_usdc=$2.00 (fallback)"
     async def _zugu_state_writer_loop(_build):
         # idle forever — no state.json written
         while True:
             await asyncio.sleep(3600)
+
+# Live trader (separate import — paper bot still works if py_clob_client_v2 is missing)
+try:
+    import live_trader as _zugu_live
+    _ZUGU_LIVE_AVAILABLE = True
+except Exception as _zugu_live_err:
+    _ZUGU_LIVE_AVAILABLE = False
+    class _ZuguLiveStub:
+        @staticmethod
+        def is_live(): return False
+        @staticmethod
+        async def place_gtc(token_id, ask, shares):
+            return False, None, "live_trader module unavailable"
+        @staticmethod
+        async def fill_watch_loop(): return
+        @staticmethod
+        async def prewarm_loop(_): return
+    _zugu_live = _ZuguLiveStub()
 
 # ─────────────────────────── CONSTANTS ───────────────────────────────────────
 
@@ -2474,7 +2495,7 @@ FL_SKIP_HOURS_UTC = {
 } if _skip_hours_raw else set()
 # Skip weekend days (Saturday=5, Sunday=6). v3 data: Sat 54.5% WR +$1.95 (basically deadweight).
 FL_SKIP_WEEKENDS = os.getenv("FL_SKIP_WEEKENDS", "true").strip().lower() in ("true", "1", "yes")
-FL_FIXED_SHARES        = float(os.getenv("FL_FIXED_SHARES", "5"))
+# Sizing: see sizing.py — single source of truth (FL_RISK_USDC).
 FL_MAX_OPEN_TRADES     = int(os.getenv("FL_MAX_OPEN_TRADES", "2"))
 FL_TIER                = int(os.getenv("FL_TIER", "2"))
 FL_SCAN_STATS_INTERVAL = float(os.getenv("FL_SCAN_STATS_INTERVAL", "1.0"))
@@ -2615,7 +2636,7 @@ def _strategy_persist_scan_stats(
         pass
 
 
-def _strategy_persist_trade(
+async def _strategy_persist_trade(
     *,
     coin: str,
     market_id: str,
@@ -2636,25 +2657,53 @@ def _strategy_persist_trade(
             return False
 
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # ── Risk-based sizing (FL_RISK_USDC > 0) or legacy FL_FIXED_SHARES ──
+        # ── Risk-based sizing: shares scaled to hit exact FL_RISK_USDC cap ──
         shares, size_usdc = _zugu_compute_size(entry_ask)
+        if shares <= 0:
+            log.info(f"SKIP FL reason=zero_size ask={entry_ask:.3f} (check FL_RISK_USDC)")
+            return False
+
+        # ── Pre-check open / dup (cheap, do BEFORE placing live order) ────────
         conn = _strategy_db_connect()
         try:
             open_n = conn.execute(
                 "SELECT COUNT(*) FROM trades WHERE status='open'"
             ).fetchone()[0]
             if open_n >= FL_MAX_OPEN_TRADES:
+                conn.close()
                 return False
             dup = conn.execute(
                 "SELECT 1 FROM trades WHERE market_id=? AND status='open' LIMIT 1",
                 (market_id,),
             ).fetchone()
             if dup:
+                conn.close()
                 return False
+        except Exception:
+            try: conn.close()
+            except: pass
+            raise
+
+        # ── LIVE: place GTC order BEFORE writing to DB. ──────────────────────
+        # Reason: if the CLOB rejects, we must not pretend we have an open
+        # position. On paper, order_id stays None and DB row goes in directly.
+        order_id: Optional[str] = None
+        if _zugu_live.is_live():
+            placed, oid, err = await _zugu_live.place_gtc(token_id, entry_ask, shares)
+            if not placed:
+                log.warning(f"LIVE order rejected: {coin} {outcome} @ {entry_ask:.3f} — {err}")
+                conn.close()
+                return False
+            order_id = oid
+            log.info(f"LIVE order placed: {coin} {outcome} @ {entry_ask:.3f} oid={oid}")
+
+        # ── Persist trade (paper: no order_id; live: real CLOB orderID) ──────
+        try:
             conn.execute(
                 "INSERT INTO trades (ts, tier, coin, market_id, token_id, question, "
-                "entry_price, size_usdc, status, outcome, pm_result, binance_price, price_to_beat) "
-                "VALUES (?,?,?,?,?,?,?,?, 'open', ?, 'pending', ?, ?)",
+                "entry_price, size_usdc, order_id, status, outcome, pm_result, "
+                "binance_price, price_to_beat) "
+                "VALUES (?,?,?,?,?,?,?,?,?, 'open', ?, 'pending', ?, ?)",
                 (
                     ts,
                     FL_TIER,
@@ -2664,6 +2713,7 @@ def _strategy_persist_trade(
                     question,
                     round(entry_ask, 4),
                     size_usdc,
+                    order_id,
                     outcome,
                     round(binance_price, 4) if binance_price is not None else None,
                     round(price_to_beat, 4) if price_to_beat is not None else None,
@@ -2674,7 +2724,7 @@ def _strategy_persist_trade(
             conn.close()
         _strategy_log_event(
             "🎯",
-            f"OPEN T{FL_TIER} {coin} {outcome} ${size_usdc:.2f}@{entry_ask:.3f}",
+            f"{'LIVE' if order_id else 'PAPER'} T{FL_TIER} {coin} {outcome} ${size_usdc:.2f}@{entry_ask:.3f}",
         )
         # ── ZUGU Telegram entry alert (opt-in via FL_TG_ENTRY_ALERT=true) ────
         if os.getenv("FL_TG_ENTRY_ALERT", "false").strip().lower() in ("true", "1", "yes"):
@@ -2852,9 +2902,11 @@ def _evaluate_follow_leader(
         )
         return None, None, "entry_ask_too_high"
 
+    # Show risk-based sizing in the entry log (matches what persist_trade will use)
+    _log_shares, _log_cost = _zugu_compute_size(float(ask))
     log.info(
-        f"ENTRY FL {asset} {side} ask={ask:.3f} shares={FL_FIXED_SHARES:.0f} "
-        f"cost={FL_FIXED_SHARES * ask:.2f} ptb={ptb:.2f} bin={bin_now:.2f} "
+        f"ENTRY FL {asset} {side} ask={ask:.3f} shares={_log_shares:.2f} "
+        f"cost=${_log_cost:.2f} ptb={ptb:.2f} bin={bin_now:.2f} "
         f"bias={bias:.6f} bin_adj={bin_adjusted:.2f} lead={lead_pct:.6f} secs_left={secs_left}"
     )
     return side, float(ask), "ok"
@@ -2968,7 +3020,7 @@ async def entry_watcher_loop() -> None:
                     and entry_ask is not None
                     and not _strategy_market_already_open(t.market.market_id)
                 ):
-                    placed = _strategy_persist_trade(
+                    placed = await _strategy_persist_trade(
                         coin=asset,
                         market_id=t.market.market_id,
                         token_id=t.market.yes_token_id if side == "UP" else t.market.no_token_id,
@@ -3098,6 +3150,14 @@ async def main() -> None:
     await run_discovery()
     if not trackers:
         log.warning("No matching markets found at startup – will retry every 30s.")
+    # v3.5 live mode: prewarm needs a function that yields secs-to-close per market
+    def _live_close_times():
+        for tr in _display_trackers():
+            try:
+                yield _secs_remaining(tr.market)
+            except Exception:
+                continue
+
     await asyncio.gather(
         _run_forever(polymarket_current_price_feed_loop, "poly-price"),
         _run_forever(binance_current_price_feed_loop,    "binance-price"),
@@ -3106,6 +3166,9 @@ async def main() -> None:
         _run_forever(entry_watcher_loop,                 "entry-watcher"),
         # v3.5: 1Hz state.json writer for dashboard (no-op if module missing)
         _run_forever(lambda: _zugu_state_writer_loop(_zugu_build_state), "state-writer"),
+        # v3.5 live mode: order management (no-op when PAPER_TRADE=true)
+        _run_forever(_zugu_live.fill_watch_loop,                       "fill-watch"),
+        _run_forever(lambda: _zugu_live.prewarm_loop(_live_close_times), "prewarm-tls"),
     )
 
 
