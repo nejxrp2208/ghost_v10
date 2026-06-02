@@ -60,17 +60,6 @@
 - T1=WRAITH (contrarian), T2=SPECTER (oracle-lag), `ghost_brain.py` ML scoring (0-100)
 - Flat $6.66 sizing, CoinDirEngine (auto-blocks negative-EV pairs), HourBiasEngine, AdaptiveRisk
 
-**WORLD EVENTS — separate system in `world_event_bot/` subfolder:**
-- Location: `/root/ghost_v10/world_event_bot/`
-- Own `.env`: `/root/ghost_v10/world_event_bot/.env` (gitignored; copy from `.env.example`)
-- Own DB: `world_event_bot/polymarket_event_bot.db`
-- Dashboard (display-only): `python3 world_event_bot/tui.py`
-- Strategy: **NO-side bias on Polymarket world events** — buys NO when YES is overpriced (0.30-0.55 band), detects momentum/extreme crash patterns + crypto binary
-- Signal source: `our_engine.py` (rule-based, no API key needed) — EdgeFinder API optional (paid)
-- Sizing: fractional Kelly (0.5×), fee-adjusted EV gate, reserve 30%, cluster cap 25%
-- Patterns: `extreme_crash` (YES -30% in 7d, 62% conf), `momentum_crash` (YES -15% in 7d, 58%), `structural` (55%), `crypto_binary` (60%)
-- Note: crash detection needs 7 days of snapshots to activate — first week mostly structural signals
-
 **GHOST PREDATOR — separate system in `ghost_predator/` subfolder:**
 - Location: `/root/ghost_v10/ghost_predator/`
 - Own `.env`: `/root/ghost_v10/ghost_predator/.env` (separate from v10 and ghost_lattice — gitignored; copy from `.env.example`)
@@ -161,9 +150,6 @@ pm2 restart ghost-predator-resolver  # on-chain token-level settlement
 pm2 restart ghost-predator-alarm     # Telegram health alarm (loss/cold/daily-loss)
 pm2 restart ghost-predator-radar     # Reversal Radar (T-11s PM-vs-spot divergence collector)
 pm2 restart ghost-predator-firstmover # First-mover edge detector (gates real fires on GO/OUT)
-
-# ── WORLD EVENTS ──────────────────────────────────────────────
-pm2 restart world-events             # background engine (market scan + signal eval + paper trade)
 ```
 
 ### First-time deploy (zugu_bot v3.5)
@@ -196,25 +182,6 @@ python3 zugu_bot/full_analysis.py
 # Velocity/volume bucket analysis
 python3 zugu_bot/velocity_volume_analysis.py
 ```
-
-### First-time deploy (world_event_bot)
-
-```bash
-cd /root/ghost_v10 && git pull
-/root/ghost_v10/venv/bin/pip install -r world_event_bot/requirements.txt
-cp world_event_bot/.env.example world_event_bot/.env
-# EDGEFINDER_API_KEY pusti prazen — our_engine ne rabi ključa
-pm2 start world_event_bot/scheduler.py --name world-events --interpreter /root/ghost_v10/venv/bin/python3
-pm2 save
-```
-
-### World Events Dashboard
-
-```bash
-cd /root/ghost_v10 && source venv/bin/activate && python3 world_event_bot/tui.py
-```
-
-Dashboard je display-only — bere iz `polymarket_event_bot.db` v read-only načinu. Ne spawna procesov. Ctrl+C za izhod.
 
 ### First-time deploy (ghost_predator)
 
