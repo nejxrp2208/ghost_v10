@@ -57,6 +57,7 @@ MIN_MOVE_BPS    = envf("MIN_MOVE_BPS", "3.0")       # leader must be ahead by >=
 BTC_MIN_MOVE_BPS = envf("BTC_MIN_MOVE_BPS", str(MIN_MOVE_BPS))  # per-coin override; default = global MIN_MOVE_BPS
 ETH_MIN_MOVE_BPS = envf("ETH_MIN_MOVE_BPS", str(MIN_MOVE_BPS))  # ETH rabi večji premik (data: 2.0 reže borderline losse)
 ETH_SKIP_15M    = os.getenv("ETH_SKIP_15M", "false").lower() == "true"  # skip ETH 15m (data: 54% WR = coinflip, Chainlink disagree)
+BTC_SKIP_15M    = os.getenv("BTC_SKIP_15M", "false").lower() == "true"  # skip BTC 15m (data: 63% WR, -$27.53 PnL, n=19 = net loser)
 BLOCKED_HOURS   = {int(h.strip()) for h in os.getenv("BLOCKED_HOURS", "").split(",") if h.strip().isdigit()}  # UTC hours to skip entirely (comma-sep, e.g. "19,23")
 MIN_ASK         = envf("MIN_ASK", "0.02")
 MAX_ASK         = envf("MAX_ASK", "0.90")           # only snipe if ask <= this (profit room)
@@ -667,6 +668,7 @@ async def snipe_loop():
                 if op is None or cur is None: continue
                 if now() - price_ts.get(coin, 0) > PRICE_MAX_AGE: continue   # stale feed — don't trade blind
                 if ETH_SKIP_15M and coin == "ETH" and m.get("dur") == "15m": continue  # ETH 15m: 54% WR coinflip (Chainlink disagree)
+                if BTC_SKIP_15M and coin == "BTC" and m.get("dur") == "15m": continue  # BTC 15m: 63% WR, net loser (-$27.53, n=19)
                 move_bps = (cur - op) / op * 1e4          # signed bps
                 # is THIS token the leading side?
                 leading_up = cur >= op
