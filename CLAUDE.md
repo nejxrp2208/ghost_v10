@@ -6,15 +6,10 @@
 
 | Process | File | Role |
 |---------|------|------|
-| `scanner` | `crypto_ghost_scanner.py` | Scanner 1: cheap longshot (entry ≤$0.03, last 5-60s) — `strategy='lottery'` |
-| `scanner3` | `crypto_ghost_scanner3.py` | Scanner 3: precision sniper (hardcoded filters, parallel S1 test) — `strategy='s3'` |
-| `scanner2` | `crypto_ghost_scanner2.py` | Scanner 2: raw data collector (tier=6) — `strategy='raw'` |
 | `scanner4` | `crypto_ghost_scanner4.py` | Scanner 4: early 50/50 zone predator (CVD+HMA+OBI, $0.38-$0.45) — `strategy='s4_reversal'` |
-| `scanner5` | `crypto_ghost_scanner5.py` | Scanner 5: precision timer (BTC+ETH only, skip dead zone 10-45s) — `strategy='s5_precision'` |
-| `resolver` | `crypto_ghost_resolver.py` | Resolves trades via Chainlink → Polymarket (shared, handles all scanners) |
-| `redeemer` | `crypto_ghost_redeemer.py` | Claims winnings on-chain (shared) |
+| `resolver` | `crypto_ghost_resolver.py` | Resolves trades via Chainlink → Polymarket |
+| `redeemer` | `crypto_ghost_redeemer.py` | Claims winnings on-chain |
 | `marketghost` | `marketghost.py` | Silent data collector (no trades) |
-| `ghostscanner-rt` | — | Real-time scanner variant |
 | `ghost-lattice` | `ghost_lattice/GHOST_LATTICE.py` | GHOST_LATTICE: unified ML scanner (T1=WRAITH, T2=SPECTER, ghost_brain) |
 | `ghost-lattice-resolver` | `ghost_lattice/GHOST_LATTICE_resolver.py` | GHOST_LATTICE resolver (separate from v10 resolver) |
 | `ghost-lattice-redeemer` | `ghost_lattice/GHOST_LATTICE_redeemer.py` | GHOST_LATTICE redeemer (separate from v10 redeemer) |
@@ -27,13 +22,7 @@
 | `ghost-predator-radar` | `ghost_predator/divergence_scan.py` | GHOST PREDATOR Reversal Radar — read-only T-11s PM-vs-spot divergence collector |
 | `ghost-predator-firstmover` | `ghost_predator/firstmover.py` | First-mover edge detector — rolling 20-window WR-vs-PM-ask, signals GO/WAIT/OUT |
 
-**Scanner architecture:** Each scanner = one strategy = one PM2 process. All write to the same `crypto_ghost_PAPER.db`, distinguished by `strategy` column. Resolver handles all.
-
-**Scanner 3 hardcoded overrides (does NOT read these from .env):**
-- `T2_MAX_ENTRY = 0.010` (S1 reads from .env, default 0.030)
-- `MIN_NO_PRICE = 0.98` (S1 reads from .env, default 0.97)
-- `MIN_TREND_STRENGTH = 0.003` (S1 hardcoded at 0.001)
-- Exhaustion gate: skips if 1h trend direction contradicts last 3 Binance ticks
+**Scanner architecture:** Scanner 4 = single strategy = one PM2 process. Writes to `crypto_ghost_PAPER.db`, distinguished by `strategy='s4_reversal'`. Resolver handles it. (Scanners 1/2/3/5 removed 2026-06-03.)
 
 **Scanner 4 hardcoded config (completely different entry logic, nothing from .env):**
 - `S4_ENTRY_MIN = 0.38`, `S4_ENTRY_MAX = 0.45` — 50/50 zone only
@@ -45,12 +34,6 @@
 - Anomaly switch: OBI vs CVD strongly conflicting → skip (trap)
 - Spread filter: ask−bid ≤ $0.04
 - Telegram alert on every fire
-
-**Scanner 5 hardcoded config (fork of Scanner 3):**
-- BTC + ETH only (no BNB/SOL/XRP)
-- Dead zone filter: skip tier=2 trades with `10 < secs_left < 45` (0/44 wins historically)
-- Both UP and DOWN active
-- `S5_TIER = 9`, `strategy = 's5_precision'`
 
 **GHOST_LATTICE v10 — separate system in `ghost_lattice/` subfolder:**
 - Location: `/root/ghost_v10/ghost_lattice/`
@@ -124,14 +107,10 @@ VPS: `root@70.34.204.152` · `/root/ghost_v10` · Ubuntu 24.04 · Stockholm
 ```bash
 # ── GhostScanner v10 ──────────────────────────────────────────
 pm2 restart marketghost      # data collector
-pm2 restart scanner          # Scanner 1: cheap longshot (strategy='lottery')
-pm2 restart scanner3         # Scanner 3: precision sniper (strategy='s3', parallel test)
 pm2 restart scanner4         # Scanner 4: early 50/50 zone predator (strategy='s4_reversal')
-pm2 restart scanner5         # Scanner 5: BTC+ETH, dead zone filter (strategy='s5_precision')
-pm2 restart scanner2         # Scanner 2: raw data collector (strategy='raw')
-pm2 restart resolver         # trade resolver (shared — handles all v10 scanners)
-pm2 restart redeemer         # on-chain redeemer (shared)
-pm2 restart ghostscanner-rt  # real-time scanner
+pm2 restart resolver         # trade resolver
+pm2 restart redeemer         # on-chain redeemer
+pm2 restart marketghost      # silent data collector
 pm2 restart all              # everything at once
 
 # ── GHOST_LATTICE v10 ─────────────────────────────────────────
