@@ -57,6 +57,7 @@ MIN_MOVE_BPS    = envf("MIN_MOVE_BPS", "3.0")       # leader must be ahead by >=
 BTC_MIN_MOVE_BPS = envf("BTC_MIN_MOVE_BPS", str(MIN_MOVE_BPS))  # per-coin override; default = global MIN_MOVE_BPS
 ETH_MIN_MOVE_BPS = envf("ETH_MIN_MOVE_BPS", str(MIN_MOVE_BPS))  # ETH rabi večji premik (data: 2.0 reže borderline losse)
 ETH_SKIP_15M    = os.getenv("ETH_SKIP_15M", "false").lower() == "true"  # skip ETH 15m (data: 54% WR = coinflip, Chainlink disagree)
+BLOCKED_HOURS   = {int(h.strip()) for h in os.getenv("BLOCKED_HOURS", "").split(",") if h.strip().isdigit()}  # UTC hours to skip entirely (comma-sep, e.g. "19,23")
 MIN_ASK         = envf("MIN_ASK", "0.02")
 MAX_ASK         = envf("MAX_ASK", "0.90")           # only snipe if ask <= this (profit room)
 BASE_SIZE       = envf("BASE_SIZE", "5.0")
@@ -654,6 +655,8 @@ async def snipe_loop():
                 await asyncio.sleep(max(1.0, BOOK_POLL_MS/1000)); continue
             if prev_halt:
                 print(f"[{ts_str()}] guardrail cleared — trading resumed"); prev_halt = None
+            if BLOCKED_HOURS and datetime.now(timezone.utc).hour in BLOCKED_HOURS:
+                await asyncio.sleep(max(1.0, BOOK_POLL_MS / 1000)); continue
             for tok, m in list(markets.items()):
                 left = m["close_ts"] - t
                 win = snipe_window_for(m.get("dur", "5m"))         # 5m=12s, 15m=30s
