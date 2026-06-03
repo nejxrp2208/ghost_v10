@@ -651,6 +651,12 @@ LAZY_ORDERBOOK = os.getenv("LAZY_ORDERBOOK", "true").strip().lower() in ("true",
 PAPER_TRADE    = os.getenv("PAPER_TRADE", "true").strip().lower() in ("true", "1", "yes")
 PORTFOLIO_SIZE = float(os.getenv("PORTFOLIO_SIZE", "200.0"))
 
+# ── Hour filter (UTC) — only scan during these hours ──────────────────────────
+# Empty = trade all hours. Set ALLOWED_HOURS=1,3,15,23 to restrict to best hours.
+# Data (n=2116 trades): hours 01, 03, 15, 23 UTC are the only profitable ones.
+_ah_raw = os.getenv("ALLOWED_HOURS", "").strip()
+ALLOWED_HOURS: set = {int(h.strip()) for h in _ah_raw.split(",") if h.strip().isdigit()} if _ah_raw else set()
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH    = os.path.join(SCRIPT_DIR,
                 "GHOST_LATTICE_PAPER.db" if PAPER_TRADE else "GHOST_LATTICE.db")
@@ -5463,6 +5469,11 @@ class CryptoGhostScanner:
                         os.replace(_stats_tmp, _stats_path)
                     except Exception:
                         pass
+
+                # ── Hour filter: skip scan entirely outside allowed hours ──
+                if ALLOWED_HOURS and datetime.now(timezone.utc).hour not in ALLOWED_HOURS:
+                    await asyncio.sleep(30)
+                    continue
 
                 fired     = 0
                 skip_ask  = 0
