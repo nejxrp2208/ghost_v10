@@ -43,7 +43,10 @@ def load_env():
                 if "#" in v: v=v[:v.index("#")]
                 os.environ.setdefault(k.strip(),v.strip())
 load_env()
-TG_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN","").strip(); TG_CHAT=os.getenv("TELEGRAM_CHAT_ID","").strip()
+# Shadow mode: if GP_DB_PATH is set, this is a shadow resolver — no Telegram
+_SHADOW_MODE = bool(os.getenv("GP_DB_PATH", ""))
+TG_TOKEN = "" if _SHADOW_MODE else os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+TG_CHAT  = "" if _SHADOW_MODE else os.getenv("TELEGRAM_CHAT_ID","").strip()
 
 def http_get(url,timeout=12):
     for _ in range(3):
