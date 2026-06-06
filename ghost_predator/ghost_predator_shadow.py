@@ -527,11 +527,47 @@ def banner():
 async def prewarm_loop(): return
 async def presign_loop(): return
 
+async def paper_resolver_loop():
+    """Resolve positions using Binance close price — paper-only, self-contained."""
+    async with aiohttp.ClientSession() as s:
+        while True:
+            try:
+                t_now = int(now())
+                c = db()
+                rows = c.execute("""SELECT id, coin, outcome, close_ts, open_price, size_usdc
+                                    FROM positions
+                                    WHERE status='open' AND close_ts < ?""",
+                                 (t_now - 30,)).fetchall()
+                c.close()
+                for pid, coin, side, close_ts, open_px, sz in rows:
+                    sym = BINANCE_SYM.get(coin)
+                    if not sym or not open_px:
+                        continue
+                    d = await jget(s, f"{BINANCE_REST}/api/v3/klines?symbol={sym}&interval=1m"
+                                      f"&startTime={(close_ts-60)*1000}&limit=1")
+                    if not d or not d[0]:
+                        continue
+                    close_px = float(d[0][4])
+                    is_up = side.upper() in ("UP", "YES")
+                    won = (close_px >= open_px) if is_up else (close_px < open_px)
+                    status = 'won' if won else 'lost'
+                    sz = sz or 20.0
+                    pnl = round(sz * (1/open_px - 1), 4) if won else -sz
+                    c = db()
+                    c.execute("UPDATE positions SET status=?, pnl=?, resolved_at=? WHERE id=?",
+                              (status, pnl, datetime.now(timezone.utc).isoformat(), pid))
+                    c.commit(); c.close()
+                    print(f"[{ts_str()}] RESOLVE #{pid} {coin} {side} {'WIN' if won else 'LOSS'} | open={open_px:.4f} close={close_px:.4f} pnl={pnl:+.2f}")
+            except Exception as ex:
+                print(f"[{ts_str()}] [resolve-err] {ex}")
+            await asyncio.sleep(30)
+
 async def main():
     init_db(); banner()
     await asyncio.gather(binance_feed(), book_feed(), discovery(), snipe_loop(),
                          status_loop(), state_writer(), regime_loop(),
-                         shadow_resolver_loop(), firstmover_reader())
+                         shadow_resolver_loop(), firstmover_reader(),
+                         paper_resolver_loop())
 
 if __name__ == "__main__":
     try:

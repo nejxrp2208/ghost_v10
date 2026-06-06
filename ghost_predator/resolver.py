@@ -29,7 +29,7 @@ def et_window(close_ts, dur_secs):
         return ""
 
 SD = os.path.dirname(os.path.abspath(__file__))
-DB = os.getenv("GP_DB_PATH", os.path.join(SD, "ghost_predator.db"))
+DB = os.path.join(SD, "ghost_predator.db")
 CLOB = "https://clob.polymarket.com"
 CLOSE_BUFFER = 20      # don't bother polling until this many secs after close
 
@@ -43,10 +43,7 @@ def load_env():
                 if "#" in v: v=v[:v.index("#")]
                 os.environ.setdefault(k.strip(),v.strip())
 load_env()
-# Shadow mode: if GP_DB_PATH is set, this is a shadow resolver — no Telegram
-_SHADOW_MODE = bool(os.getenv("GP_DB_PATH", ""))
-TG_TOKEN = "" if _SHADOW_MODE else os.getenv("TELEGRAM_BOT_TOKEN","").strip()
-TG_CHAT  = "" if _SHADOW_MODE else os.getenv("TELEGRAM_CHAT_ID","").strip()
+TG_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN","").strip(); TG_CHAT=os.getenv("TELEGRAM_CHAT_ID","").strip()
 
 def http_get(url,timeout=12):
     for _ in range(3):
