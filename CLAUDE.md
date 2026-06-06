@@ -21,6 +21,7 @@
 | `ghost-predator-alarm` | `ghost_predator/alarmghost.py` | GHOST PREDATOR Telegram health alarm (loss/cold/daily-loss triggers) |
 | `ghost-predator-radar` | `ghost_predator/divergence_scan.py` | GHOST PREDATOR Reversal Radar — read-only T-11s PM-vs-spot divergence collector |
 | `ghost-predator-firstmover` | `ghost_predator/firstmover.py` | First-mover edge detector — rolling 20-window WR-vs-PM-ask, signals GO/WAIT/OUT |
+| `ghost-predator-shadow` | `ghost_predator/ghost_predator_shadow.py` | Shadow data collector — same snipe logic, BTC/ETH/XRP/SOL, 5m+15m, always PAPER, writes to `shadow_predator.db` |
 
 **Scanner architecture:** Scanner 4 = single strategy = one PM2 process. Writes to `crypto_ghost_PAPER.db`, distinguished by `strategy='s4_reversal'`. Resolver handles it. (Scanners 1/2/3/5 removed 2026-06-03.)
 
@@ -129,6 +130,7 @@ pm2 restart ghost-predator-resolver  # on-chain token-level settlement
 pm2 restart ghost-predator-alarm     # Telegram health alarm (loss/cold/daily-loss)
 pm2 restart ghost-predator-radar     # Reversal Radar (T-11s PM-vs-spot divergence collector)
 pm2 restart ghost-predator-firstmover # First-mover edge detector (gates real fires on GO/OUT)
+pm2 restart ghost-predator-shadow     # Shadow data collector (BTC/ETH/XRP/SOL, 5m+15m, paper-only)
 ```
 
 ### First-time deploy (zugu_bot v3.5)
@@ -212,6 +214,21 @@ pm2 logs ghost-predator-firstmover --lines 10 --nostream
 ```
 
 When ENABLED=true, predator only fires real money when signal is GO or WARMUP (default-safe). WAIT/OUT routes to shadow paper.
+
+### Shadow data collector (ghost-predator-shadow)
+
+Standalone paper-only bot that collects entry/WR data across BTC, ETH, XRP, SOL on 5m+15m markets. No `.env` needed — all config hardcoded. Never touches `ghost_predator.db`.
+
+```bash
+# First-time deploy
+cd /root/ghost_v10 && git pull
+pm2 start ghost_predator/ghost_predator_shadow.py --name ghost-predator-shadow --interpreter /root/ghost_v10/venv/bin/python3
+pm2 save
+pm2 logs ghost-predator-shadow --lines 10 --nostream
+```
+
+**Key hardcoded config:** `COINS=BTC,ETH,XRP,SOL` | `DURATIONS=5m,15m` | `SNIPE_WINDOW=28s` (5m) / `20s` (15m) | `ask 0.65-0.78` | `$20 stake` | `REGIME_GATE=false` (never halts)
+**DB:** `ghost_predator/shadow_predator.db` (separate from main bot)
 
 ### GHOST_LATTICE Dashboard
 
