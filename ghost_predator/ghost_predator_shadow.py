@@ -528,39 +528,45 @@ async def prewarm_loop(): return
 async def presign_loop(): return
 
 async def paper_resolver_loop():
-    """Resolve positions using Binance close price — paper-only, self-contained."""
+    """Resolve positions using Polymarket on-chain TOKEN WINNER — same logic as
+    main resolver.py. 100% accurate (settles on what PM actually paid out).
+    Uses public CLOB API — no credentials, no env needed."""
+    CLOSE_BUFFER = 20
     async with aiohttp.ClientSession() as s:
         while True:
             try:
                 t_now = int(now())
                 c = db()
-                rows = c.execute("""SELECT id, coin, outcome, close_ts, open_price, size_usdc
-                                    FROM positions
-                                    WHERE status='open' AND close_ts < ?""",
-                                 (t_now - 30,)).fetchall()
+                rows = c.execute("""SELECT id, coin, outcome, token_id, condition_id,
+                                           size_usdc, shares, close_ts, status
+                                    FROM positions WHERE status='open'""").fetchall()
                 c.close()
-                for pid, coin, side, close_ts, open_px, sz in rows:
-                    sym = BINANCE_SYM.get(coin)
-                    if not sym or not open_px:
+                for pid, coin, side, token, cond, sz, shares, close_ts, status in rows:
+                    if close_ts and t_now < close_ts + CLOSE_BUFFER:
                         continue
-                    d = await jget(s, f"{BINANCE_REST}/api/v3/klines?symbol={sym}&interval=1m"
-                                      f"&startTime={(close_ts-60)*1000}&limit=1")
-                    if not d or not d[0]:
+                    # Fetch market from PM CLOB — find token with winner=True
+                    m = await jget(s, f"{CLOB}/markets/{cond}", timeout=12)
+                    if not m or not m.get("tokens"):
                         continue
-                    close_px = float(d[0][4])
-                    is_up = side.upper() in ("UP", "YES")
-                    won = (close_px >= open_px) if is_up else (close_px < open_px)
-                    status = 'won' if won else 'lost'
-                    sz = sz or 20.0
-                    pnl = round(sz * (1/open_px - 1), 4) if won else -sz
+                    toks = m["tokens"]
+                    ids = {t.get("token_id") for t in toks}
+                    if ids and token not in ids:
+                        continue  # safety: our token not in this market
+                    w = next((t for t in toks if t.get("winner")), None)
+                    if w is None:
+                        continue  # PM has not settled yet — leave open
+                    wtok = w.get("token_id")
+                    won = (wtok == token)
+                    pnl = round(shares - sz, 2) if won else round(-sz, 2)
+                    new_status = "won" if won else "lost"
                     c = db()
-                    c.execute("UPDATE positions SET status=?, pnl=?, resolved_at=? WHERE id=?",
-                              (status, pnl, datetime.now(timezone.utc).isoformat(), pid))
+                    c.execute("UPDATE positions SET status=?, pnl=?, resolved_at=?, pm_confirmed=1 WHERE id=?",
+                              (new_status, pnl, datetime.now(timezone.utc).isoformat(), pid))
                     c.commit(); c.close()
-                    print(f"[{ts_str()}] RESOLVE #{pid} {coin} {side} {'WIN' if won else 'LOSS'} | open={open_px:.4f} close={close_px:.4f} pnl={pnl:+.2f}")
+                    print(f"[{ts_str()}] RESOLVE #{pid} {coin} {side} {'WIN' if won else 'LOSS'} PM-confirmed | pnl={pnl:+.2f}")
             except Exception as ex:
                 print(f"[{ts_str()}] [resolve-err] {ex}")
-            await asyncio.sleep(30)
+            await asyncio.sleep(20)
 
 async def main():
     init_db(); banner()
