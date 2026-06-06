@@ -29,7 +29,7 @@ def et_window(close_ts, dur_secs):
         return ""
 
 SD = os.path.dirname(os.path.abspath(__file__))
-DB = os.path.join(SD, "ghost_predator.db")
+DB = os.getenv("GP_DB_PATH", os.path.join(SD, "ghost_predator.db"))
 CLOB = "https://clob.polymarket.com"
 CLOSE_BUFFER = 20      # don't bother polling until this many secs after close
 

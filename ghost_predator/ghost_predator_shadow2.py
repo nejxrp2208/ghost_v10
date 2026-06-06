@@ -394,46 +394,6 @@ async def fire(session, tok, m, ask, size, move_bps, left, cur,
     print(f"[{ts_str()}] SHADOW2 #{pid} {coin} PM:{pm_fav_side} @ {fill_price:.3f} "
           f"${size:.2f} | BIN:{binance_leader} DIVERGED | {move_bps:+.1f}bps | {left}s")
 
-# ── paper resolver ────────────────────────────────────────────────────────────
-async def paper_resolver_loop():
-    async with aiohttp.ClientSession() as s:
-        while True:
-            try:
-                t_now = int(now())
-                c = db()
-                rows = c.execute("""SELECT id, coin, outcome, close_ts, open_price
-                                    FROM positions WHERE status='open' AND close_ts < ?""",
-                                 (t_now - 30,)).fetchall()
-                c.close()
-                for pid, coin, side, close_ts, open_px in rows:
-                    sym = BINANCE_SYM.get(coin)
-                    if not sym or not open_px:
-                        continue
-                    d = await jget(s, f"{BINANCE_REST}/api/v3/klines?symbol={sym}&interval=1m"
-                                      f"&startTime={(close_ts-60)*1000}&limit=1")
-                    if not d or not d[0]:
-                        continue
-                    close_px = float(d[0][4])
-                    is_up = side.upper() in ("UP", "YES")
-                    won = (close_px >= open_px) if is_up else (close_px < open_px)
-                    status = 'won' if won else 'lost'
-                    pnl = round(size * (1/open_px - 1), 4) if won else -20.0
-                    # re-fetch size
-                    c2 = db()
-                    sz_row = c2.execute("SELECT size_usdc FROM positions WHERE id=?", (pid,)).fetchone()
-                    c2.close()
-                    sz = sz_row[0] if sz_row else 20.0
-                    pnl = round(sz * (1/open_px - 1), 4) if won else -sz
-                    c3 = db()
-                    c3.execute("UPDATE positions SET status=?, pnl=?, resolved_at=? WHERE id=?",
-                               (status, pnl, datetime.now(timezone.utc).isoformat(), pid))
-                    c3.commit(); c3.close()
-                    print(f"[{ts_str()}] RESOLVE2 #{pid} {coin} {side} {'WIN' if won else 'LOSS'} "
-                          f"open={open_px:.4f} close={close_px:.4f} pnl={pnl:+.2f}")
-            except Exception as ex:
-                print(f"[{ts_str()}] [resolve-err] {ex}")
-            await asyncio.sleep(30)
-
 # ── status ────────────────────────────────────────────────────────────────────
 async def status_loop():
     while True:
@@ -455,7 +415,7 @@ def banner():
 async def main():
     init_db(); banner()
     await asyncio.gather(binance_feed(), book_feed(), discovery(), snipe_loop(),
-                         status_loop(), paper_resolver_loop())
+                         status_loop())
 
 if __name__ == "__main__":
     try:
