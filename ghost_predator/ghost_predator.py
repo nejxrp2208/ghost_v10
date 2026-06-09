@@ -63,10 +63,28 @@ MIN_ASK         = envf("MIN_ASK", "0.02")
 MAX_ASK         = envf("MAX_ASK", "0.90")           # only snipe if ask <= this (profit room)
 BASE_SIZE       = envf("BASE_SIZE", "5.0")
 MAX_PER_MARKET  = envf("MAX_PER_MARKET", "10.0")
-BTC_BASE_SIZE      = envf("BTC_BASE_SIZE", str(BASE_SIZE))        # BTC stake (data: 82% WR → bigger bet)
-ETH_BASE_SIZE      = envf("ETH_BASE_SIZE", str(BASE_SIZE))        # ETH stake (data: lower WR → smaller bet)
+BTC_BASE_SIZE      = envf("BTC_BASE_SIZE", str(BASE_SIZE))        # BTC stake (IGNORED when LADDER_ENABLED=true)
+ETH_BASE_SIZE      = envf("ETH_BASE_SIZE", str(BASE_SIZE))        # ETH stake (IGNORED when LADDER_ENABLED=true)
 BTC_MAX_PER_MARKET = envf("BTC_MAX_PER_MARKET", str(MAX_PER_MARKET))
 ETH_MAX_PER_MARKET = envf("ETH_MAX_PER_MARKET", str(MAX_PER_MARKET))
+# ── Compounding ladder (per coin × duration) ─────────────────────────────────
+# Win advances to next step. Loss resets to step 1. Last step cycles back to step 1.
+# When LADDER_ENABLED=true, BTC_BASE_SIZE / ETH_BASE_SIZE are IGNORED.
+LADDER_ENABLED  = os.getenv("LADDER_ENABLED", "true").lower() == "true"
+def _parse_steps(s):
+    out = []
+    for x in (s or "").split(","):
+        x = x.strip()
+        if x:
+            try: out.append(float(x))
+            except Exception: pass
+    return out or [10.0]
+LADDER_STEPS = {
+    ("BTC", "5m"):  _parse_steps(os.getenv("BTC_5M_LADDER_STEPS",  "10,15,25")),
+    ("BTC", "15m"): _parse_steps(os.getenv("BTC_15M_LADDER_STEPS", "10,15,25")),
+    ("ETH", "5m"):  _parse_steps(os.getenv("ETH_5M_LADDER_STEPS",  "10,15,25")),
+    ("ETH", "15m"): _parse_steps(os.getenv("ETH_15M_LADDER_STEPS", "10,15,25")),
+}
 REQUIRE_FILL    = os.getenv("REQUIRE_FILL", "true").lower() == "true"  # only fire/record when resting depth >= stake (skip unfillable; paper mirrors live FOK). false = record everything + tag would_fill
 DYNAMIC_SIZE    = os.getenv("DYNAMIC_SIZE", "true").lower() == "true"  # 2026-05-23: size each order to depth at the ask = min(BASE_SIZE, depth) for ~100% fill. Captures thin high-win books at small size; supersedes the REQUIRE_FILL gate. BASE_SIZE becomes the CAP.
 MIN_STAKE       = envf("MIN_STAKE", "1.0")                             # Polymarket min order; if depth-matched size is below this, the book is truly unfillable -> skip
@@ -160,6 +178,30 @@ def init_db():
 def market_exposure(cond):
     c = db(); r = c.execute("SELECT COALESCE(SUM(size_usdc),0) FROM positions WHERE condition_id=?",(cond,)).fetchone()[0]; c.close()
     return r or 0.0
+
+def compute_ladder_size(coin, dur):
+    """Compounding ladder per (coin, dur). Walks recent resolved trades to
+    determine the current step:
+      - 'won'  → advance to next step (cycles back to step 0 after last step)
+      - 'lost' → reset to step 0
+    Cold start (no history) → step 0. Returns the next bet size in USDC."""
+    steps = LADDER_STEPS.get((coin, dur)) or [10.0]
+    c = db()
+    # slug format: "btc-updown-5m-..." or "eth-updown-15m-..." — LIKE matches both
+    rows = c.execute("""SELECT status FROM positions
+                        WHERE coin=? AND slug LIKE ?
+                          AND status IN ('won','lost')
+                        ORDER BY id DESC LIMIT 50""",
+                     (coin, f"%-updown-{dur}-%")).fetchall()
+    c.close()
+    # Walk oldest -> newest to track current position
+    pos = 0
+    for (status,) in reversed(rows):
+        if status == 'lost':
+            pos = 0
+        elif status == 'won':
+            pos = (pos + 1) % len(steps)
+    return steps[pos]
 
 def halt_reason():
     """Account-survival guardrails. Returns a halt string, or None if clear to trade.
@@ -680,8 +722,12 @@ async def snipe_loop():
                 # refresh ask (+ how many shares are offered at it)
                 ask, ask_sz = await best_ask(s, tok)
                 if ask is None or not (MIN_ASK <= ask <= MAX_ASK): continue
-                coin_base = BTC_BASE_SIZE if coin == "BTC" else ETH_BASE_SIZE
-                coin_max  = BTC_MAX_PER_MARKET if coin == "BTC" else ETH_MAX_PER_MARKET
+                if LADDER_ENABLED:
+                    coin_base = compute_ladder_size(coin, m.get("dur", "5m"))
+                    coin_max  = coin_base
+                else:
+                    coin_base = BTC_BASE_SIZE if coin == "BTC" else ETH_BASE_SIZE
+                    coin_max  = BTC_MAX_PER_MARKET if coin == "BTC" else ETH_MAX_PER_MARKET
                 exp = market_exposure(m["cond"])
                 if exp >= coin_max: continue
                 target = min(coin_base, coin_max - exp)
@@ -767,8 +813,8 @@ async def fire(session, tok, m, ask, size, move_bps, left, cur, ask_sz=0.0, cum_
             # skipping the ~30-50ms EIP-712 signing. Fall back to signing inline if none is cached.
             order = presigned.pop(tok, None)
             if order is None:
-                coin_b = BTC_BASE_SIZE if coin == "BTC" else ETH_BASE_SIZE
-                amt = coin_b if WALK_FILL else size
+                # use the snipe_loop-computed size (ladder-aware) as the FOK amount
+                amt = size
                 cap = MAX_ASK if WALK_FILL else ask
                 args = MarketOrderArgs(token_id=tok, amount=amt, side=BUY, price=cap,
                                        order_type=OrderType.FOK)
@@ -917,6 +963,9 @@ def banner():
     print(f"  leader must move >={MIN_MOVE_BPS}bps | ask {MIN_ASK}-{MAX_ASK} | "
           f"${BASE_SIZE}/snipe cap ${MAX_PER_MARKET}/mkt")
     print(f"  bankroll ${START_BAL:.0f} | book {'WSS realtime (REST fallback)' if USE_WSS_BOOK else f'REST {BOOK_POLL_MS}ms'} | db {os.path.basename(DB)}")
+    if LADDER_ENABLED:
+        print(f"  LADDER ON: BTC 5m={LADDER_STEPS[('BTC','5m')]}  BTC 15m={LADDER_STEPS[('BTC','15m')]}")
+        print(f"             ETH 5m={LADDER_STEPS[('ETH','5m')]}  ETH 15m={LADDER_STEPS[('ETH','15m')]}")
     print("="*66)
 
 # ── order-path pre-warm (LIVE only) ─────────────────────────────────────────
@@ -966,12 +1015,16 @@ async def presign_loop():
                 from py_clob_client_v2.clob_types import MarketOrderArgs, OrderType
                 from py_clob_client_v2.order_builder.constants import BUY
                 cap = MAX_ASK if WALK_FILL else None
-                coin_b = BTC_BASE_SIZE if m.get("coin") == "BTC" else ETH_BASE_SIZE
+                _coin = m.get("coin"); _dur = m.get("dur", "5m")
+                if LADDER_ENABLED:
+                    coin_b = compute_ladder_size(_coin, _dur)
+                else:
+                    coin_b = BTC_BASE_SIZE if _coin == "BTC" else ETH_BASE_SIZE
                 args = MarketOrderArgs(token_id=tok, amount=coin_b, side=BUY,
                                        price=(cap if cap is not None else MAX_ASK),
                                        order_type=OrderType.FOK)
                 presigned[tok] = await asyncio.to_thread(live_client().create_market_order, args)
-                print(f"[{ts_str()}] [presign] {m['coin']} {m['side']} {m.get('dur','5m')} — $30 FOK @ <={MAX_ASK} ready")
+                print(f"[{ts_str()}] [presign] {_coin} {m['side']} {_dur} — ${coin_b:.0f} FOK @ <={MAX_ASK} ready")
             for tk in [k for k in presigned if k not in markets]:   # prune closed windows
                 presigned.pop(tk, None)
         except Exception as e:
