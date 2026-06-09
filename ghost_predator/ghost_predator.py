@@ -813,8 +813,13 @@ async def fire(session, tok, m, ask, size, move_bps, left, cur, ask_sz=0.0, cum_
             # skipping the ~30-50ms EIP-712 signing. Fall back to signing inline if none is cached.
             order = presigned.pop(tok, None)
             if order is None:
-                # use the snipe_loop-computed size (ladder-aware) as the FOK amount
-                amt = size
+                # Match the OLD WALK_FILL pattern (clean amount, not walk_cost decimal),
+                # but use ladder size when LADDER_ENABLED — same as snipe_loop & presign.
+                if LADDER_ENABLED:
+                    coin_b = compute_ladder_size(coin, m.get("dur", "5m"))
+                else:
+                    coin_b = BTC_BASE_SIZE if coin == "BTC" else ETH_BASE_SIZE
+                amt = coin_b if WALK_FILL else size
                 cap = MAX_ASK if WALK_FILL else ask
                 args = MarketOrderArgs(token_id=tok, amount=amt, side=BUY, price=cap,
                                        order_type=OrderType.FOK)
