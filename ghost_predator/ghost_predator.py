@@ -679,7 +679,7 @@ async def pm_balance_loop():
             )
             raw = (result or {}).get("balance") or (result or {}).get("usdc")
             if raw is not None:
-                PM_BALANCE["usdc"] = round(float(raw), 2)
+                PM_BALANCE["usdc"] = round(float(raw) / 1_000_000, 2)
                 PM_BALANCE["ts"] = time.time()
         except Exception:
             pass
