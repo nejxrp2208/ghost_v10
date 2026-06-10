@@ -22,6 +22,9 @@ Run:  python3 alarmghost.py            (alongside ghost_predator.py + resolver.p
 import os, time, json, sqlite3, ssl, urllib.parse, urllib.request
 from datetime import datetime, timezone
 
+STATE_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+HEARTBEAT_SECS = 30 * 60  # 30 minutes
+
 SD    = os.path.dirname(os.path.abspath(__file__))
 DB    = os.path.join(SD, "ghost_predator.db")          # Predator's own DB — nothing else
 STATE = os.path.join(SD, "alarmghost_state.json")
@@ -96,15 +99,16 @@ def check():
     # cold run: 0% wins over the most recent COLD_MIN settled
     recent = rows[:COLD_MIN]
     wins_recent = sum(1 for r in recent if r[3] == "won")
-    # today's pnl + lifetime
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    tp    = sum((r[4] or 0) for r in rows if (r[5] or "")[:10] == today)
-    total = sum((r[4] or 0) for r in rows)
-    won   = sum(1 for r in rows if r[3] == "won")
-    lost  = sum(1 for r in rows if r[3] == "lost")
-    base  = f"\n📊 Predator: {won}W/{lost}L  lifetime ${total:+.2f}  today ${tp:+.2f}"
+    # today's pnl + W/L
+    today      = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_rows = [r for r in rows if (r[5] or "")[:10] == today]
+    tp         = sum((r[4] or 0) for r in today_rows)
+    today_won  = sum(1 for r in today_rows if r[3] == "won")
+    today_lost = sum(1 for r in today_rows if r[3] == "lost")
+    base  = f"\n📊 Predator today: {today_won}W/{today_lost}L  ${tp:+.2f}"
 
     st = load_state(); now_h = time.time() / 3600.0
+    heartbeat(st, now_h)
     def fire(key, msg):
         if now_h - st.get(key, 0) >= COOLDOWN_H:
             tg(msg); st[key] = now_h
@@ -136,6 +140,44 @@ def check():
         st.pop("daily", None)
 
     save_state(st)
+
+def heartbeat(st, now_h):
+    """Send 30-minute balance + daily summary to Telegram."""
+    if now_h - st.get("heartbeat", 0) < HEARTBEAT_SECS / 3600.0:
+        return
+    try:
+        c = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today_rows = c.execute(
+            "SELECT status, COALESCE(pnl,0) FROM positions "
+            "WHERE status IN ('won','lost') AND substr(ts,1,10)=?", (today,)
+        ).fetchall()
+        c.close()
+        tp        = sum(r[1] for r in today_rows)
+        today_won  = sum(1 for r in today_rows if r[0] == "won")
+        today_lost = sum(1 for r in today_rows if r[0] == "lost")
+    except Exception:
+        tp = today_won = today_lost = 0
+
+    pm_bal = None
+    try:
+        s = json.load(open(STATE_JSON))
+        pm_bal = s.get("pm_balance")
+    except Exception:
+        pass
+
+    total_today = today_won + today_lost
+    wr = f"{today_won/total_today*100:.0f}%" if total_today else "—"
+    now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    bal_line = f"Balance:  ${pm_bal:,.2f}" if pm_bal is not None else ""
+    msg = (f"📊 PREDATOR — 30m update\n{now_utc}\n\n"
+           + (f"{bal_line}\n" if bal_line else "")
+           + f"Today:    ${tp:+.2f}  ({today_won}W / {today_lost}L)\n"
+           + f"Win rate: {wr}")
+    tg(msg)
+    st["heartbeat"] = now_h
+    print(f"[{ts()}] heartbeat sent")
+
 
 def main():
     print(f"[{ts()}] PREDATOR AlarmGhost — watching {os.path.basename(DB)} "
