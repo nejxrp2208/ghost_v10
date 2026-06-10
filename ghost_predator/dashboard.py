@@ -128,8 +128,13 @@ def wallet_panel(st):
     roi=(pnl/cost*100) if cost else 0; wr=(won/(won+lost)*100) if (won+lost) else 0
     today=(q("SELECT COALESCE(SUM(pnl),0) FROM positions WHERE substr(ts,1,10)=?",
              (datetime.now(timezone.utc).strftime("%Y-%m-%d"),)) or [(0,)])[0][0]
+    pm_bal=(st or {}).get("pm_balance")
     t=Table.grid(padding=(0,1)); t.add_column(style=LBL,width=10); t.add_column(width=16)
-    t.add_row("Balance",money(bankroll+pnl)); t.add_row("Today",money(today))
+    if pm_bal is not None:
+        t.add_row("Balance",Text(f"${pm_bal:,.2f}",style=WIN if pm_bal>0 else (LOSS if pm_bal<0 else VAL)))
+    else:
+        t.add_row("Balance",money(bankroll+pnl))
+    t.add_row("Today",money(today))
     t.add_row("All-time",money(pnl))
     t.add_row("Record",Text(f"{won}W / {lost}L  ({tot})",style=VAL))
     t.add_row("Win rate",Text(f"{wr:.0f}%",style=ACCENT))

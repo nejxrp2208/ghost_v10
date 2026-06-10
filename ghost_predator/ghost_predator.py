@@ -126,6 +126,7 @@ REGIME = {
 }
 # ── First-mover detector state (updated by firstmover_reader from firstmover_state.json) ──
 FIRSTMOVER = {"signal": "WARMUP", "edge": None, "n": 0, "ts": 0}
+PM_BALANCE = {"usdc": None, "ts": 0.0}  # live-only: real USDC balance fetched from Polymarket CLOB API
 prices  = {}     # COIN -> latest Binance price
 price_ts = {}    # COIN -> time.time() when that price arrived (stale-feed guard)
 markets = {}     # token_id -> dict(coin, side, cond, slug, open_price, close_ts)
@@ -221,7 +222,7 @@ def halt_reason():
     else:
         rolling_pnl = 0.0
     c.close()
-    balance = START_BAL + total_pnl
+    balance = PM_BALANCE["usdc"] if (not PAPER and PM_BALANCE["usdc"] is not None) else START_BAL + total_pnl
     floor = MIN_BALANCE if MIN_BALANCE > 0 else BASE_SIZE
     if ROLLING_24H_LIMIT > 0 and rolling_pnl <= -ROLLING_24H_LIMIT:
         return f"ROLLING 24H LIMIT (${rolling_pnl:.2f} <= -${ROLLING_24H_LIMIT:.0f})"
@@ -663,6 +664,28 @@ async def firstmover_reader():
         await asyncio.sleep(30)
 
 
+async def pm_balance_loop():
+    """Fetch real USDC balance from Polymarket CLOB every 30s (LIVE only).
+    Stored in PM_BALANCE and surfaced to dashboard + halt_reason floor check."""
+    if PAPER:
+        return
+    while True:
+        try:
+            from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+            cl = live_client()
+            result = await asyncio.to_thread(
+                cl.get_balance_allowance,
+                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            raw = (result or {}).get("balance") or (result or {}).get("usdc")
+            if raw is not None:
+                PM_BALANCE["usdc"] = round(float(raw), 2)
+                PM_BALANCE["ts"] = time.time()
+        except Exception:
+            pass
+        await asyncio.sleep(30)
+
+
 def _wick_snapshot(coin, op, leading_up, dur):
     """Snapshot price state just BEFORE the snipe window opened.
     Returns (pre_window_move_bps, price_trend).
@@ -934,7 +957,8 @@ async def state_writer():
                                                 "now": prices.get(cc),
                                                 "hist": list(price_hist.get(cc, []))}
                 payload = {"ts": t, "mode": "PAPER" if PAPER else "LIVE",
-                           "bankroll": START_BAL, "prices": prices, "tracking": len(hunt),
+                           "bankroll": START_BAL, "pm_balance": PM_BALANCE["usdc"],
+                           "prices": prices, "tracking": len(hunt),
                            "halt": HALT["reason"], "charts": charts,
                            "regime": {"gate": REGIME["gate"], "edge": REGIME["edge"],
                                       "n": REGIME["n"], "window": REGIME_WINDOW,
@@ -1041,7 +1065,7 @@ async def main():
     await asyncio.gather(binance_feed(), book_feed(), discovery(), snipe_loop(),
                          status_loop(), state_writer(), prewarm_loop(), presign_loop(),
                          regime_loop(), shadow_resolver_loop(),
-                         firstmover_reader())
+                         firstmover_reader(), pm_balance_loop())
 
 if __name__ == "__main__":
     try:
