@@ -1,0 +1,71 @@
+meta:
+  owner: team
+  last_verified_by: "Julian (live box state.json) + KSO (2nd-book reproduction)"
+  last_verified_date: 2026-06-18
+  source: "team CLAUDE.md golden-hour recipe + Julian chat: .50-.90, 1.5bps flat, t-30, RAW"
+  status: verified
+  mode: live
+
+# SHARED GOLDEN-HOUR PROFILE ("the sauce"). LIVE-VERIFIED on Julian's box, reproduced on KSO's.
+# Runs hours 08-11 UTC; team applies Mon-Thu themselves (the bot has NO weekday gate -> running it
+# only Mon-Thu via the profile-swap cron IS the fix for J's known weekend-$25 bug).
+
+entry_band:
+  min_ask: 0.50               # RAW wide band
+  max_ask: 0.90               # eff morning cap (Julian .env base 0.78, lifted to 0.90 in-window)
+  fill_floor: 0.50            # no extra floor (RAW)
+
+filters:
+  min_move_bps: 1.5           # FLAT 1.5 across all hours (Julian CORRECTED: 1.5 not 3.0; KSO confirmed)
+  weekend_min_move_bps: 0     # golden runs Mon-Thu only (via cron)
+  min_book_depth: 0           # RAW -- "no filters"
+  min_confirms: 1             # RAW -- "no filters"
+  chop_filter: false          # "no chop no nothing"
+  chop_max_flips: 4
+  chop_lookback: 90
+  coins: [BTC, ETH]
+  durations: ["5m", "15m"]
+
+fire_timing:
+  snipe_window_secs: 28       # Julian's live box = 28s (chat "t-30" ~= 28-30s first-tick window)
+  snipe_window_15m: 28
+  min_fill_secs: 2
+  late_fire_secs: 0
+
+sizing:                       # Julian: MORNING_SIZE=$25 flat, ADAPTIVE_STAKE off, NO Paroli.
+  base_size: 25.0             # $25 flat in-window (off-peak $1 handled by Branden's own config out-of-window)
+  dynamic_size: false
+  paroli_enabled: false       # Julian runs flat. NOTE: KSO runs Paroli in-window (+20%, morning wins streak) -- variant to test
+  paroli_ladder: [10, 15]
+  paroli_mult: 1.5
+  paroli_steps: 3
+  paroli_5m_max_step: 1
+  max_per_market: 25.0
+
+guardrails:
+  max_loss_streak: 1000       # Julian runs streak-halt OFF in-window. Branden test override below.
+  daily_loss_limit: 60        # Branden SAFETY cap for the test (Julian runs 75)
+  min_balance: 150
+  rolling_24h_limit: 0
+  max_open_positions: 5
+  auto_scratch: true
+  scratch_max_slip: 0.15
+
+schedule_gate:
+  trading_hours: [8, 9, 10, 11]   # MORNING_HOURS = 08-11 UTC (per Julian's live box)
+  active_days: [Mon, Tue, Wed, Thu]
+  blackout_start: 21
+  blackout_end: 23
+
+skips:
+  skip_eth_up: false
+  skip_btc_up: false
+  eth_skip_15m: false
+  btc_skip_5m: false
+
+# ⚠️ PER-BOOK WARNING (iron rule 2): the golden hour is VERIFIED on Julian + KSO, but Branden's OWN
+# book is the documented EXCEPTION -- 08-11Z = -$0.43/fire (CLAUDE.md 2026-06-16 05:09Z) and the
+# workflow on 930 fills = -0.25/trade. Branden's edge is US-MIDDAY (12-19Z), not EU-morning.
+# So this profile on BRANDEN's book Monday is a CAPPED LIVE PROBE of a window that backtested DEAD
+# on his fills -- NOT a known winner. Kill rule: -$60/day stop; Thu eval flat-$10 net, kill if <=0.
+# Also re-check NET OF the 0.072*(1-p) taker fee before calling any morning block a durable edge.

@@ -1,0 +1,13 @@
+# NEVER commit secrets — belt to the check_no_secrets.sh suspenders
+.env
+.env.*
+*.key
+*.pem
+*secret*
+*passphrase*
+*.db
+*credentials*
+# scratch
+__pycache__/
+*.pyc
+.DS_Store

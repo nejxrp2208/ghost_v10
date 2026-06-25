@@ -1,0 +1,65 @@
+# CANONICAL CONFIG SCHEMA — Ghost Predator
+# Every person's config uses THESE keys, these units, these meanings. No aliases.
+# This file is the contract that ends "your 3.0 vs my 1.5" drift.
+# Format per field:  key: { type, unit, meaning, range }
+
+meta:
+  owner:             { type: str,  meaning: "person who owns/maintains this config" }
+  last_verified_by:  { type: str,  meaning: "who last confirmed the values are real" }
+  last_verified_date:{ type: date, meaning: "YYYY-MM-DD of last verification" }
+  source:            { type: str,  meaning: "where values came from: live .env / dashboard / screenshot" }
+  status:            { type: enum, range: [verified, draft, unverified, template] }
+  mode:              { type: enum, range: [live, paper] }
+
+entry_band:
+  min_ask:    { type: float, unit: prob, meaning: "lowest entry price the bot will pay", range: "0.50-0.79" }
+  max_ask:    { type: float, unit: prob, meaning: "highest entry price the bot will pay", range: "0.70-0.90" }
+  fill_floor: { type: float, unit: prob, meaning: "reject fills below this price (slippage floor)", range: "0.50-0.65" }
+
+filters:
+  min_move_bps:         { type: float, unit: bps, meaning: "required |move| of leader to be 'decisive' (uses abs(), both directions)", range: "1.5-6.0" }
+  weekend_min_move_bps: { type: float, unit: bps, meaning: "stricter |move| during Fri-Sun ET window; 0 = off", range: "0-8.0" }
+  min_book_depth:       { type: int,  unit: usd, meaning: "min top-of-book depth to fire", range: "0-200" }
+  min_confirms:         { type: int,  unit: count, meaning: "book confirmations before fire", range: "1-4" }
+  chop_filter:          { type: bool, meaning: "skip choppy windows" }
+  chop_max_flips:       { type: int,  meaning: "max direction flips allowed if chop_filter on" }
+  chop_lookback:        { type: int,  unit: secs, meaning: "lookback for chop detection" }
+  coins:                { type: list, range: [BTC, ETH, SOL, XRP, DOGE, BNB] }
+  durations:            { type: list, range: ["5m", "15m", "1h", "4h"] }
+
+fire_timing:
+  snipe_window_secs: { type: int, unit: secs, meaning: "fire window before close, 5m markets", range: "2-30" }
+  snipe_window_15m:  { type: int, unit: secs, meaning: "fire window before close, 15m markets", range: "2-30" }
+  min_fill_secs:     { type: int, unit: secs, meaning: "don't fire if fewer than this many secs left", range: "0-5" }
+  late_fire_secs:    { type: int, unit: secs, meaning: "extra delay into the window; 0 = earliest", range: "0-20" }
+
+sizing:
+  base_size:        { type: float, unit: usd, meaning: "base stake per fire", range: "1-50" }
+  dynamic_size:     { type: bool, meaning: "scale size by book/conditions" }
+  paroli_enabled:   { type: bool, meaning: "ladder up stakes after wins" }
+  paroli_ladder:    { type: list, unit: usd, meaning: "stake steps, e.g. 8,12,15", }
+  paroli_mult:      { type: float, meaning: "ladder multiplier between steps" }
+  paroli_steps:     { type: int,  meaning: "max ladder steps" }
+  paroli_5m_max_step:{ type: int, meaning: "cap ladder step on 5m markets" }
+  max_per_market:   { type: float, unit: usd, meaning: "hard cap stake on any one market", range: "5-50" }
+
+guardrails:
+  max_loss_streak:  { type: int,  unit: count, meaning: "stop after this many consecutive losses", range: "3-15" }
+  daily_loss_limit: { type: float, unit: usd, meaning: "halt for the day at this realized loss", range: "40-200" }
+  min_balance:      { type: float, unit: usd, meaning: "stop trading if balance falls below", range: "100-300" }
+  rolling_24h_limit:{ type: float, unit: usd, meaning: "rolling 24h loss cap; 0 = off" }
+  max_open_positions:{ type: int, meaning: "max concurrent open positions" }
+  auto_scratch:     { type: bool, meaning: "auto-exit (scratch) losing positions early" }
+  scratch_max_slip: { type: float, unit: prob, meaning: "max slippage allowed when scratching" }
+
+schedule_gate:
+  trading_hours: { type: list, unit: utc_hour, meaning: "ONLY enter in these UTC hours; empty = all hours", range: "0-23" }
+  active_days:   { type: list, meaning: "days the profile runs, e.g. [Mon,Tue,Wed,Thu]; empty = all" }
+  blackout_start:{ type: int, unit: utc_hour, meaning: "blackout window start (likely legacy/dead)" }
+  blackout_end:  { type: int, unit: utc_hour, meaning: "blackout window end" }
+
+skips:
+  skip_eth_up:  { type: bool, meaning: "block ETH-Up trades" }
+  skip_btc_up:  { type: bool, meaning: "block BTC-Up trades" }
+  eth_skip_15m: { type: bool, meaning: "block ETH 15m" }
+  btc_skip_5m:  { type: bool, meaning: "block BTC 5m" }

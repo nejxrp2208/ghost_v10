@@ -1,0 +1,66 @@
+meta:
+  owner: branden
+  last_verified_by: branden
+  last_verified_date: 2026-06-18
+  source: live VPS .env (secrets stripped)
+  status: verified
+  mode: live
+
+entry_band:
+  min_ask: 0.50
+  max_ask: 0.75
+  fill_floor: 0.50
+
+filters:
+  min_move_bps: 1.5
+  weekend_min_move_bps: 1.5
+  min_book_depth: 50
+  min_confirms: 2
+  chop_filter: false
+  chop_max_flips: 4
+  chop_lookback: 90
+  coins: [BTC, ETH]
+  durations: ["5m", "15m"]
+
+fire_timing:
+  snipe_window_secs: 12
+  snipe_window_15m: 12
+  min_fill_secs: 2
+  late_fire_secs: 0
+
+sizing:
+  base_size: 10.0
+  dynamic_size: true
+  paroli_enabled: true
+  paroli_ladder: [10, 15]
+  paroli_mult: 1.5
+  paroli_steps: 3
+  paroli_5m_max_step: 1
+  max_per_market: 25.0
+
+guardrails:
+  max_loss_streak: 10
+  daily_loss_limit: 150
+  min_balance: 150
+  rolling_24h_limit: 0
+  max_open_positions: 5
+  auto_scratch: true
+  scratch_max_slip: 0.15
+
+schedule_gate:
+  trading_hours: []        # all hours
+  active_days: []          # all days
+  blackout_start: 21       # legacy/likely-dead config
+  blackout_end: 23
+
+skips:
+  skip_eth_up: false
+  skip_btc_up: false
+  eth_skip_15m: false
+  btc_skip_5m: false
+
+# NOTES (from data analysis 2026-06-18):
+#  - whole book -0.30/trade flat-$10 (account up on sizing, not per-trade edge)
+#  - biggest leak = entries < 0.60 (n=96, 50% WR, -$74.70) -> candidate: raise fill_floor to 0.60
+#  - bleeder UTC hours: 07, 23, 01, 22; all Sat/Sun
+#  - brightest window: UTC hour 13 (84% WR) but fails multiple-comparison correction -> watch only

@@ -10,9 +10,6 @@
 | `resolver` | `crypto_ghost_resolver.py` | Resolves trades via Chainlink → Polymarket |
 | `redeemer` | `crypto_ghost_redeemer.py` | Claims winnings on-chain |
 | `marketghost` | `marketghost.py` | Silent data collector (no trades) |
-| `ghost-lattice` | `ghost_lattice/GHOST_LATTICE.py` | GHOST_LATTICE: unified ML scanner (T1=WRAITH, T2=SPECTER, ghost_brain) |
-| `ghost-lattice-resolver` | `ghost_lattice/GHOST_LATTICE_resolver.py` | GHOST_LATTICE resolver (separate from v10 resolver) |
-| `ghost-lattice-redeemer` | `ghost_lattice/GHOST_LATTICE_redeemer.py` | GHOST_LATTICE redeemer (separate from v10 redeemer) |
 | `ghost-predator` | `ghost_predator/ghost_predator.py` | GHOST PREDATOR: last-window latency snipe (BTC/ETH 5m+15m, T-12s) |
 | `ghost-predator-resolver` | `ghost_predator/resolver.py` | GHOST PREDATOR resolver (on-chain token-level winner, separate subsystem) |
 | `ghost-predator-alarm` | `ghost_predator/alarmghost.py` | GHOST PREDATOR Telegram health alarm (loss/cold/daily-loss triggers) |
@@ -33,17 +30,9 @@
 - Spread filter: ask−bid ≤ $0.04
 - Telegram alert on every fire
 
-**GHOST_LATTICE v10 — separate system in `ghost_lattice/` subfolder:**
-- Location: `/root/ghost_v10/ghost_lattice/`
-- Own `.env`: `/root/ghost_v10/ghost_lattice/.env` (separate from v10 .env)
-- Own DB: `ghost_lattice/GHOST_LATTICE_PAPER.db` (paper) / `GHOST_LATTICE.db` (live)
-- Dashboard (display-only, PM2 manages processes): `python3 ghost_lattice/GHOST_LATTICE_dashboard.py`
-- T1=WRAITH (contrarian), T2=SPECTER (oracle-lag), `ghost_brain.py` ML scoring (0-100)
-- Flat $6.66 sizing, CoinDirEngine (auto-blocks negative-EV pairs), HourBiasEngine, AdaptiveRisk
-
 **GHOST PREDATOR — separate system in `ghost_predator/` subfolder:**
 - Location: `/root/ghost_v10/ghost_predator/`
-- Own `.env`: `/root/ghost_v10/ghost_predator/.env` (separate from v10 and ghost_lattice — gitignored; copy from `.env.example`)
+- Own `.env`: `/root/ghost_v10/ghost_predator/.env` (separate from v10 — gitignored; copy from `.env.example`)
 - Own DB: `ghost_predator/ghost_predator.db` (single DB for paper+live, distinguished by `mode` column)
 - Dashboard (display-only, PM2 manages processes): `python3 ghost_predator/dashboard.py`
 - Strategy: **Last-window latency snipe** — in the final ~17s (5m) / ~30s (15m) of a BTC/ETH up-down market, compute leader from our own Binance feed and snipe PM's stale ask before it reprices
@@ -57,10 +46,17 @@
 - Guardrails: `DAILY_LOSS_LIMIT=150`, `MAX_LOSS_STREAK=5` — auto-halts trading
 - See `ghost_predator/FILTERS.md` and `ghost_predator/LEARNINGS.md` for full filter chain + tuning history
 
+**GHOST_NEJC — reference knowledge folder in `ghost_nejc/` subfolder (NOT a running process):**
+- Origin: external "Ghost Predator Team Playbook" repo (`Ghinsinc/Ghins-inc`), security-reviewed file-by-file 2026-06-18 before import — no exec/exfil/secret-stealing code, strong anti-secret hygiene. Imported as a **static copy with `.git` stripped** (no remote, no auto-sync, nothing pushes out).
+- **No PM2 process, no DB, no trades.** This is read-only reference material — a shared trading journal from 4 operators running the same last-window snipe strategy.
+- `ghost_nejc/CLAUDE.md` — THE value: compounding team lessons (fire-timing EV by secs_left, per-book entry bands, weekend bleed, hour-of-day per-book, on-chain Chainlink resolution decode recipe, razor-loss analysis). Note: Claude Code auto-reads this as nested instructions when working inside `ghost_nejc/`.
+- `ghost_nejc/data/configs/*.env|*.yaml` — reference strategy configs from other operators (secrets stripped); concrete parameter examples only.
+- `ghost_nejc/proposals/`, `ghost_nejc/*.py`, `ghost_nejc/scripts/ghins_sync.sh` — data-pool collaboration tooling (read-only exporters/validators + an opt-in hourly git auto-sync). **Not wired up; `ghins_sync.sh` must never be run unless you consciously want to push your CLAUDE.md to their shared repo.**
+- Relationship to `ghost_predator/`: same strategy family, but `ghost_predator/` is OUR live code; `ghost_nejc/` is borrowed knowledge. Cross-apply lessons manually after validating on our own book — never copy another operator's config verbatim (their builds differ).
+
 **Tech:** Python async (`asyncio` + `aiohttp`), SQLite, Polygon/Chainlink, Polymarket CLOB + Gamma APIs.
 
 **DBs (v10):** `crypto_ghost_PAPER.db` (trades), `scanner.db` (book/summary), `marketghost.db` (market snapshots).
-**DBs (GHOST_LATTICE):** `ghost_lattice/GHOST_LATTICE_PAPER.db` (paper trades), `ghost_lattice/GHOST_LATTICE.db` (live trades).
 **DBs (GHOST PREDATOR):** `ghost_predator/ghost_predator.db` (paper + live, distinguished by `mode` column).
 
 ---
@@ -89,11 +85,6 @@ pm2 restart resolver         # trade resolver
 pm2 restart redeemer         # on-chain redeemer
 pm2 restart marketghost      # silent data collector
 pm2 restart all              # everything at once
-
-# ── GHOST_LATTICE v10 ─────────────────────────────────────────
-pm2 restart ghost-lattice            # main scanner (T1+T2, ghost_brain ML)
-pm2 restart ghost-lattice-resolver   # GHOST_LATTICE resolver
-pm2 restart ghost-lattice-redeemer   # GHOST_LATTICE redeemer
 
 # ── GHOST PREDATOR ────────────────────────────────────────────
 pm2 restart ghost-predator           # main snipe engine (Binance feed + WSS book + snipe loop)
@@ -169,14 +160,6 @@ pm2 logs ghost-predator-shadow --lines 10 --nostream
 
 **Key hardcoded config:** `COINS=BTC,ETH,XRP,SOL` | `DURATIONS=5m,15m` | `SNIPE_WINDOW=28s` (5m) / `20s` (15m) | `ask 0.65-0.78` | `$20 stake` | `REGIME_GATE=false` (never halts)
 **DB:** `ghost_predator/shadow_predator.db` (separate from main bot)
-
-### GHOST_LATTICE Dashboard
-
-```bash
-cd /root/ghost_v10 && source venv/bin/activate && python3 ghost_lattice/GHOST_LATTICE_dashboard.py
-```
-
-Dashboard je display-only — PM2 upravlja procese. Ne zažene dvojnikov.
 
 ### GHOST PREDATOR Dashboard
 

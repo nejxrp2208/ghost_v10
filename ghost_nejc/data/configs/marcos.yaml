@@ -1,0 +1,63 @@
+meta:
+  owner: marcos
+  last_verified_by: ""          # << Marcos: confirm your real values and sign here
+  last_verified_date: ""
+  source: "reconstructed from dashboard + Julian; NOT yet owner-confirmed"
+  status: unverified
+  mode: live
+
+entry_band:
+  min_ask: 0.65                 # UNVERIFIED
+  max_ask: 0.78                 # UNVERIFIED -- dash read 0.78; Branden notes had 0.79
+  fill_floor: 0.62              # UNVERIFIED
+
+filters:
+  min_move_bps: 3.0             # per Julian "he put 3.0 bps" + 10 days data -- CONFIRM
+  weekend_min_move_bps: 0       # UNVERIFIED
+  min_book_depth: 50            # UNVERIFIED
+  min_confirms: 2               # UNVERIFIED
+  chop_filter: false            # confirmed off (Branden)
+  chop_max_flips: 4
+  chop_lookback: 90
+  coins: [BTC, ETH]
+  durations: ["5m", "15m"]
+
+fire_timing:
+  snipe_window_secs: 12         # "same fire time as Branden" (Branden) -- CONFIRM
+  snipe_window_15m: 12
+  min_fill_secs: 2
+  late_fire_secs: 0
+
+sizing:
+  base_size: 10.0               # dash: $10-25/snipe
+  dynamic_size: true
+  paroli_enabled: true
+  paroli_ladder: [8, 12, 15]    # UNVERIFIED -- CONFIRM
+  paroli_mult: 1.5
+  paroli_steps: 3
+  paroli_5m_max_step: 1
+  max_per_market: 15.0          # UNVERIFIED
+
+guardrails:
+  max_loss_streak: 3            # UNVERIFIED
+  daily_loss_limit: 75          # dash showed day stop ~ +83/-75 -- CONFIRM
+  min_balance: 150
+  rolling_24h_limit: 0
+  max_open_positions: 5
+  auto_scratch: true
+  scratch_max_slip: 0.15
+
+schedule_gate:
+  trading_hours: []             # UNVERIFIED -- does Marcos hard-gate hours, or run all + golden sizing?
+  active_days: []
+  blackout_start: 21
+  blackout_end: 23
+
+skips:
+  skip_eth_up: false
+  skip_btc_up: false
+  eth_skip_15m: false
+  btc_skip_5m: false
+
+# DASH SNAPSHOT 2026-06-18 (for reference, not config): all-time +$112.31, 997W/368L 73% WR,
+# BUT Norm @$10 = -$135.30 / -1% ROI -> booked profit is from variable SIZING, not a per-trade edge.
