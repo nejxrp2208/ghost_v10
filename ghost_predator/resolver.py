@@ -106,6 +106,84 @@ def pm_resolution(cond):
     w=next((t for t in toks if t.get("winner")),None)
     return (w.get("token_id") if w else None), ids
 
+# ── FAST PATH: on-chain CTF payout (settles ~21s after close vs ~379s for the
+#    CLOB winner flag). Reads the SAME source of truth — Polymarket's CTF payout
+#    vector on Polygon — straight from the chain. No wallet, no gas, no API key. ──
+CTF       = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"   # Polymarket CTF on Polygon
+SEL_DEN   = "0xdd34de67"   # payoutDenominator(bytes32)
+SEL_NUM   = "0x0504c814"   # payoutNumerators(bytes32,uint256)
+# Public Polygon RPCs — TEST THIS LIST FROM THE VPS; some reject certain hosts.
+POLY_RPCS = ["https://polygon-bor-rpc.publicnode.com",
+             "https://polygon-pokt.nodies.app",
+             "https://gateway.tenderly.co/public/polygon",
+             "https://polygon.api.onfinality.io/public",
+             "https://1rpc.io/matic",
+             "https://polygon.drpc.org"]
+_rpc_dead = {}            # rpc -> unix ts to skip until (benches flaky nodes ~120s)
+
+def eth_call(data_hex, rpc, timeout=5):
+    """One read-only eth_call to the CTF contract; int result or None."""
+    try:
+        body = json.dumps({"jsonrpc":"2.0","id":1,"method":"eth_call",
+                           "params":[{"to":CTF,"data":data_hex},"latest"]}).encode()
+        req = urllib.request.Request(rpc, data=body, headers={"Content-Type":"application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            res = json.load(r).get("result")
+        return int(res,16) if res and res != "0x" else None
+    except Exception:
+        return None
+
+def chain_winner_index(cond):
+    """Winning outcome index (0/1) from the on-chain CTF payout, or None if
+    unsettled / unclear. Requires TWO RPCs that RESPONDED to AGREE on the same
+    settled verdict — a single bad node can never flip or fake an outcome."""
+    if not cond:
+        return None
+    word = cond[2:].lower().zfill(64) if cond.startswith("0x") else cond.lower().zfill(64)
+    now = time.time()
+    verdicts = []
+    for rpc in POLY_RPCS:
+        if _rpc_dead.get(rpc, 0) > now:
+            continue
+        den = eth_call(SEL_DEN + word, rpc)
+        if den is None:
+            _rpc_dead[rpc] = now + 120; continue
+        if den == 0:
+            v = "unsettled"
+        else:
+            n0 = eth_call(SEL_NUM + word + "%064x" % 0, rpc)
+            n1 = eth_call(SEL_NUM + word + "%064x" % 1, rpc)
+            if n0 is None or n1 is None:
+                _rpc_dead[rpc] = now + 120; continue
+            if (n0 > 0) == (n1 > 0):          # split / tie -> nonsense for binary, never guess
+                return None
+            v = 0 if n0 > 0 else 1
+        verdicts.append(v)
+        if len(verdicts) == 2:
+            if verdicts[0] == verdicts[1] and verdicts[0] != "unsettled":
+                return verdicts[0]            # two responders agree on a settled winner
+            return None                       # disagree / both unsettled -> retry next poll
+    return None
+
+GAMMA = "https://gamma-api.polymarket.com"
+_tok_order = {}           # cond -> [token_id, ...] in OUTCOME-INDEX order (static per market)
+def token_order(cond, slug):
+    """Ordered clobTokenIds for a market (index 0 = outcomes[0], 1 = outcomes[1]) —
+    the SAME ordering the bot uses at fire-time. Lets us map an on-chain winning
+    INDEX back to a winning TOKEN_ID, so settlement stays token-level (no labels)."""
+    if cond in _tok_order:
+        return _tok_order[cond]
+    mk = http_get(f"{GAMMA}/markets?slug={slug}") if slug else None
+    toks = None
+    try:
+        toks = mk[0].get("clobTokenIds")
+        if isinstance(toks, str): toks = json.loads(toks)
+    except Exception:
+        toks = None
+    if toks:
+        _tok_order[cond] = toks
+    return toks
+
 def main():
     ensure_schema()
     print(f"[resolver] watching {DB} — Polymarket TOKEN-level settlement only")
@@ -119,22 +197,37 @@ def main():
             c.close()
         except Exception as e:
             print(f"[resolver] db err: {e}"); time.sleep(20); continue
+        hot = False
         for pid,coin,outcome,token,cond,size,shares,close_ts,status,conf,ts_iso,entry,open_px,slug in rows:
             if close_ts and now < close_ts + CLOSE_BUFFER:
                 continue
-            wtok, ids = pm_resolution(cond)
+            # ── determine the winning TOKEN: on-chain CTF first (fast), CLOB winner flag as fallback ──
+            order = token_order(cond, slug)
             # side-safety: our token must belong to this market
-            if ids and token not in ids:
+            if order and token not in order:
                 print(f"[resolver] !! #{pid} token NOT in market {cond[:10]} — refusing to settle")
                 continue
-            if wtok is None:
-                # Polymarket has NOT settled on-chain yet. Make sure the record
-                # does not show an unconfirmed win/loss — revert to open.
+            winner_tok, src = None, None
+            if order:                                   # fast path needs the index→token map
+                wi = chain_winner_index(cond)
+                if wi is not None and wi < len(order):
+                    winner_tok, src = order[wi], "chain"
+            if winner_tok is None:                       # fallback: CLOB winner flag (slow, lags ~6min)
+                wtok, ids = pm_resolution(cond)
+                if ids and token not in ids:
+                    print(f"[resolver] !! #{pid} token NOT in market {cond[:10]} — refusing to settle")
+                    continue
+                if wtok is not None:
+                    winner_tok, src = wtok, "clob"
+            if winner_tok is None:
+                # Not settled on-chain OR via CLOB yet — keep polling fast and make sure
+                # the record shows no unconfirmed win/loss (revert to open).
+                hot = True
                 if status != "open":
                     c=db(); c.execute("UPDATE positions SET status='open',pnl=0,resolved_at=NULL WHERE id=?",(pid,)); c.commit(); c.close()
-                    print(f"[resolver] #{pid} {coin} {outcome} reverted to PENDING (PM not settled yet)")
+                    print(f"[resolver] #{pid} {coin} {outcome} reverted to PENDING (not settled yet)")
                 continue
-            won = (wtok == token)
+            won = (winner_tok == token)
             pnl = round(shares-size,2) if won else round(-size,2)
             new_status = "won" if won else "lost"
             resolved_iso = datetime.now(timezone.utc).isoformat()
@@ -142,7 +235,7 @@ def main():
             c.execute("UPDATE positions SET status=?,pnl=?,resolved_at=?,pm_confirmed=1 WHERE id=?",
                       (new_status,pnl,resolved_iso,pid))
             c.commit(); c.close()
-            print(f"[resolver] {'WIN' if won else 'loss'} #{pid} {coin} {outcome} PM-confirmed | ${pnl:+.2f}")
+            print(f"[resolver] {'WIN' if won else 'loss'} #{pid} {coin} {outcome} settled via {src} | ${pnl:+.2f}")
             # ── rich Telegram WON/LOST alert ──
             dur=(slug or "").split("-")[-2] if slug else "?"
             up=outcome.upper() in ("UP","YES")
@@ -156,10 +249,10 @@ def main():
             tg(f"{'✅ WON' if won else '❌ LOST'} #{pid} — ${pnl:+.2f}\n"
                f"{'🟢' if up else '🔴'} {coin} {outcome.upper()} @ ${entry:.4f} (size ${size:.2f})\n"
                f"📋 {dur} · {win}\n\n"
-               f"⏱ Held {held_str(ts_iso,resolved_iso)} · resolved via Polymarket token (CLOB authoritative)"
+               f"⏱ Held {held_str(ts_iso,resolved_iso)} · settled via {'on-chain CTF (~21s)' if src=='chain' else 'CLOB winner'} — token-level"
                f"{move}\n\n"
                f"📊 Lifetime: {w}W / {l}L ({wr:.1f}% WR) · ${life:+.2f}")
-        time.sleep(20)
+        time.sleep(4 if hot else 20)   # hot-poll while a closed market is still pending (~21s settle); idle otherwise
 
 if __name__=="__main__":
     try: main()

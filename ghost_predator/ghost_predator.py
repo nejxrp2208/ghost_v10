@@ -39,8 +39,8 @@ def load_env():
                 if "#" in v: v = v[:v.index("#")]
                 os.environ.setdefault(k.strip(), v.strip())
 load_env()
-def envf(k, d): return float(os.getenv(k, d))
-def envi(k, d): return int(os.getenv(k, d))
+def envf(k, d): return float(os.getenv(k) or d)   # `or d`: empty env value ('') falls back to default, never crashes
+def envi(k, d): return int(os.getenv(k) or d)     # (os.getenv(k, d) only uses d when the key is ABSENT, not when empty)
 
 PAPER           = os.getenv("PAPER_TRADE", "true").lower() == "true"
 START_BAL       = envf("STARTING_BALANCE", "1000")
