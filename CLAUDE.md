@@ -35,11 +35,12 @@
 - Own `.env`: `/root/ghost_v10/ghost_predator/.env` (separate from v10 — gitignored; copy from `.env.example`)
 - Own DB: `ghost_predator/ghost_predator.db` (single DB for paper+live, distinguished by `mode` column)
 - Dashboard (display-only, PM2 manages processes): `python3 ghost_predator/dashboard.py`
-- Strategy: **Last-window latency snipe** — in the final ~17s (5m) / ~30s (15m) of a BTC/ETH up-down market, compute leader from our own Binance feed and snipe PM's stale ask before it reprices
+- Strategy: **Last-window latency snipe** — in the final ~17s (5m) / ~30s (15m) of a BTC/ETH/SOL/XRP up-down market, compute leader from our own Binance feed and snipe PM's stale ask before it reprices
+- **Config is fully env-driven per coin (2026-07-04)** — every coin in `COINS` gets `{COIN}_*` keys: `MIN/MAX_MOVE_BPS` (bps band), `SKIP_5M/15M`, `GOLDEN/BLOCKED/ALLOWED_HOURS`, `BASE_SIZE`, `MAX_PER_MARKET`, tier ladders. Absent/empty key = inherit global; set key = replaces global. **Full reference: `ghost_predator/CLAUDE.md` (the main predator doc).**
+- Hour tiers: GOLDEN hours → biggest ladder, normal hours → classic ladder, BLOCKED hours → minimal ladder (default `1,2,3`, still trades; hard-skips only when `LADDER_ENABLED=false`). `ALLOWED_HOURS` = separate HARD whitelist.
 - Entry band: `MIN_ASK=0.65`, `MAX_ASK=0.85` (favorites with profit room, no coinflips)
-- Move gate: `BTC_MIN_MOVE_BPS=1.0`, `ETH_MIN_MOVE_BPS=1.3` (per-coin, data-driven from 57 live trades)
-- ETH 15m skipped: `ETH_SKIP_15M=true` (data: 54% WR = coinflip, Chainlink disagree)
-- Sizing: `WALK_FILL=true` + per-coin: `BTC_BASE_SIZE=12`, `ETH_BASE_SIZE=7` (data: BTC 82% WR vs ETH 64%)
+- Move gates: per-coin lower `{COIN}_MIN_MOVE_BPS` + upper `{COIN}_MAX_MOVE_BPS` (giant moves are already repriced — BTC 6+bps edge −17%, SOL 4–6bps −14%)
+- Sizing: `WALK_FILL=true` + per-coin sizes/ladders (data: BTC 82% WR vs ETH 64%; SOL/XRP start small)
 - Safety: `FILL_FLOOR=0.50` (prevents stale WSS levels dragging blended fill below viable entry)
 - Live auth: `signature_type=3` (POLY_1271 deposit wallet flow), `creds=ApiCreds(...)` in constructor
 - Realtime: WSS Polymarket book channel (REST fallback), `BOOK_POLL_MS=10` snipe cadence

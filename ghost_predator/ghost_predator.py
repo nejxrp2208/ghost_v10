@@ -65,13 +65,25 @@ SKIP_DUR        = {(c, d): os.getenv(f"{c}_SKIP_{d.upper()}", "false").lower() =
                    for c in COINS for d in ("5m", "15m")}   # per-coin duration kill-switch
 def _parse_hours(s):
     return {int(h.strip()) % 24 for h in (s or "").split(",") if h.strip().isdigit()}
-BLOCKED_HOURS   = _parse_hours(os.getenv("BLOCKED_HOURS", ""))  # UTC hours to NEVER trade (blacklist, comma-sep, e.g. "19,23")
-ALLOWED_HOURS   = _parse_hours(os.getenv("ALLOWED_HOURS", ""))  # if non-empty: trade ONLY these UTC hours (whitelist). Empty = all hours.
+# Hour TIERS (UTC): GOLDEN (best edge -> biggest ladder), normal (everything else
+# -> classic ladder), BLOCKED (worst edge -> minimal ladder when LADDER_ENABLED,
+# hard skip when ladder is off). ALLOWED_HOURS is a separate HARD whitelist:
+# if non-empty, hours outside it never trade at all.
+GOLDEN_HOURS    = _parse_hours(os.getenv("GOLDEN_HOURS", ""))   # UTC hours that use the GOLDEN ladder
+BLOCKED_HOURS   = _parse_hours(os.getenv("BLOCKED_HOURS", ""))  # UTC hours that use the minimal BLOCKED ladder (skip entirely if LADDER_ENABLED=false)
+ALLOWED_HOURS   = _parse_hours(os.getenv("ALLOWED_HOURS", ""))  # if non-empty: trade ONLY these UTC hours. Empty = all hours.
 def _coin_hours(c, key, fallback):
     v = (os.getenv(f"{c}_{key}") or "").strip()
     return _parse_hours(v) if v else fallback
+GOLDEN_HOURS_C  = {c: _coin_hours(c, "GOLDEN_HOURS", GOLDEN_HOURS) for c in COINS}
 BLOCKED_HOURS_C = {c: _coin_hours(c, "BLOCKED_HOURS", BLOCKED_HOURS) for c in COINS}
 ALLOWED_HOURS_C = {c: _coin_hours(c, "ALLOWED_HOURS", ALLOWED_HOURS) for c in COINS}
+def hour_tier(coin, hr=None):
+    """Which ladder tier applies for this coin right now. GOLDEN wins on overlap."""
+    if hr is None: hr = datetime.now(timezone.utc).hour
+    if hr in GOLDEN_HOURS_C.get(coin, GOLDEN_HOURS):  return "golden"
+    if hr in BLOCKED_HOURS_C.get(coin, BLOCKED_HOURS): return "blocked"
+    return "normal"
 MIN_ASK         = envf("MIN_ASK", "0.02")
 MAX_ASK         = envf("MAX_ASK", "0.90")           # only snipe if ask <= this (profit room)
 BASE_SIZE       = envf("BASE_SIZE", "5.0")
@@ -92,6 +104,18 @@ def _parse_steps(s):
     return out or [10.0]
 LADDER_STEPS = {(c, d): _parse_steps(os.getenv(f"{c}_{d.upper()}_LADDER_STEPS", "10,15,25"))
                 for c in COINS for d in ("5m", "15m")}   # {COIN}_5M_LADDER_STEPS / {COIN}_15M_LADDER_STEPS
+# Tier ladders: the hour tier (see hour_tier above) picks WHICH ladder sizes the trade.
+#   golden  -> {COIN}_{DUR}_GOLDEN_LADDER_STEPS  -> GOLDEN_LADDER_STEPS  -> classic ladder (no boost)
+#   blocked -> {COIN}_{DUR}_BLOCKED_LADDER_STEPS -> BLOCKED_LADDER_STEPS -> "1,2,3" (minimal probe)
+_g_gold = (os.getenv("GOLDEN_LADDER_STEPS") or "").strip()
+_g_blck = (os.getenv("BLOCKED_LADDER_STEPS") or "").strip() or "1,2,3"
+GOLDEN_LADDER, BLOCKED_LADDER = {}, {}
+for _c in COINS:
+    for _d in ("5m", "15m"):
+        _v = (os.getenv(f"{_c}_{_d.upper()}_GOLDEN_LADDER_STEPS") or "").strip() or _g_gold
+        GOLDEN_LADDER[(_c, _d)]  = _parse_steps(_v) if _v else LADDER_STEPS[(_c, _d)]
+        _v = (os.getenv(f"{_c}_{_d.upper()}_BLOCKED_LADDER_STEPS") or "").strip() or _g_blck
+        BLOCKED_LADDER[(_c, _d)] = _parse_steps(_v)
 REQUIRE_FILL    = os.getenv("REQUIRE_FILL", "true").lower() == "true"  # only fire/record when resting depth >= stake (skip unfillable; paper mirrors live FOK). false = record everything + tag would_fill
 DYNAMIC_SIZE    = os.getenv("DYNAMIC_SIZE", "true").lower() == "true"  # 2026-05-23: size each order to depth at the ask = min(BASE_SIZE, depth) for ~100% fill. Captures thin high-win books at small size; supersedes the REQUIRE_FILL gate. BASE_SIZE becomes the CAP.
 MIN_STAKE       = envf("MIN_STAKE", "1.0")                             # Polymarket min order; if depth-matched size is below this, the book is truly unfillable -> skip
@@ -192,8 +216,12 @@ def compute_ladder_size(coin, dur):
     determine the current step:
       - 'won'  → advance to next step (cycles back to step 0 after last step)
       - 'lost' → reset to step 0
-    Cold start (no history) → step 0. Returns the next bet size in USDC."""
-    steps = LADDER_STEPS.get((coin, dur)) or [10.0]
+    Cold start (no history) → step 0. The CURRENT HOUR TIER (golden/normal/blocked)
+    picks which ladder the step indexes into — win/loss position is shared across
+    tiers, only the sizes differ. Returns the next bet size in USDC."""
+    tier = hour_tier(coin)
+    table = GOLDEN_LADDER if tier == "golden" else BLOCKED_LADDER if tier == "blocked" else LADDER_STEPS
+    steps = table.get((coin, dur)) or [10.0]
     c = db()
     # slug format: "btc-updown-5m-..." or "eth-updown-15m-..." — LIKE matches both
     rows = c.execute("""SELECT status FROM positions
@@ -202,14 +230,14 @@ def compute_ladder_size(coin, dur):
                         ORDER BY id DESC LIMIT 50""",
                      (coin, f"%-updown-{dur}-%")).fetchall()
     c.close()
-    # Walk oldest -> newest to track current position
+    # Walk oldest -> newest: consecutive wins since the last loss
     pos = 0
     for (status,) in reversed(rows):
         if status == 'lost':
             pos = 0
         elif status == 'won':
-            pos = (pos + 1) % len(steps)
-    return steps[pos]
+            pos += 1
+    return steps[pos % len(steps)]
 
 def halt_reason():
     """Account-survival guardrails. Returns a halt string, or None if clear to trade.
@@ -740,8 +768,9 @@ async def snipe_loop():
                 if now() - price_ts.get(coin, 0) > PRICE_MAX_AGE: continue   # stale feed — don't trade blind
                 if SKIP_DUR.get((coin, m.get("dur", "5m"))): continue      # per-coin duration kill-switch ({COIN}_SKIP_5M/_SKIP_15M)
                 _allow = ALLOWED_HOURS_C.get(coin, ALLOWED_HOURS)
-                if _allow and hr_utc not in _allow: continue               # whitelist: coin trades ONLY in these UTC hours
-                if hr_utc in BLOCKED_HOURS_C.get(coin, BLOCKED_HOURS): continue  # blacklist: coin never trades in these UTC hours
+                if _allow and hr_utc not in _allow: continue               # HARD whitelist: coin trades ONLY in these UTC hours
+                if not LADDER_ENABLED and hr_utc in BLOCKED_HOURS_C.get(coin, BLOCKED_HOURS):
+                    continue   # no ladder to shrink -> blocked hours hard-skip. With ladder ON, blocked hours trade the minimal BLOCKED ladder (compute_ladder_size)
                 move_bps = (cur - op) / op * 1e4          # signed bps
                 # is THIS token the leading side?
                 leading_up = cur >= op
@@ -1009,11 +1038,14 @@ def banner():
         move = f">={mm}bps" + (f" <={xm}bps" if xm > 0 else "")
         hrs = ""
         if ALLOWED_HOURS_C[c]: hrs += f" | allow h={sorted(ALLOWED_HOURS_C[c])}"
+        if GOLDEN_HOURS_C[c]:  hrs += f" | gold h={sorted(GOLDEN_HOURS_C[c])}"
         if BLOCKED_HOURS_C[c]: hrs += f" | block h={sorted(BLOCKED_HOURS_C[c])}"
         print(f"  {c}: {durs or 'OFF'} | move {move} | ${BASE_SIZE_C[c]:g}/snipe cap ${MAX_PER_MARKET_C[c]:g}{hrs}")
     if LADDER_ENABLED:
         for c in COINS:
-            print(f"  LADDER {c}: 5m={LADDER_STEPS[(c,'5m')]}  15m={LADDER_STEPS[(c,'15m')]}")
+            for d in ("5m", "15m"):
+                if d not in DURATIONS or SKIP_DUR.get((c, d)): continue
+                print(f"  LADDER {c} {d}: gold={GOLDEN_LADDER[(c,d)]} norm={LADDER_STEPS[(c,d)]} block={BLOCKED_LADDER[(c,d)]}")
     print("="*66)
 
 # ── order-path pre-warm (LIVE only) ─────────────────────────────────────────
