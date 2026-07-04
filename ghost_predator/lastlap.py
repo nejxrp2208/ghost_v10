@@ -17,6 +17,11 @@ import os, sys, json, sqlite3, asyncio, time
 from datetime import datetime, timezone
 
 try:
+    sys.stdout.reconfigure(line_buffering=True)   # PM2 pipes stdout (no TTY) -> without this,
+except Exception:                                  # prints sit in a 4KB block buffer for ~20min
+    pass
+
+try:
     import aiohttp
 except ImportError:
     sys.exit("needs aiohttp:  pip install aiohttp")
