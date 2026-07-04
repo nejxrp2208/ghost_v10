@@ -48,8 +48,10 @@ Per-coin keys (see `.env.example` for data-driven presets):
   Only when `LADDER_ENABLED=false` do blocked hours hard-skip (no ladder to shrink).
 - GOLDEN wins if an hour appears in both golden and blocked.
 - `ALLOWED_HOURS` is separate and HARD: outside it the coin never fires at all.
-- Ladder win/loss step position is SHARED across tiers (per coin×duration, from DB
-  history): crossing into another tier changes the sizes, not the step index.
+- Each tier climbs its OWN ladder independently (per coin×duration, from DB history):
+  only trades fired in that tier's hours advance/reset that tier's position — a $1
+  blocked-hour probe never advances or resets the golden ladder. A trade's tier is
+  derived from its fire hour under the CURRENT hour config.
 
 ## Data findings (shadow DB 2026-06-05..25, n=5201 resolved; edge = WR − avg entry)
 

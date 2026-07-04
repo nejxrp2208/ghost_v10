@@ -212,27 +212,35 @@ def market_exposure(cond):
     return r or 0.0
 
 def compute_ladder_size(coin, dur):
-    """Compounding ladder per (coin, dur). Walks recent resolved trades to
-    determine the current step:
+    """Compounding ladder per (coin, dur, HOUR TIER). Walks recent resolved trades:
       - 'won'  → advance to next step (cycles back to step 0 after last step)
       - 'lost' → reset to step 0
-    Cold start (no history) → step 0. The CURRENT HOUR TIER (golden/normal/blocked)
-    picks which ladder the step indexes into — win/loss position is shared across
-    tiers, only the sizes differ. Returns the next bet size in USDC."""
+    Cold start (no history) → step 0. Each tier (golden/normal/blocked) tracks its
+    OWN independent position: only trades FIRED in the same tier's hours move that
+    tier's ladder — a $1 blocked-hour probe can never advance/reset the golden
+    ladder. A trade's tier is derived from its fire hour under the CURRENT hour
+    config (retuning hours re-buckets history). Returns the next bet size in USDC."""
     tier = hour_tier(coin)
     table = GOLDEN_LADDER if tier == "golden" else BLOCKED_LADDER if tier == "blocked" else LADDER_STEPS
     steps = table.get((coin, dur)) or [10.0]
     c = db()
     # slug format: "btc-updown-5m-..." or "eth-updown-15m-..." — LIKE matches both
-    rows = c.execute("""SELECT status FROM positions
+    # LIMIT 200 (was 50): after tier-filtering, enough same-tier history must remain
+    rows = c.execute("""SELECT status, ts FROM positions
                         WHERE coin=? AND slug LIKE ?
                           AND status IN ('won','lost')
-                        ORDER BY id DESC LIMIT 50""",
+                        ORDER BY id DESC LIMIT 200""",
                      (coin, f"%-updown-{dur}-%")).fetchall()
     c.close()
-    # Walk oldest -> newest: consecutive wins since the last loss
+    # Walk oldest -> newest: consecutive same-tier wins since the last same-tier loss
     pos = 0
-    for (status,) in reversed(rows):
+    for status, ts in reversed(rows):
+        try:
+            row_hr = int(ts[11:13])          # ts is UTC ISO ("2026-06-25T18:39:44...")
+        except Exception:
+            continue
+        if hour_tier(coin, row_hr) != tier:  # other-tier trade — invisible to this ladder
+            continue
         if status == 'lost':
             pos = 0
         elif status == 'won':
