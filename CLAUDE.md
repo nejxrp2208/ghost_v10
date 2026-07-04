@@ -16,6 +16,7 @@
 | `ghost-predator-radar` | `ghost_predator/divergence_scan.py` | GHOST PREDATOR Reversal Radar — read-only T-11s PM-vs-spot divergence collector |
 | `ghost-predator-firstmover` | `ghost_predator/firstmover.py` | First-mover edge detector — rolling 20-window WR-vs-PM-ask, signals GO/WAIT/OUT |
 | `ghost-predator-shadow` | `ghost_predator/ghost_predator_shadow.py` | Shadow data collector — same snipe logic, BTC/ETH/XRP/SOL, 5m+15m, always PAPER, writes to `shadow_predator.db` |
+| `ghost-predator-lastlap` | `ghost_predator/lastlap.py` | LASTLAP read-only tracer — T-240s (5m) / T-480s (15m) spot-vs-price-to-beat ticks (500ms) + PM asks → `lastlap.db` (HOLD vs FALL analiza) |
 
 **Scanner architecture:** Scanner 4 = single strategy = one PM2 process. Writes to `crypto_ghost_PAPER.db`, distinguished by `strategy='s4_reversal'`. Resolver handles it. (Scanners 1/2/3/5 removed 2026-06-03.)
 
@@ -94,6 +95,7 @@ pm2 restart ghost-predator-alarm     # Telegram health alarm (loss/cold/daily-lo
 pm2 restart ghost-predator-radar     # Reversal Radar (T-11s PM-vs-spot divergence collector)
 pm2 restart ghost-predator-firstmover # First-mover edge detector (gates real fires on GO/OUT)
 pm2 restart ghost-predator-shadow     # Shadow data collector (BTC/ETH/XRP/SOL, 5m+15m, paper-only)
+pm2 restart ghost-predator-lastlap    # LASTLAP price-trace collector (read-only, lastlap.db)
 ```
 
 ### First-time deploy (ghost_predator)

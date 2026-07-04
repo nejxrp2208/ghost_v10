@@ -17,6 +17,7 @@ the authoritative config + data reference for the predator itself.
 | `ghost-predator-radar` | `divergence_scan.py` | read-only PM-vs-spot divergence collector |
 | `ghost-predator-firstmover` | `firstmover.py` | GO/WAIT/OUT edge signal from radar DB |
 | `ghost-predator-shadow` | `ghost_predator_shadow.py` | paper-only collector, BTC/ETH/XRP/SOL → `shadow_predator.db` |
+| `ghost-predator-lastlap` | `lastlap.py` | read-only last-lap tracer: T-240s (5m) / T-480s (15m) spot-vs-open ticks every 500ms + PM asks → `lastlap.db`; `lastlap.py report` = HOLD-vs-FALL profile |
 
 ## Config model — everything is env-driven, NOTHING per-coin is hardcoded
 
