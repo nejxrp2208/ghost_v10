@@ -54,22 +54,33 @@ def snipe_window_for(dur):                          # per-duration snipe window 
     return SNIPE_WINDOW_15M if dur == "15m" else SNIPE_WINDOW
 MIN_FILL_SECS   = envi("MIN_FILL_SECS", "2")        # don't fire if less time than this remains
 MIN_MOVE_BPS    = envf("MIN_MOVE_BPS", "3.0")       # leader must be ahead by >= this (0.03%) to be "decisive"
-BTC_MIN_MOVE_BPS = envf("BTC_MIN_MOVE_BPS", str(MIN_MOVE_BPS))  # per-coin override; default = global MIN_MOVE_BPS
-ETH_MIN_MOVE_BPS = envf("ETH_MIN_MOVE_BPS", str(MIN_MOVE_BPS))  # ETH rabi večji premik (data: 2.0 reže borderline losse)
-ETH_SKIP_15M    = os.getenv("ETH_SKIP_15M", "false").lower() == "true"  # skip ETH 15m (data: 54% WR = coinflip, Chainlink disagree)
-BTC_SKIP_15M    = os.getenv("BTC_SKIP_15M", "false").lower() == "true"  # skip BTC 15m (data: 63% WR, -$27.53 PnL, n=19 = net loser)
-BLOCKED_HOURS   = {int(h.strip()) for h in os.getenv("BLOCKED_HOURS", "").split(",") if h.strip().isdigit()}  # UTC hours to skip entirely (comma-sep, e.g. "19,23")
+MAX_MOVE_BPS    = envf("MAX_MOVE_BPS", "0")         # skip if |move| > this — giant moves are already repriced by PM (0 = disabled)
+# ── per-coin overrides, built for EVERY coin in COINS ────────────────────────
+# {COIN}_MIN_MOVE_BPS / {COIN}_MAX_MOVE_BPS / {COIN}_SKIP_5M / {COIN}_SKIP_15M /
+# {COIN}_ALLOWED_HOURS / {COIN}_BLOCKED_HOURS. Absent or empty key = inherit the
+# global value; a SET per-coin value fully REPLACES the global one for that coin.
+MIN_MOVE_BPS_C  = {c: envf(f"{c}_MIN_MOVE_BPS", str(MIN_MOVE_BPS)) for c in COINS}
+MAX_MOVE_BPS_C  = {c: envf(f"{c}_MAX_MOVE_BPS", str(MAX_MOVE_BPS)) for c in COINS}
+SKIP_DUR        = {(c, d): os.getenv(f"{c}_SKIP_{d.upper()}", "false").lower() == "true"
+                   for c in COINS for d in ("5m", "15m")}   # per-coin duration kill-switch
+def _parse_hours(s):
+    return {int(h.strip()) % 24 for h in (s or "").split(",") if h.strip().isdigit()}
+BLOCKED_HOURS   = _parse_hours(os.getenv("BLOCKED_HOURS", ""))  # UTC hours to NEVER trade (blacklist, comma-sep, e.g. "19,23")
+ALLOWED_HOURS   = _parse_hours(os.getenv("ALLOWED_HOURS", ""))  # if non-empty: trade ONLY these UTC hours (whitelist). Empty = all hours.
+def _coin_hours(c, key, fallback):
+    v = (os.getenv(f"{c}_{key}") or "").strip()
+    return _parse_hours(v) if v else fallback
+BLOCKED_HOURS_C = {c: _coin_hours(c, "BLOCKED_HOURS", BLOCKED_HOURS) for c in COINS}
+ALLOWED_HOURS_C = {c: _coin_hours(c, "ALLOWED_HOURS", ALLOWED_HOURS) for c in COINS}
 MIN_ASK         = envf("MIN_ASK", "0.02")
 MAX_ASK         = envf("MAX_ASK", "0.90")           # only snipe if ask <= this (profit room)
 BASE_SIZE       = envf("BASE_SIZE", "5.0")
 MAX_PER_MARKET  = envf("MAX_PER_MARKET", "10.0")
-BTC_BASE_SIZE      = envf("BTC_BASE_SIZE", str(BASE_SIZE))        # BTC stake (IGNORED when LADDER_ENABLED=true)
-ETH_BASE_SIZE      = envf("ETH_BASE_SIZE", str(BASE_SIZE))        # ETH stake (IGNORED when LADDER_ENABLED=true)
-BTC_MAX_PER_MARKET = envf("BTC_MAX_PER_MARKET", str(MAX_PER_MARKET))
-ETH_MAX_PER_MARKET = envf("ETH_MAX_PER_MARKET", str(MAX_PER_MARKET))
+BASE_SIZE_C      = {c: envf(f"{c}_BASE_SIZE", str(BASE_SIZE)) for c in COINS}            # per-coin stake (IGNORED when LADDER_ENABLED=true)
+MAX_PER_MARKET_C = {c: envf(f"{c}_MAX_PER_MARKET", str(MAX_PER_MARKET)) for c in COINS}  # per-coin max exposure per market
 # ── Compounding ladder (per coin × duration) ─────────────────────────────────
 # Win advances to next step. Loss resets to step 1. Last step cycles back to step 1.
-# When LADDER_ENABLED=true, BTC_BASE_SIZE / ETH_BASE_SIZE are IGNORED.
+# When LADDER_ENABLED=true, {COIN}_BASE_SIZE is IGNORED — ladder is the sole sizing source.
 LADDER_ENABLED  = os.getenv("LADDER_ENABLED", "true").lower() == "true"
 def _parse_steps(s):
     out = []
@@ -79,12 +90,8 @@ def _parse_steps(s):
             try: out.append(float(x))
             except Exception: pass
     return out or [10.0]
-LADDER_STEPS = {
-    ("BTC", "5m"):  _parse_steps(os.getenv("BTC_5M_LADDER_STEPS",  "10,15,25")),
-    ("BTC", "15m"): _parse_steps(os.getenv("BTC_15M_LADDER_STEPS", "10,15,25")),
-    ("ETH", "5m"):  _parse_steps(os.getenv("ETH_5M_LADDER_STEPS",  "10,15,25")),
-    ("ETH", "15m"): _parse_steps(os.getenv("ETH_15M_LADDER_STEPS", "10,15,25")),
-}
+LADDER_STEPS = {(c, d): _parse_steps(os.getenv(f"{c}_{d.upper()}_LADDER_STEPS", "10,15,25"))
+                for c in COINS for d in ("5m", "15m")}   # {COIN}_5M_LADDER_STEPS / {COIN}_15M_LADDER_STEPS
 REQUIRE_FILL    = os.getenv("REQUIRE_FILL", "true").lower() == "true"  # only fire/record when resting depth >= stake (skip unfillable; paper mirrors live FOK). false = record everything + tag would_fill
 DYNAMIC_SIZE    = os.getenv("DYNAMIC_SIZE", "true").lower() == "true"  # 2026-05-23: size each order to depth at the ask = min(BASE_SIZE, depth) for ~100% fill. Captures thin high-win books at small size; supersedes the REQUIRE_FILL gate. BASE_SIZE becomes the CAP.
 MIN_STAKE       = envf("MIN_STAKE", "1.0")                             # Polymarket min order; if depth-matched size is below this, the book is truly unfillable -> skip
@@ -721,8 +728,7 @@ async def snipe_loop():
                 await asyncio.sleep(max(1.0, BOOK_POLL_MS/1000)); continue
             if prev_halt:
                 print(f"[{ts_str()}] guardrail cleared — trading resumed"); prev_halt = None
-            if BLOCKED_HOURS and datetime.now(timezone.utc).hour in BLOCKED_HOURS:
-                await asyncio.sleep(max(1.0, BOOK_POLL_MS / 1000)); continue
+            hr_utc = datetime.now(timezone.utc).hour   # allowed/blocked hour gates are per-coin (checked per market below)
             for tok, m in list(markets.items()):
                 left = m["close_ts"] - t
                 win = snipe_window_for(m.get("dur", "5m"))         # 5m=12s, 15m=30s
@@ -732,16 +738,20 @@ async def snipe_loop():
                 coin = m["coin"]; op = m["open_price"]; cur = prices.get(coin)
                 if op is None or cur is None: continue
                 if now() - price_ts.get(coin, 0) > PRICE_MAX_AGE: continue   # stale feed — don't trade blind
-                if ETH_SKIP_15M and coin == "ETH" and m.get("dur") == "15m": continue  # ETH 15m: 54% WR coinflip (Chainlink disagree)
-                if BTC_SKIP_15M and coin == "BTC" and m.get("dur") == "15m": continue  # BTC 15m: 63% WR, net loser (-$27.53, n=19)
+                if SKIP_DUR.get((coin, m.get("dur", "5m"))): continue      # per-coin duration kill-switch ({COIN}_SKIP_5M/_SKIP_15M)
+                _allow = ALLOWED_HOURS_C.get(coin, ALLOWED_HOURS)
+                if _allow and hr_utc not in _allow: continue               # whitelist: coin trades ONLY in these UTC hours
+                if hr_utc in BLOCKED_HOURS_C.get(coin, BLOCKED_HOURS): continue  # blacklist: coin never trades in these UTC hours
                 move_bps = (cur - op) / op * 1e4          # signed bps
                 # is THIS token the leading side?
                 leading_up = cur >= op
                 is_up = m["side"].upper() in ("UP", "YES")
                 token_is_leader = (leading_up and is_up) or ((not leading_up) and (not is_up))
                 if not token_is_leader: continue
-                coin_min_move = ETH_MIN_MOVE_BPS if coin == "ETH" else BTC_MIN_MOVE_BPS
+                coin_min_move = MIN_MOVE_BPS_C.get(coin, MIN_MOVE_BPS)
                 if abs(move_bps) < coin_min_move: continue  # per-coin move threshold
+                coin_max_move = MAX_MOVE_BPS_C.get(coin, MAX_MOVE_BPS)
+                if coin_max_move > 0 and abs(move_bps) > coin_max_move: continue  # giant move — PM already repriced it (data: BTC 6+bps edge -17%, SOL 4-6bps -14%)
                 # refresh ask (+ how many shares are offered at it)
                 ask, ask_sz = await best_ask(s, tok)
                 if ask is None or not (MIN_ASK <= ask <= MAX_ASK): continue
@@ -749,8 +759,8 @@ async def snipe_loop():
                     coin_base = compute_ladder_size(coin, m.get("dur", "5m"))
                     coin_max  = coin_base
                 else:
-                    coin_base = BTC_BASE_SIZE if coin == "BTC" else ETH_BASE_SIZE
-                    coin_max  = BTC_MAX_PER_MARKET if coin == "BTC" else ETH_MAX_PER_MARKET
+                    coin_base = BASE_SIZE_C.get(coin, BASE_SIZE)
+                    coin_max  = MAX_PER_MARKET_C.get(coin, MAX_PER_MARKET)
                 exp = market_exposure(m["cond"])
                 if exp >= coin_max: continue
                 target = min(coin_base, coin_max - exp)
@@ -841,7 +851,7 @@ async def fire(session, tok, m, ask, size, move_bps, left, cur, ask_sz=0.0, cum_
                 if LADDER_ENABLED:
                     coin_b = compute_ladder_size(coin, m.get("dur", "5m"))
                 else:
-                    coin_b = BTC_BASE_SIZE if coin == "BTC" else ETH_BASE_SIZE
+                    coin_b = BASE_SIZE_C.get(coin, BASE_SIZE)
                 amt = coin_b if WALK_FILL else size
                 cap = MAX_ASK if WALK_FILL else ask
                 args = MarketOrderArgs(token_id=tok, amount=amt, side=BUY, price=cap,
@@ -896,7 +906,8 @@ async def status_loop():
         tot, won, pnl = c.execute("SELECT COUNT(*), COALESCE(SUM(status='won'),0), COALESCE(SUM(pnl),0) FROM positions").fetchone()
         c.close()
         inwin = sum(1 for m in markets.values() if 0 < m["close_ts"]-now() <= snipe_window_for(m.get("dur","5m")))
-        px = " ".join(f"{c}={prices.get(c,0):.0f}" for c in COINS)
+        px = " ".join(f"{c}={prices.get(c,0):.4f}".rstrip("0").rstrip(".") if prices.get(c,0) < 10
+                      else f"{c}={prices.get(c,0):.0f}" for c in COINS)   # sub-$10 coins (XRP/SOL) need decimals
         print(f"[{ts_str()}] tracking {len(markets)} mkts | {inwin} in-window | "
               f"open {o} | total {tot} won {won} pnl ${pnl:+.2f} | {px}")
 
@@ -937,7 +948,7 @@ async def state_writer():
                                  "move_bps": round(move, 1), "pct": round(move/100, 3),
                                  "secs_left": int(left), "price": cur, "ask": ask,
                                  "in_window": MIN_FILL_SECS <= left <= snipe_window_for(_dl),
-                                 "decisive": abs(move) >= MIN_MOVE_BPS})
+                                 "decisive": abs(move) >= MIN_MOVE_BPS_C.get(d["coin"], MIN_MOVE_BPS)})
                 hunt.sort(key=lambda x: x["secs_left"])
                 # ── price history + per-coin chart data (price-to-beat + countdown) ──
                 for cc in COINS:
@@ -992,9 +1003,17 @@ def banner():
     print(f"  leader must move >={MIN_MOVE_BPS}bps | ask {MIN_ASK}-{MAX_ASK} | "
           f"${BASE_SIZE}/snipe cap ${MAX_PER_MARKET}/mkt")
     print(f"  bankroll ${START_BAL:.0f} | book {'WSS realtime (REST fallback)' if USE_WSS_BOOK else f'REST {BOOK_POLL_MS}ms'} | db {os.path.basename(DB)}")
+    for c in COINS:
+        durs = "+".join(d for d in ("5m", "15m") if d in DURATIONS and not SKIP_DUR.get((c, d)))
+        mm, xm = MIN_MOVE_BPS_C[c], MAX_MOVE_BPS_C[c]
+        move = f">={mm}bps" + (f" <={xm}bps" if xm > 0 else "")
+        hrs = ""
+        if ALLOWED_HOURS_C[c]: hrs += f" | allow h={sorted(ALLOWED_HOURS_C[c])}"
+        if BLOCKED_HOURS_C[c]: hrs += f" | block h={sorted(BLOCKED_HOURS_C[c])}"
+        print(f"  {c}: {durs or 'OFF'} | move {move} | ${BASE_SIZE_C[c]:g}/snipe cap ${MAX_PER_MARKET_C[c]:g}{hrs}")
     if LADDER_ENABLED:
-        print(f"  LADDER ON: BTC 5m={LADDER_STEPS[('BTC','5m')]}  BTC 15m={LADDER_STEPS[('BTC','15m')]}")
-        print(f"             ETH 5m={LADDER_STEPS[('ETH','5m')]}  ETH 15m={LADDER_STEPS[('ETH','15m')]}")
+        for c in COINS:
+            print(f"  LADDER {c}: 5m={LADDER_STEPS[(c,'5m')]}  15m={LADDER_STEPS[(c,'15m')]}")
     print("="*66)
 
 # ── order-path pre-warm (LIVE only) ─────────────────────────────────────────
@@ -1048,7 +1067,7 @@ async def presign_loop():
                 if LADDER_ENABLED:
                     coin_b = compute_ladder_size(_coin, _dur)
                 else:
-                    coin_b = BTC_BASE_SIZE if _coin == "BTC" else ETH_BASE_SIZE
+                    coin_b = BASE_SIZE_C.get(_coin, BASE_SIZE)
                 args = MarketOrderArgs(token_id=tok, amount=coin_b, side=BUY,
                                        price=(cap if cap is not None else MAX_ASK),
                                        order_type=OrderType.FOK)
